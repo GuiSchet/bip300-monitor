@@ -6,9 +6,15 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[dependencies]
+prost = { workspace = true }
+serde = { workspace = true }
+
+[build-dependencies]
+prost-build = { workspace = true }
+
 [features]
 strict = []
 
 [lints]
 workspace = true
-

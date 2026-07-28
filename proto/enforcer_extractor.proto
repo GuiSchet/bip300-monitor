@@ -1,0 +1,173 @@
+syntax = "proto3";
+
+package enforcer_extractor;
+
+// A normalized event produced from the enforcer's read-only validator API.
+message EnforcerEvent {
+  oneof event {
+    ChainInfo chain_info = 1;
+    ChainTip chain_tip = 2;
+    SidechainProposalsSnapshot sidechain_proposals = 3;
+    ActiveSidechainsSnapshot active_sidechains = 4;
+    CtipSnapshot ctip = 5;
+    BlockConnected block_connected = 6;
+    BlockDisconnected block_disconnected = 7;
+  }
+}
+
+enum Network {
+  NETWORK_UNSPECIFIED = 0;
+  NETWORK_UNKNOWN = 1;
+  NETWORK_MAINNET = 2;
+  NETWORK_REGTEST = 3;
+  NETWORK_SIGNET = 4;
+  NETWORK_TESTNET = 5;
+}
+
+message Bip300Constants {
+  uint32 withdrawal_bundle_max_age = 1;
+  uint32 withdrawal_bundle_inclusion_threshold = 2;
+  uint32 used_sidechain_slot_proposal_max_age = 3;
+  uint32 used_sidechain_slot_activation_threshold = 4;
+  uint32 unused_sidechain_slot_proposal_max_age = 5;
+  uint32 unused_sidechain_slot_activation_threshold = 6;
+  uint32 activation_height = 7;
+}
+
+message ChainInfo {
+  Network network = 1;
+  Bip300Constants bip300_constants = 2;
+}
+
+message BlockHeader {
+  // 32-byte block hash in conventional display order.
+  bytes hash = 1;
+  // 32-byte previous block hash in conventional display order.
+  bytes previous_hash = 2;
+  uint32 height = 3;
+  // Total chain work as a 32-byte little-endian unsigned integer.
+  bytes chain_work = 4;
+  // Block timestamp in seconds since the Unix epoch.
+  uint64 timestamp = 5;
+}
+
+message ChainTip {
+  BlockHeader header = 1;
+}
+
+message SidechainDeclaration {
+  oneof declaration {
+    SidechainDeclarationV0 v0 = 1;
+  }
+}
+
+message SidechainDeclarationV0 {
+  string title = 1;
+  string description = 2;
+  // Consensus-encoded bytes as returned by the enforcer.
+  bytes hash_id_1 = 3;
+  // Raw bytes as returned by the enforcer.
+  bytes hash_id_2 = 4;
+}
+
+message SidechainProposal {
+  uint32 sidechain_number = 1;
+  // Consensus-encoded proposal bytes as returned by the enforcer.
+  bytes raw_description = 2;
+  // 32-byte SHA256d hash in conventional display order.
+  bytes description_hash = 3;
+  uint32 vote_count = 4;
+  uint32 proposal_height = 5;
+  uint32 proposal_age = 6;
+  // Absent when the proposal version is unknown to the enforcer.
+  SidechainDeclaration declaration = 7;
+}
+
+message SidechainProposalsSnapshot {
+  repeated SidechainProposal proposals = 1;
+}
+
+message ActiveSidechain {
+  uint32 sidechain_number = 1;
+  // Consensus-encoded proposal bytes as returned by the enforcer.
+  bytes raw_description = 2;
+  uint32 vote_count = 3;
+  uint32 proposal_height = 4;
+  uint32 activation_height = 5;
+  // Absent when the proposal version is unknown to the enforcer.
+  SidechainDeclaration declaration = 6;
+}
+
+message ActiveSidechainsSnapshot {
+  repeated ActiveSidechain sidechains = 1;
+}
+
+message Ctip {
+  // 32-byte transaction ID in conventional display order.
+  bytes txid = 1;
+  uint32 vout = 2;
+  uint64 value_sats = 3;
+  uint64 sequence_number = 4;
+}
+
+message CtipSnapshot {
+  uint32 sidechain_number = 1;
+  // Absence is meaningful: the sidechain currently has no CTIP.
+  Ctip ctip = 2;
+}
+
+message OutPoint {
+  // 32-byte transaction ID in conventional display order.
+  bytes txid = 1;
+  uint32 vout = 2;
+}
+
+message Deposit {
+  uint64 sequence_number = 1;
+  OutPoint outpoint = 2;
+  // Raw sidechain address bytes, without a consensus length prefix.
+  bytes address = 3;
+  uint64 value_sats = 4;
+}
+
+message WithdrawalBundleEvent {
+  // Consensus-encoded M6 identifier bytes as returned by the enforcer.
+  bytes m6id = 1;
+
+  oneof state {
+    WithdrawalBundleSubmitted submitted = 2;
+    WithdrawalBundleFailed failed = 3;
+    WithdrawalBundleSucceeded succeeded = 4;
+  }
+}
+
+message WithdrawalBundleSubmitted {}
+
+message WithdrawalBundleFailed {}
+
+message WithdrawalBundleSucceeded {
+  uint64 sequence_number = 1;
+  // Consensus-encoded transaction bytes as returned by the enforcer.
+  bytes transaction = 2;
+}
+
+message SidechainEvent {
+  oneof event {
+    Deposit deposit = 1;
+    WithdrawalBundleEvent withdrawal_bundle = 2;
+  }
+}
+
+message BlockConnected {
+  BlockHeader header = 1;
+  uint32 sidechain_number = 2;
+  // Consensus-encoded BMM h* bytes as returned by the enforcer.
+  optional bytes bmm_commitment = 3;
+  repeated SidechainEvent events = 4;
+}
+
+message BlockDisconnected {
+  // 32-byte disconnected block hash in conventional display order.
+  bytes block_hash = 1;
+  uint32 sidechain_number = 2;
+}

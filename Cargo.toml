@@ -14,7 +14,10 @@ repository = "https://github.com/GuiSchet/bip300-monitor"
 
 [workspace.dependencies]
 anyhow = "1.0.102"
+hex = "0.4.3"
 prost = "0.14.1"
+prost-build = "0.14.1"
+serde = { version = "1.0.219", features = ["derive"] }
 tokio = { version = "1.52.0", features = ["macros", "rt-multi-thread", "time"] }
 tonic = { version = "0.14.2", default-features = false, features = ["channel", "codegen"] }
 tonic-prost = "0.14.2"

@@ -9,6 +9,7 @@ description = "Publishes live BIP300/301 enforcer events to NATS"
 
 [dependencies]
 anyhow = { workspace = true }
+hex = { workspace = true }
 prost = { workspace = true }
 shared = { path = "../../shared" }
 tokio = { workspace = true }

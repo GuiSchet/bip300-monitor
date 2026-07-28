@@ -1,0 +1,15 @@
+syntax = "proto3";
+
+package event;
+
+import "enforcer_extractor.proto";
+
+// Stable envelope shared by monitor extractors and consumers.
+message Event {
+  // Milliseconds since the Unix epoch when the monitor constructed the event.
+  uint64 timestamp = 10;
+
+  oneof monitor_event {
+    enforcer_extractor.EnforcerEvent enforcer = 1;
+  }
+}

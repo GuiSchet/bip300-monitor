@@ -20,6 +20,17 @@ The enforcer extractor generates a standard gRPC client from a minimal vendored
 copy of the enforcer's public validator API. It does not link to the enforcer
 implementation.
 
+## Event schema
+
+The monitor publishes its own stable protobuf contract instead of forwarding
+the enforcer API responses directly. The top-level event envelope, normalized
+enforcer messages, byte-order rules, and snapshot semantics are documented in
+[`proto/README.md`](proto/README.md).
+
+Rust event types are generated in `shared`. Fallible conversions in the
+enforcer extractor reject missing fields, malformed hex, and incorrectly sized
+hashes before an event can be published.
+
 ## Build
 
 ```bash
