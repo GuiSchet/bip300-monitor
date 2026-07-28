@@ -16,13 +16,25 @@ BIP300/301 enforcer ── Connect/gRPC ──► enforcer-extractor ── prot
 - `shared` contains common event, NATS, and metrics infrastructure.
 - `extractors/enforcer` contains the enforcer client and extraction runtime.
 
-Only the workspace skeleton is present at this stage.
+The enforcer extractor generates a standard gRPC client from a minimal vendored
+copy of the enforcer's public validator API. It does not link to the enforcer
+implementation.
 
 ## Build
 
 ```bash
 cargo check --workspace --jobs 2
 cargo test --workspace --jobs 2
+```
+
+Generating the client currently requires `protoc` to be installed. On
+Debian/Ubuntu it is provided by `protobuf-compiler`.
+
+To verify API compatibility against a running enforcer:
+
+```bash
+cargo run --example get_chain_info -- \
+  http://127.0.0.1:50051
 ```
 
 ## Planned pilot
@@ -43,4 +55,3 @@ deferred and will be documented before implementation.
 ## License
 
 MIT
-

@@ -8,11 +8,18 @@ repository.workspace = true
 description = "Publishes live BIP300/301 enforcer events to NATS"
 
 [dependencies]
+anyhow = { workspace = true }
+prost = { workspace = true }
 shared = { path = "../../shared" }
+tokio = { workspace = true }
+tonic = { workspace = true }
+tonic-prost = { workspace = true }
+
+[build-dependencies]
+tonic-prost-build = "0.14.2"
 
 [features]
 strict = ["shared/strict"]
 
 [lints]
 workspace = true
-
