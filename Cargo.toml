@@ -1,0 +1,20 @@
+[workspace]
+resolver = "2"
+members = [
+    "extractors/enforcer",
+    "shared",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.96.0"
+license = "MIT"
+repository = "https://github.com/GuiSchet/bip300-monitor"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = "deny"
+

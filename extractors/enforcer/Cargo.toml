@@ -1,0 +1,18 @@
+[package]
+name = "enforcer-extractor"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Publishes live BIP300/301 enforcer events to NATS"
+
+[dependencies]
+shared = { path = "../../shared" }
+
+[features]
+strict = ["shared/strict"]
+
+[lints]
+workspace = true
+
