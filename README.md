@@ -31,6 +31,28 @@ Rust event types are generated in `shared`. Fallible conversions in the
 enforcer extractor reject missing fields, malformed hex, and incorrectly sized
 hashes before an event can be published.
 
+## Initial snapshot
+
+The current executable publishes one initial state snapshot to the
+`bip300.enforcer` Core NATS subject and exits. Sidechain slots must be
+configured explicitly:
+
+```bash
+cargo run -p enforcer-extractor -- \
+  --enforcer-endpoint http://127.0.0.1:50051 \
+  --nats-url nats://127.0.0.1:4222 \
+  --sidechain 9,98
+```
+
+Configuration can also be supplied with the `BIP300_MONITOR_*` environment
+variables shown by `cargo run -p enforcer-extractor -- --help`. NATS supports
+anonymous access or a username with either `--nats-password` or
+`--nats-password-file`. Passwords are never logged.
+
+The initial snapshot contains chain configuration, chain tip, pending
+sidechain proposals, active sidechains, and one CTIP snapshot for each
+configured slot. Continuous block streaming is the next implementation stage.
+
 ## Build
 
 ```bash
@@ -40,6 +62,14 @@ cargo test --workspace --jobs 2
 
 Generating the client currently requires `protoc` to be installed. On
 Debian/Ubuntu it is provided by `protobuf-compiler`.
+
+The feature-gated Core NATS integration test requires a `nats-server` binary.
+Run it with:
+
+```bash
+NATS_SERVER_BINARY=/path/to/nats-server \
+  cargo test --workspace --all-features --jobs 2
+```
 
 To verify API compatibility against a running enforcer:
 

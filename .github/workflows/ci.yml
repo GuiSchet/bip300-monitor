@@ -30,12 +30,13 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Install protobuf compiler
+      - name: Install system dependencies
         run: |
           sudo apt-get update
           sudo apt-get install --yes --no-install-recommends \
             protobuf-compiler \
-            libprotobuf-dev
+            libprotobuf-dev \
+            nats-server
 
       - name: Install Rust toolchain
         run: rustup show active-toolchain

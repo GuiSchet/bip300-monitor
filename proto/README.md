@@ -9,6 +9,11 @@ payload carries the time at which the monitor constructed it and a `oneof`
 identifying the extractor. `enforcer_extractor.proto` contains normalized
 events derived from the enforcer's read-only validator API.
 
+All envelopes are published to the stable Core NATS subject
+`bip300.enforcer`. Consumers select the concrete payload through the protobuf
+`oneof`; the subject is intentionally not split by sidechain slot or event
+variant in the first pilot.
+
 ## Semantics
 
 - `Event.timestamp` is the observation time in Unix milliseconds. It is not a

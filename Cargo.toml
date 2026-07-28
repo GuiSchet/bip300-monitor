@@ -14,6 +14,9 @@ repository = "https://github.com/GuiSchet/bip300-monitor"
 
 [workspace.dependencies]
 anyhow = "1.0.102"
+async-nats = { version = "0.50.0", default-features = false }
+clap = { version = "4.6.0", features = ["derive", "env"] }
+futures-util = "0.3.31"
 hex = "0.4.3"
 prost = "0.14.1"
 prost-build = "0.14.1"

@@ -9,6 +9,7 @@ description = "Publishes live BIP300/301 enforcer events to NATS"
 
 [dependencies]
 anyhow = { workspace = true }
+clap = { workspace = true }
 hex = { workspace = true }
 prost = { workspace = true }
 shared = { path = "../../shared" }
@@ -19,8 +20,13 @@ tonic-prost = { workspace = true }
 [build-dependencies]
 tonic-prost-build = "0.14.2"
 
+[dev-dependencies]
+async-nats = { workspace = true }
+futures-util = { workspace = true }
+
 [features]
 strict = ["shared/strict"]
+nats_integration_tests = []
 
 [lints]
 workspace = true
