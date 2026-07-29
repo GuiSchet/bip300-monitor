@@ -21,9 +21,71 @@ env:
   CARGO_TERM_COLOR: always
   DOCKER_METADATA_SHORT_SHA_LENGTH: "12"
 
+# The workflow first classifies the changed files, then runs only the relevant
+# jobs. This keeps deployment-only PRs from rebuilding or publishing the Rust
+# container images. `ci-result` is the single stable check for branch protection.
 jobs:
+  changes:
+    name: Detect changed areas
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      # Rust sources, Cargo metadata, or protobuf definitions changed.
+      rust: ${{ steps.changes.outputs.rust }}
+      # Files that affect the contents of a published container image changed.
+      image_inputs: ${{ steps.changes.outputs.image_inputs }}
+      # Files below deployments/ changed.
+      deployment: ${{ steps.changes.outputs.deployment }}
+      # This workflow or its helper scripts changed, so all checks should run.
+      workflow: ${{ steps.changes.outputs.workflow }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Classify changed paths
+        id: changes
+        env:
+          BASE_REF: ${{ github.base_ref }}
+          BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+
+          # Manual runs and release tags intentionally exercise every check.
+          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]] \
+            || [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            {
+              echo "rust=true"
+              echo "image_inputs=true"
+              echo "deployment=true"
+              echo "workflow=true"
+            } >> "${GITHUB_OUTPUT}"
+          # For a PR, compare the complete branch with its target branch.
+          elif [[ "${GITHUB_EVENT_NAME}" == "pull_request" ]]; then
+            git diff --name-only "origin/${BASE_REF}...HEAD" \
+              | .github/scripts/classify-changes.sh
+          # For a push to main, inspect only the commits included in that push.
+          elif [[ -n "${BEFORE_SHA}" ]] \
+            && [[ "${BEFORE_SHA}" != "0000000000000000000000000000000000000000" ]]; then
+            git diff --name-only "${BEFORE_SHA}" "${GITHUB_SHA}" \
+              | .github/scripts/classify-changes.sh
+          # New refs do not have a usable previous SHA, so classify all files.
+          else
+            git ls-files | .github/scripts/classify-changes.sh
+          fi
+
+  # Run the expensive Rust suite only when code, image inputs, or CI behavior
+  # changed. A deployment-only PR skips this job.
   quality:
     name: Rust quality checks
+    needs: changes
+    if: >-
+      needs.changes.outputs.rust == 'true'
+      || needs.changes.outputs.image_inputs == 'true'
+      || needs.changes.outputs.workflow == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 20
 
@@ -56,9 +118,16 @@ jobs:
       - name: Test workspace
         run: cargo test --workspace --all-features --jobs 2 --locked
 
+  # Build both final images and smoke-test their contents. Pull requests never
+  # publish; a merge to main publishes only when an actual image input changed.
   images:
     name: Container image (${{ matrix.target }})
-    needs: quality
+    needs:
+      - changes
+      - quality
+    if: >-
+      needs.changes.outputs.image_inputs == 'true'
+      || needs.changes.outputs.workflow == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 45
 
@@ -88,6 +157,8 @@ jobs:
         with:
           images: ${{ matrix.image }}
           flavor: latest=false
+          # main identifies the default branch, sha-* is immutable, and
+          # semantic/latest tags are reserved for explicit vX.Y.Z releases.
           tags: |
             type=ref,event=branch,enable=${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
             type=sha,prefix=sha-
@@ -95,8 +166,18 @@ jobs:
             type=semver,pattern={{major}}.{{minor}},enable=${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}
             type=raw,value=latest,enable=${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}
 
+      # Secrets are unavailable to PRs. Workflow-only and deployment-only
+      # merges also skip login because they must not publish new images.
       - name: Log in to Docker Hub
-        if: github.event_name != 'pull_request'
+        if: >-
+          github.event_name == 'push'
+          && (
+            startsWith(github.ref, 'refs/tags/v')
+            || (
+              github.ref == 'refs/heads/main'
+              && needs.changes.outputs.image_inputs == 'true'
+            )
+          )
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           username: guischet
@@ -132,7 +213,15 @@ jobs:
           "${{ matrix.absent_binary }}"
 
       - name: Publish image
-        if: github.event_name != 'pull_request'
+        if: >-
+          github.event_name == 'push'
+          && (
+            startsWith(github.ref, 'refs/tags/v')
+            || (
+              github.ref == 'refs/heads/main'
+              && needs.changes.outputs.image_inputs == 'true'
+            )
+          )
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
           context: .
@@ -150,3 +239,71 @@ jobs:
           # Keep a single image manifest until Docker Hub indexes attached attestations.
           provenance: false
           sbom: false
+
+  # Deployment checks will grow with deployments/ecash-drynet3. Keeping the
+  # job separate means infrastructure PRs remain fast and cannot publish code.
+  deployment:
+    name: Deployment checks
+    needs: changes
+    if: >-
+      needs.changes.outputs.deployment == 'true'
+      || needs.changes.outputs.workflow == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Reject tracked deployment secrets
+        run: |
+          set -euo pipefail
+
+          if git ls-files 'deployments/**/.env' | grep -q .; then
+            echo "::error::deployment .env files must not be committed"
+            exit 1
+          fi
+
+          echo "No tracked deployment .env files found."
+
+  # Other jobs may be intentionally skipped, which makes their individual
+  # check names unstable. This always-running aggregate is the required PR check.
+  ci-result:
+    name: CI result
+    if: always()
+    needs:
+      - changes
+      - quality
+      - images
+      - deployment
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+
+    steps:
+      - name: Require successful checks
+        env:
+          CHANGES_RESULT: ${{ needs.changes.result }}
+          QUALITY_RESULT: ${{ needs.quality.result }}
+          IMAGES_RESULT: ${{ needs.images.result }}
+          DEPLOYMENT_RESULT: ${{ needs.deployment.result }}
+        run: |
+          set -euo pipefail
+
+          if [[ "${CHANGES_RESULT}" != "success" ]]; then
+            echo "::error::change detection finished with ${CHANGES_RESULT}"
+            exit 1
+          fi
+
+          for result in \
+            "${QUALITY_RESULT}" \
+            "${IMAGES_RESULT}" \
+            "${DEPLOYMENT_RESULT}"; do
+            if [[ "${result}" != "success" && "${result}" != "skipped" ]]; then
+              echo "::error::a required CI job finished with ${result}"
+              exit 1
+            fi
+          done
+
+          echo "All required CI jobs passed or were intentionally skipped."
