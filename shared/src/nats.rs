@@ -2,11 +2,13 @@
 
 use std::fs;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use async_nats::{Client, ConnectOptions};
+use async_nats::{Client, ConnectOptions, Event as NatsEvent};
 use clap::Args as ClapArgs;
 use prost::Message;
+use tokio::time::timeout;
 
 use crate::nats_subjects::Subject;
 use crate::protobuf::event::Event;
@@ -46,6 +48,15 @@ pub struct NatsArgs {
         conflicts_with = "nats_password"
     )]
     pub nats_password_file: Option<PathBuf>,
+
+    /// Maximum time to wait for the NATS client transport to flush.
+    #[arg(
+        long,
+        env = "BIP300_MONITOR_NATS_FLUSH_TIMEOUT_SECONDS",
+        default_value_t = 10,
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
+    pub nats_flush_timeout_seconds: u64,
 }
 
 impl Default for NatsArgs {
@@ -55,7 +66,15 @@ impl Default for NatsArgs {
             nats_username: None,
             nats_password: None,
             nats_password_file: None,
+            nats_flush_timeout_seconds: 10,
         }
+    }
+}
+
+impl NatsArgs {
+    /// Return the maximum time allowed for a server-confirmed flush.
+    pub const fn flush_timeout(&self) -> Duration {
+        Duration::from_secs(self.nats_flush_timeout_seconds)
     }
 }
 
@@ -78,7 +97,28 @@ pub fn connect_options(args: &NatsArgs) -> Result<ConnectOptions> {
         (None, None) => None,
     };
 
-    let options = ConnectOptions::new().name(CLIENT_NAME);
+    let options = ConnectOptions::new()
+        .name(CLIENT_NAME)
+        .event_callback(|event| async move {
+            match event {
+                NatsEvent::Connected => tracing::info!("connected to Core NATS"),
+                NatsEvent::Disconnected => tracing::warn!("disconnected from Core NATS"),
+                NatsEvent::LameDuckMode => {
+                    tracing::warn!("Core NATS server entered lame-duck mode");
+                }
+                NatsEvent::Draining => tracing::info!("Core NATS connection is draining"),
+                NatsEvent::Closed => tracing::warn!("Core NATS connection closed"),
+                NatsEvent::SlowConsumer(pending_messages) => {
+                    tracing::warn!(pending_messages, "Core NATS reported a slow consumer");
+                }
+                NatsEvent::ServerError(error) => {
+                    tracing::error!(%error, "Core NATS server error");
+                }
+                NatsEvent::ClientError(error) => {
+                    tracing::error!(%error, "Core NATS client error");
+                }
+            }
+        });
     match (&args.nats_username, password) {
         (Some(username), Some(password)) => {
             Ok(options.user_and_password(username.clone(), password))
@@ -93,6 +133,7 @@ pub fn connect_options(args: &NatsArgs) -> Result<ConnectOptions> {
 #[derive(Clone)]
 pub struct EventPublisher {
     client: Client,
+    flush_timeout: Duration,
 }
 
 impl EventPublisher {
@@ -103,7 +144,10 @@ impl EventPublisher {
             .await
             .with_context(|| format!("connecting to Core NATS at `{}`", args.nats_url))?;
 
-        Ok(Self { client })
+        Ok(Self {
+            client,
+            flush_timeout: args.flush_timeout(),
+        })
     }
 
     /// Publish one protobuf event to a stable monitor subject.
@@ -114,11 +158,22 @@ impl EventPublisher {
             .with_context(|| format!("publishing event to NATS subject `{subject}`"))
     }
 
+    /// Publish one event and wait for the client transport buffer to flush.
+    pub async fn publish_and_flush(&self, subject: Subject, event: &Event) -> Result<()> {
+        self.publish(subject, event).await?;
+        self.flush().await
+    }
+
     /// Wait until the server has processed all previously sent messages.
     pub async fn flush(&self) -> Result<()> {
-        self.client
-            .flush()
+        timeout(self.flush_timeout, self.client.flush())
             .await
+            .with_context(|| {
+                format!(
+                    "timed out after {}s while flushing the Core NATS connection",
+                    self.flush_timeout.as_secs()
+                )
+            })?
             .context("flushing the Core NATS connection")
     }
 }
@@ -126,6 +181,7 @@ impl EventPublisher {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::time::Duration;
 
     use super::{NatsArgs, connect_options};
 
@@ -174,5 +230,10 @@ mod tests {
                 .to_string()
                 .contains("requires a password or password file")
         );
+    }
+
+    #[test]
+    fn uses_a_bounded_flush_timeout() {
+        assert_eq!(NatsArgs::default().flush_timeout(), Duration::from_secs(10));
     }
 }

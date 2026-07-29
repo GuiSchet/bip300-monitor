@@ -15,7 +15,7 @@ use shared::protobuf::event::{Event, event::MonitorEvent};
 use tokio::time::{sleep, timeout};
 
 struct TestNatsServer {
-    child: Child,
+    child: Option<Child>,
     address: String,
 }
 
@@ -34,7 +34,7 @@ impl TestNatsServer {
             .spawn()
             .unwrap_or_else(|error| panic!("starting `{binary}`: {error}"));
         let server = Self {
-            child,
+            child: Some(child),
             address: format!("nats://127.0.0.1:{port}"),
         };
 
@@ -51,12 +51,18 @@ impl TestNatsServer {
 
         server
     }
+
+    fn stop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
 }
 
 impl Drop for TestNatsServer {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        self.stop();
     }
 }
 
@@ -91,10 +97,9 @@ async fn publishes_and_decodes_the_monitor_envelope() {
         Event::new(MonitorEvent::Enforcer(payload)).expect("system clock after Unix epoch");
 
     publisher
-        .publish(Subject::Enforcer, &expected)
+        .publish_and_flush(Subject::Enforcer, &expected)
         .await
-        .expect("publish event");
-    publisher.flush().await.expect("flush publisher");
+        .expect("publish and flush event");
 
     let message = timeout(Duration::from_secs(2), subscription.next())
         .await
@@ -103,4 +108,38 @@ async fn publishes_and_decodes_the_monitor_envelope() {
     let received = Event::decode(message.payload).expect("valid monitor protobuf");
 
     assert_eq!(received, expected);
+}
+
+#[tokio::test]
+async fn detected_server_loss_makes_publish_and_flush_time_out() {
+    let mut server = TestNatsServer::start().await;
+    let publisher = EventPublisher::connect(&NatsArgs {
+        nats_url: server.address.clone(),
+        nats_flush_timeout_seconds: 1,
+        ..NatsArgs::default()
+    })
+    .await
+    .expect("publisher connection");
+    let payload = EnforcerEvent {
+        event: Some(enforcer_event::Event::ChainInfo(ChainInfo {
+            network: Network::Regtest as i32,
+            bip300_constants: None,
+        })),
+    };
+    let event = Event::new(MonitorEvent::Enforcer(payload)).expect("system clock after Unix epoch");
+
+    server.stop();
+    sleep(Duration::from_millis(250)).await;
+    let error = timeout(
+        Duration::from_secs(2),
+        publisher.publish_and_flush(Subject::Enforcer, &event),
+    )
+    .await
+    .expect("publish and flush is bounded")
+    .expect_err("server loss must make the flush fail");
+
+    assert!(
+        format!("{error:#}").contains("flushing the Core NATS connection"),
+        "unexpected error: {error:#}"
+    );
 }

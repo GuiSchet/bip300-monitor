@@ -21,9 +21,12 @@ hex = "0.4.3"
 prost = "0.14.1"
 prost-build = "0.14.1"
 serde = { version = "1.0.219", features = ["derive"] }
-tokio = { version = "1.52.0", features = ["macros", "rt-multi-thread", "time"] }
+tokio = { version = "1.52.0", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
 tonic = { version = "0.14.2", default-features = false, features = ["channel", "codegen"] }
 tonic-prost = "0.14.2"
+tracing = "0.1.44"
+tracing-log = "0.2.0"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

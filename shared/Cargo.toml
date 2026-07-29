@@ -12,6 +12,8 @@ async-nats = { workspace = true }
 clap = { workspace = true }
 prost = { workspace = true }
 serde = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
 
 [build-dependencies]
 prost-build = { workspace = true }

@@ -31,11 +31,11 @@ Rust event types are generated in `shared`. Fallible conversions in the
 enforcer extractor reject missing fields, malformed hex, and incorrectly sized
 hashes before an event can be published.
 
-## Initial snapshot
+## Continuous extraction
 
-The current executable publishes one initial state snapshot to the
-`bip300.enforcer` Core NATS subject and exits. Sidechain slots must be
-configured explicitly:
+The executable publishes an initial state snapshot to the `bip300.enforcer`
+Core NATS subject and then follows live block events until it receives
+`SIGINT` or `SIGTERM`. Sidechain slots must be configured explicitly:
 
 ```bash
 cargo run -p enforcer-extractor -- \
@@ -45,13 +45,25 @@ cargo run -p enforcer-extractor -- \
 ```
 
 Configuration can also be supplied with the `BIP300_MONITOR_*` environment
-variables shown by `cargo run -p enforcer-extractor -- --help`. NATS supports
-anonymous access or a username with either `--nats-password` or
-`--nats-password-file`. Passwords are never logged.
+variables shown by `--help`. NATS supports anonymous or username/password
+authentication. Logging defaults to `info`; use `--log-level` or `RUST_LOG` for
+more detail.
 
-The initial snapshot contains chain configuration, chain tip, pending
-sidechain proposals, active sidechains, and one CTIP snapshot for each
-configured slot. Continuous block streaming is the next implementation stage.
+Subscriptions are opened before collecting the initial snapshot, so live
+events are buffered during startup. This avoids an unreported gap but can
+produce duplicates; consumers should deduplicate block events by type,
+sidechain slot, and block hash. Ordering is preserved within each slot, not
+across slots.
+
+HTTP/2 and TCP keepalives detect dead gRPC connections. Every live publication
+uses a bounded NATS client flush, and a fatal stream, conversion, or publication
+error stops all slot workers. `SIGINT` and `SIGTERM` trigger graceful shutdown;
+a second signal or the configured timeout forces termination.
+
+Core NATS delivery remains at-most-once and non-durable. A successful client
+flush is not a server or consumer acknowledgement, and this pilot does not
+backfill downtime gaps. Detailed event and delivery semantics are documented in
+[`proto/README.md`](proto/README.md).
 
 ## Build
 
@@ -71,6 +83,10 @@ NATS_SERVER_BINARY=/path/to/nats-server \
   cargo test --workspace --all-features --jobs 2
 ```
 
+Drynet gate: with `--request-timeout-seconds 5`, confirm that subscriptions to
+an idle enforcer remain open for more than five seconds and that `SIGTERM`
+produces a clean exit within the configured shutdown timeout.
+
 To verify API compatibility against a running enforcer:
 
 ```bash
@@ -78,20 +94,11 @@ cargo run --example get_chain_info -- \
   http://127.0.0.1:50051
 ```
 
-## Planned pilot
+## Next
 
-The first pilot will:
-
-- publish the enforcer's chain configuration and current consensus-state view;
-- stream mainchain block connections and disconnections;
-- extract BMM commitments, deposits, withdrawal transitions, sidechain
-  proposals, active sidechains, and CTIPs;
-- monitor explicitly configured sidechain slots;
-- expose low-cardinality operational metrics.
-
-Pending withdrawal vote counts are maintained internally by the enforcer but
-are not exposed by its current public API. Extending that API is intentionally
-deferred and will be documented before implementation.
+Planned work includes operational metrics, gRPC resubscription, and gap
+backfill. Pending withdrawal vote counts require a future extension to the
+enforcer's public API.
 
 ## License
 

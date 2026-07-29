@@ -1,5 +1,6 @@
 //! Read-only client for the enforcer's validator service.
 
+use std::future::Future;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -7,6 +8,12 @@ use tonic::transport::{Channel, Endpoint};
 use tonic::{Request, Streaming};
 
 use crate::proto::{common, mainchain};
+
+const HTTP2_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(30);
+const HTTP2_KEEP_ALIVE_TIMEOUT: Duration = Duration::from_secs(10);
+const TCP_KEEP_ALIVE_IDLE: Duration = Duration::from_secs(60);
+const TCP_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(30);
+const TCP_KEEP_ALIVE_RETRIES: u32 = 3;
 
 /// Thin read-only wrapper around the generated validator service client.
 #[derive(Clone, Debug)]
@@ -21,6 +28,12 @@ impl EnforcerClient {
         let channel = Endpoint::from_shared(endpoint.to_owned())
             .with_context(|| format!("parsing enforcer endpoint `{endpoint}`"))?
             .connect_timeout(request_timeout)
+            .tcp_keepalive(Some(TCP_KEEP_ALIVE_IDLE))
+            .tcp_keepalive_interval(Some(TCP_KEEP_ALIVE_INTERVAL))
+            .tcp_keepalive_retries(Some(TCP_KEEP_ALIVE_RETRIES))
+            .http2_keep_alive_interval(HTTP2_KEEP_ALIVE_INTERVAL)
+            .keep_alive_timeout(HTTP2_KEEP_ALIVE_TIMEOUT)
+            .keep_alive_while_idle(true)
             .connect()
             .await
             .with_context(|| format!("connecting to enforcer at `{endpoint}`"))?;
@@ -107,8 +120,8 @@ impl EnforcerClient {
     /// Subscribe to live block connect/disconnect events.
     ///
     /// No RPC deadline is attached to this request because it is intentionally
-    /// long-lived. Connection establishment remains bounded by
-    /// [`Self::connect`].
+    /// long-lived. Establishing the stream is bounded by the configured
+    /// request timeout.
     pub async fn subscribe_events(
         &mut self,
         sidechain_id: u8,
@@ -116,13 +129,13 @@ impl EnforcerClient {
         let request = mainchain::SubscribeEventsRequest {
             sidechain_id: Some(u32::from(sidechain_id)),
         };
-        self.inner
-            .subscribe_events(Request::new(request))
-            .await
-            .with_context(|| {
-                format!("calling ValidatorService.SubscribeEvents for sidechain {sidechain_id}")
-            })
-            .map(tonic::Response::into_inner)
+        await_stream_setup(
+            self.request_timeout,
+            sidechain_id,
+            self.inner.subscribe_events(Request::new(request)),
+        )
+        .await
+        .map(tonic::Response::into_inner)
     }
 
     fn unary_request<T>(&self, message: T) -> Request<T> {
@@ -132,8 +145,51 @@ impl EnforcerClient {
     }
 }
 
+async fn await_stream_setup<T, F>(
+    request_timeout: Duration,
+    sidechain_id: u8,
+    setup: F,
+) -> Result<T>
+where
+    F: Future<Output = Result<T, tonic::Status>>,
+{
+    tokio::time::timeout(request_timeout, setup)
+        .await
+        .with_context(|| {
+            format!("waiting for ValidatorService.SubscribeEvents for sidechain {sidechain_id}")
+        })?
+        .with_context(|| {
+            format!("calling ValidatorService.SubscribeEvents for sidechain {sidechain_id}")
+        })
+}
+
 fn reverse_hex(value: impl Into<String>) -> common::ReverseHex {
     common::ReverseHex {
         hex: Some(value.into()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::future;
+    use std::time::Duration;
+
+    use super::await_stream_setup;
+
+    #[tokio::test]
+    async fn stream_setup_is_bounded_by_the_request_timeout() {
+        let error = await_stream_setup(
+            Duration::from_millis(1),
+            9,
+            future::pending::<Result<(), tonic::Status>>(),
+        )
+        .await
+        .expect_err("idle stream setup must time out");
+
+        assert!(
+            error
+                .to_string()
+                .contains("waiting for ValidatorService.SubscribeEvents for sidechain 9")
+        );
     }
 }
