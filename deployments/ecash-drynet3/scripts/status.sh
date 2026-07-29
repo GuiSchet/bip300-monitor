@@ -43,3 +43,19 @@ if chain_tip="$(enforcer_rpc GetChainTip)"; then
 else
     info "enforcer validator has not established a chain tip yet"
 fi
+
+if ! service_is_running nats; then
+    info "observation pipeline is not running; start it with 'just monitor-up'"
+    exit 0
+fi
+
+info "Core NATS health"
+nats_monitor /healthz | jq '{status}'
+
+info "monitor NATS clients"
+nats_monitor /connz |
+    jq '[.connections[] | select(.name | startswith("bip300-monitor-")) | {name, subscriptions, in_msgs, out_msgs}]'
+
+info "enforcer event subscriptions"
+nats_monitor '/subsz?subs=true' |
+    jq '[.subscriptions_list[] | select(.subject == "bip300.enforcer") | {account, subject, msgs}]'

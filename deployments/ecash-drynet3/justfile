@@ -17,6 +17,10 @@ up:
 enforcer-up:
     ./scripts/enforcer-up.sh
 
+# Start NATS, the event logger, and the enforcer extractor in safe order.
+monitor-up:
+    ./scripts/monitor-up.sh
+
 # Download, verify, and load the pinned AssumeUTXO snapshot.
 snapshot:
     ./scripts/snapshot.sh
@@ -25,7 +29,7 @@ snapshot:
 status:
     ./scripts/status.sh
 
-# Verify that the node and enforcer agree on the current Drynet3 tip.
+# Verify the complete node-to-logger observation pipeline.
 verify:
     ./scripts/verify.sh
 

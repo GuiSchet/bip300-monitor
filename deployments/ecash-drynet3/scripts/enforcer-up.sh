@@ -18,4 +18,4 @@ compose pull enforcer
 info "starting the Drynet3 enforcer"
 compose up --detach enforcer
 compose ps enforcer
-info "the initial validator sync may take time; run 'just status' and 'just verify'"
+info "the initial validator sync may take time; run 'just status', then 'just monitor-up'"

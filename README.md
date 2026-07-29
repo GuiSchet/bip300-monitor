@@ -126,10 +126,9 @@ cargo run --example get_chain_info -- \
 
 ## Next
 
-Planned work includes the NATS and monitor services for the eCash Drynet
-deployment, VM acceptance, operational metrics, gRPC resubscription, and gap
-backfill. Pending withdrawal vote counts require a future extension to the
-enforcer's public API.
+Planned work includes VM acceptance, operational metrics, gRPC resubscription,
+and gap backfill. Pending withdrawal vote counts require a future extension to
+the enforcer's public API.
 
 ## License
 

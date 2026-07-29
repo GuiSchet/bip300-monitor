@@ -19,6 +19,13 @@ require_command() {
     command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"
 }
 
+require_positive_integer() {
+    local name="$1"
+    local value="$2"
+    [[ "${value}" =~ ^[0-9]+$ ]] || die "${name} must be numeric"
+    ((value > 0)) || die "${name} must be greater than zero"
+}
+
 load_versions() {
     [[ -f "${VERSIONS_FILE}" ]] || die "missing ${VERSIONS_FILE}"
     # This file is tracked in the repository and contains assignments only.
@@ -46,10 +53,12 @@ load_deployment_env() {
     : "${PGID:?PGID must be set}"
     [[ "${PUID}" =~ ^[0-9]+$ ]] || die "PUID must be numeric"
     [[ "${PGID}" =~ ^[0-9]+$ ]] || die "PGID must be numeric"
-    [[ "${ENFORCER_SYNC_WAIT_SECONDS:-300}" =~ ^[0-9]+$ ]] ||
-        die "ENFORCER_SYNC_WAIT_SECONDS must be numeric"
-    (("${ENFORCER_SYNC_WAIT_SECONDS:-300}" > 0)) ||
-        die "ENFORCER_SYNC_WAIT_SECONDS must be greater than zero"
+    require_positive_integer \
+        ENFORCER_SYNC_WAIT_SECONDS "${ENFORCER_SYNC_WAIT_SECONDS:-300}"
+    require_positive_integer \
+        MONITOR_STARTUP_WAIT_SECONDS "${MONITOR_STARTUP_WAIT_SECONDS:-60}"
+    require_positive_integer \
+        MONITOR_EVENT_WAIT_SECONDS "${MONITOR_EVENT_WAIT_SECONDS:-60}"
 }
 
 data_root() {
@@ -94,6 +103,67 @@ enforcer_rpc() {
         --header 'Content-Type: application/json' \
         --data '{}' \
         "http://127.0.0.1:50051/cusf.mainchain.v1.ValidatorService/${method}"
+}
+
+nats_monitor() {
+    local endpoint="$1"
+    compose exec -T nats \
+        wget -qO- "http://127.0.0.1:8222${endpoint}"
+}
+
+nats_is_healthy() {
+    local health
+    health="$(nats_monitor /healthz 2>/dev/null)" &&
+        jq -e '.status == "ok"' <<<"${health}" >/dev/null
+}
+
+nats_has_client() {
+    local client_name="$1"
+    local connections
+    connections="$(nats_monitor /connz 2>/dev/null)" &&
+        jq -e --arg client_name "${client_name}" \
+            '.connections | any(.name == $client_name)' \
+            <<<"${connections}" >/dev/null
+}
+
+nats_has_enforcer_subscription() {
+    local subscriptions
+    subscriptions="$(nats_monitor '/subsz?subs=true' 2>/dev/null)" &&
+        jq -e \
+            '.subscriptions_list | any(.account == "$G" and .subject == "bip300.enforcer")' \
+            <<<"${subscriptions}" >/dev/null
+}
+
+wait_for_nats_health() {
+    local wait_seconds="${MONITOR_STARTUP_WAIT_SECONDS:-60}"
+    local deadline="$((SECONDS + wait_seconds))"
+    until nats_is_healthy; do
+        ((SECONDS < deadline)) ||
+            die "Core NATS was not healthy after ${wait_seconds}s"
+        sleep 2
+    done
+}
+
+wait_for_event_logger_subscription() {
+    local wait_seconds="${MONITOR_STARTUP_WAIT_SECONDS:-60}"
+    local deadline="$((SECONDS + wait_seconds))"
+    until nats_has_client bip300-monitor-event-logger &&
+        nats_has_enforcer_subscription; do
+        ((SECONDS < deadline)) ||
+            die "event logger subscription was not ready after ${wait_seconds}s"
+        sleep 2
+    done
+}
+
+wait_for_nats_client() {
+    local client_name="$1"
+    local wait_seconds="${MONITOR_STARTUP_WAIT_SECONDS:-60}"
+    local deadline="$((SECONDS + wait_seconds))"
+    until nats_has_client "${client_name}"; do
+        ((SECONDS < deadline)) ||
+            die "NATS client ${client_name} was not connected after ${wait_seconds}s"
+        sleep 2
+    done
 }
 
 require_drynet_activation_block() {
