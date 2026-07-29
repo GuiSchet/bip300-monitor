@@ -88,6 +88,12 @@ normalized payload as one-line JSON with byte fields in hexadecimal.
 
 CI publishes separate public `linux/amd64` images for the extractor and logger.
 
+## Deployments
+
+Reproducible, network-specific infrastructure lives under `deployments/`.
+The first target is the in-progress
+[eCash Drynet3 deployment](deployments/ecash-drynet3/README.md).
+
 ## Build
 
 ```bash

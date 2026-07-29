@@ -1,0 +1,54 @@
+---
+name: ${COMPOSE_PROJECT_NAME:-bip300-ecash-drynet3}
+
+services:
+  ecash-node:
+    image: ${ECASH_NODE_IMAGE:?ECASH_NODE_IMAGE must be set by VERSIONS.lock}
+    init: true
+    restart: unless-stopped
+    stop_grace_period: 2m
+    environment:
+      BITCOIN_DATA: /data
+      GID: ${PGID:-1000}
+      UID: ${PUID:-1000}
+    command:
+      - -conf=/etc/ecash/drivechain-ecash.conf
+      - -printtoconsole=1
+    volumes:
+      - type: bind
+        source: ${ECASH_DATA_ROOT:-./data}/node
+        target: /data
+      - type: bind
+        source: ${ECASH_DATA_ROOT:-./data}/snapshots
+        target: /snapshots
+        read_only: true
+      - type: bind
+        source: ./config/drynet3/drivechain-ecash.conf
+        target: /etc/ecash/drivechain-ecash.conf
+        read_only: true
+    networks:
+      ecash-internal:
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          bitcoin-cli -datadir=/data
+          -conf=/etc/ecash/drivechain-ecash.conf
+          -rpcwait getblockchaininfo >/dev/null
+      interval: 30s
+      timeout: 20s
+      retries: 20
+      start_period: 2m
+    logging:
+      driver: json-file
+      options:
+        max-file: "5"
+        max-size: 20m
+
+networks:
+  ecash-internal:
+    name: ${COMPOSE_PROJECT_NAME:-bip300-ecash-drynet3}-internal
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.0.0/24
