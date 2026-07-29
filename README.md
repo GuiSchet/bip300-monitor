@@ -87,9 +87,6 @@ normalized payload as one-line JSON with byte fields in hexadecimal.
 ## Container images
 
 CI publishes separate public `linux/amd64` images for the extractor and logger.
-Their names, immutable tags, local builds, and Docker Hub setup are documented
-in [`docs/container-images.md`](docs/container-images.md). The images are
-network-neutral; eCash Drynet configuration belongs in its deployment Compose.
 
 ## Build
 
