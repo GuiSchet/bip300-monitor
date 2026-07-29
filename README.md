@@ -91,7 +91,7 @@ CI publishes separate public `linux/amd64` images for the extractor and logger.
 ## Deployments
 
 Reproducible, network-specific infrastructure lives under `deployments/`.
-The first target is the in-progress
+The first target currently includes a pinned node and validator enforcer:
 [eCash Drynet3 deployment](deployments/ecash-drynet3/README.md).
 
 ## Build
@@ -126,9 +126,10 @@ cargo run --example get_chain_info -- \
 
 ## Next
 
-Planned work includes operational metrics, a complete eCash Drynet deployment,
-gRPC resubscription, and gap backfill. Pending withdrawal vote counts require a
-future extension to the enforcer's public API.
+Planned work includes the NATS and monitor services for the eCash Drynet
+deployment, VM acceptance, operational metrics, gRPC resubscription, and gap
+backfill. Pending withdrawal vote counts require a future extension to the
+enforcer's public API.
 
 ## License
 

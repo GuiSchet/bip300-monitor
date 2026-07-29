@@ -23,6 +23,9 @@ services:
         target: /snapshots
         read_only: true
       - type: bind
+        source: ${ECASH_DATA_ROOT:-./data}/rpc-cookie
+        target: /rpc-cookie
+      - type: bind
         source: ./config/drynet3/drivechain-ecash.conf
         target: /etc/ecash/drivechain-ecash.conf
         read_only: true
@@ -39,6 +42,65 @@ services:
       timeout: 20s
       retries: 20
       start_period: 2m
+    logging:
+      driver: json-file
+      options:
+        max-file: "5"
+        max-size: 20m
+
+  enforcer:
+    image: ${ENFORCER_IMAGE:?ENFORCER_IMAGE must be set by VERSIONS.lock}
+    init: true
+    restart: unless-stopped
+    stop_grace_period: 2m
+    user: ${PUID:-1000}:${PGID:-1000}
+    environment:
+      HOME: /data
+      RUST_LOG: ${ENFORCER_RUST_LOG:-info}
+    command:
+      - --data-dir=/data
+      - --network-preset=drynet3
+      - --node-rpc-addr=ecash-node:8332
+      - --node-rpc-cookie-path=/rpc-cookie/.cookie
+      - --node-zmq-addr-sequence=tcp://ecash-node:29000
+      - --node-blocks-dir=/node-blocks
+      - --serve-grpc-addr=0.0.0.0:50051
+      - --bitcoin-core-expected-version=31
+      - --log-level=INFO
+    volumes:
+      - type: bind
+        source: ${ECASH_DATA_ROOT:-./data}/enforcer
+        target: /data
+      - type: bind
+        source: ${ECASH_DATA_ROOT:-./data}/rpc-cookie
+        target: /rpc-cookie
+        read_only: true
+      - type: bind
+        source: ${ECASH_DATA_ROOT:-./data}/node/blocks
+        target: /node-blocks
+        read_only: true
+    depends_on:
+      ecash-node:
+        condition: service_healthy
+    networks:
+      ecash-internal:
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          curl --fail --silent --show-error --max-time 10
+          --request POST --header 'Content-Type: application/json'
+          --data '{}'
+          http://127.0.0.1:50051/cusf.mainchain.v1.ValidatorService/GetChainTip
+          >/dev/null
+      interval: 30s
+      timeout: 15s
+      retries: 10
+      start_period: 5m
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
     logging:
       driver: json-file
       options:

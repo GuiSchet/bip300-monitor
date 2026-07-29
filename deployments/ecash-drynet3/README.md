@@ -2,8 +2,8 @@
 
 Single-VM infrastructure for exercising `bip300-monitor` against the current
 eCash/Drivechain dry-run network. This directory currently deploys the pinned
-Drynet3 L1 node; the enforcer and observation pipeline are added in the next
-reviewable stages.
+Drynet3 L1 node and its validator enforcer. NATS and the observation pipeline
+are added in the next reviewable stage.
 
 Drynet3 is an experimental fork network. It shares Bitcoin mainnet's network
 magic, so this deployment uses a dedicated data directory and connects only to
@@ -38,32 +38,46 @@ just snapshot
 just status
 ```
 
-Once the node reaches the active Drynet3 tip, run the operational acceptance
-check:
+Once the node reaches the active Drynet3 tip, start the pinned validator-only
+enforcer. Wallet and mining services are deliberately disabled:
+
+```bash
+just enforcer-up
+just status
+```
+
+The first enforcer synchronization can take time. It reads the node's block
+files directly when available and uses RPC for anything still missing. Run the
+operational acceptance check when its tip catches up:
 
 ```bash
 just verify
 ```
 
 It checks the running node, the exact Drynet3 activation block, initial
-synchronization state, chainstate availability, and that Compose publishes no
-host ports. Repository format and configuration checks run separately in
-GitHub Actions.
+synchronization state, enforcer network constants, and that both services agree
+on the current tip. Repository format and configuration checks run separately
+in GitHub Actions. `ENFORCER_SYNC_WAIT_SECONDS` controls how long `just verify`
+waits for the tips to converge.
 
 Useful commands are listed by `just --list`. `just down` stops the containers
 without deleting `${ECASH_DATA_ROOT}`.
 
 ## Network exposure
 
-Compose publishes no host ports. RPC, REST, and ZMQ are reachable only by
-containers on the deployment network. The node makes an outbound connection to
-`drynet3.drivechain.dev:8337` and does not accept inbound peers.
+Compose publishes no host ports. Node RPC, REST, ZMQ, and enforcer gRPC are
+reachable only by containers on the deployment network. The node makes an
+outbound connection to `drynet3.drivechain.dev:8337` and does not accept inbound
+peers. The enforcer authenticates with a shared RPC cookie; no RPC password is
+stored in the repository or container arguments.
 
 ## Persistent layout
 
 ```text
 ${ECASH_DATA_ROOT}/
+├── enforcer/
 ├── node/
+├── rpc-cookie/
 └── snapshots/
 ```
 

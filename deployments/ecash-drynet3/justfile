@@ -9,9 +9,13 @@ default:
 init:
     ./scripts/init.sh
 
-# Pull the pinned images and start the current stack.
+# Pull and start the pinned Drynet3 node.
 up:
     ./scripts/up.sh
+
+# Start the enforcer after the Drynet3 node is synchronized.
+enforcer-up:
+    ./scripts/enforcer-up.sh
 
 # Download, verify, and load the pinned AssumeUTXO snapshot.
 snapshot:
@@ -21,7 +25,7 @@ snapshot:
 status:
     ./scripts/status.sh
 
-# Verify that the node is synchronized and ready for the next stage.
+# Verify that the node and enforcer agree on the current Drynet3 tip.
 verify:
     ./scripts/verify.sh
 

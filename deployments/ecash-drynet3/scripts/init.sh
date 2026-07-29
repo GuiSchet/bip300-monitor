@@ -26,7 +26,11 @@ load_deployment_env
 resolved_data_root="$(data_root)"
 [[ "${resolved_data_root}" != "/" ]] || die "ECASH_DATA_ROOT must not be /"
 
-for directory in "${resolved_data_root}/node" "${resolved_data_root}/snapshots"; do
+for directory in \
+    "${resolved_data_root}/node" \
+    "${resolved_data_root}/snapshots" \
+    "${resolved_data_root}/rpc-cookie" \
+    "${resolved_data_root}/enforcer"; do
     if ! mkdir -p -- "${directory}" 2>/dev/null; then
         require_command sudo
         sudo install -d -o "${PUID}" -g "${PGID}" "${directory}"
@@ -34,6 +38,8 @@ for directory in "${resolved_data_root}/node" "${resolved_data_root}/snapshots";
     [[ -w "${directory}" ]] ||
         die "${directory} is not writable by the current user"
 done
+
+chmod 0750 "${resolved_data_root}/rpc-cookie"
 
 compose config --quiet
 info "Drynet3 deployment initialized at ${resolved_data_root}"
