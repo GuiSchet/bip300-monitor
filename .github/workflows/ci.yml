@@ -257,6 +257,24 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Install deployment check dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            jq \
+            shellcheck \
+            shfmt \
+            yamllint
+
+      - name: Install pinned just
+        if: hashFiles('deployments/ecash-drynet3/scripts/install-just.sh') != ''
+        working-directory: deployments/ecash-drynet3
+        env:
+          JUST_INSTALL_DIR: ${{ runner.temp }}/just/bin
+        run: |
+          ./scripts/install-just.sh "${JUST_INSTALL_DIR}"
+          echo "${JUST_INSTALL_DIR}" >> "${GITHUB_PATH}"
+
       - name: Reject tracked deployment secrets
         run: |
           set -euo pipefail
@@ -267,6 +285,11 @@ jobs:
           fi
 
           echo "No tracked deployment .env files found."
+
+      - name: Validate eCash Drynet3 deployment
+        if: hashFiles('deployments/ecash-drynet3/scripts/static-check.sh') != ''
+        working-directory: deployments/ecash-drynet3
+        run: ./scripts/static-check.sh
 
   # Other jobs may be intentionally skipped, which makes their individual
   # check names unstable. This always-running aggregate is the required PR check.

@@ -1,0 +1,34 @@
+set dotenv-load
+set shell := ["bash", "-euo", "pipefail", "-c"]
+
+# Show the available deployment commands.
+default:
+    @just --list
+
+# Create local configuration and persistent directories.
+init:
+    ./scripts/init.sh
+
+# Pull the pinned images and start the current stack.
+up:
+    ./scripts/up.sh
+
+# Download, verify, and load the pinned AssumeUTXO snapshot.
+snapshot:
+    ./scripts/snapshot.sh
+
+# Show container, blockchain, and chainstate status.
+status:
+    ./scripts/status.sh
+
+# Verify that the node is synchronized and ready for the next stage.
+verify:
+    ./scripts/verify.sh
+
+# Follow all logs, or only one named service.
+logs service="":
+    ./scripts/logs.sh "{{ service }}"
+
+# Stop the stack without deleting persistent data.
+down:
+    ./scripts/down.sh
