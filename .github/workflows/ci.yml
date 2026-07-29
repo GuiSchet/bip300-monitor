@@ -147,5 +147,6 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha,scope=${{ matrix.target }}
           push: true
-          provenance: mode=max
-          sbom: true
+          # Keep a single image manifest until Docker Hub indexes attached attestations.
+          provenance: false
+          sbom: false
