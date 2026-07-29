@@ -72,7 +72,7 @@ impl Default for NatsArgs {
 }
 
 impl NatsArgs {
-    /// Return the maximum time allowed for a server-confirmed flush.
+    /// Return the maximum time allowed for a client transport flush.
     pub const fn flush_timeout(&self) -> Duration {
         Duration::from_secs(self.nats_flush_timeout_seconds)
     }
@@ -164,7 +164,7 @@ impl EventPublisher {
         self.flush().await
     }
 
-    /// Wait until the server has processed all previously sent messages.
+    /// Wait until the NATS client transport buffer has been flushed.
     pub async fn flush(&self) -> Result<()> {
         timeout(self.flush_timeout, self.client.flush())
             .await

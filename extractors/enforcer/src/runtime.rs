@@ -1,6 +1,7 @@
 //! Continuous enforcer event extraction.
 
 use std::future::Future;
+use std::pin::Pin;
 
 use anyhow::{Context, Result, bail};
 use futures_util::future::try_join_all;
@@ -17,16 +18,55 @@ use tonic::{Status, Streaming};
 use crate::config::Args;
 use crate::event::envelope;
 use crate::proto::mainchain;
-use crate::snapshot::{InitialSnapshot, collect_snapshot, current_tip_hash, publish_snapshot};
+use crate::snapshot::{self, InitialSnapshot, publish_snapshot};
 use crate::{EnforcerClient, convert};
 
 type EventStream = Streaming<mainchain::SubscribeEventsResponse>;
+type StartupFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>>;
+
+trait StartupSource: Clone + Send {
+    type Stream: Send;
+
+    fn subscribe_events(&mut self, sidechain: u8) -> StartupFuture<'_, Self::Stream>;
+    fn current_tip_hash(&mut self) -> StartupFuture<'_, Vec<u8>>;
+    fn collect_snapshot<'a>(
+        &'a mut self,
+        sidechains: &'a [u8],
+    ) -> StartupFuture<'a, InitialSnapshot>;
+}
+
+impl StartupSource for EnforcerClient {
+    type Stream = EventStream;
+
+    fn subscribe_events(&mut self, sidechain: u8) -> StartupFuture<'_, Self::Stream> {
+        Box::pin(EnforcerClient::subscribe_events(self, sidechain))
+    }
+
+    fn current_tip_hash(&mut self) -> StartupFuture<'_, Vec<u8>> {
+        Box::pin(snapshot::current_tip_hash(self))
+    }
+
+    fn collect_snapshot<'a>(
+        &'a mut self,
+        sidechains: &'a [u8],
+    ) -> StartupFuture<'a, InitialSnapshot> {
+        Box::pin(snapshot::collect_snapshot(self, sidechains))
+    }
+}
 
 struct PreparedStartup {
     publisher: EventPublisher,
     streams: Vec<(u8, EventStream)>,
     snapshot: InitialSnapshot,
     tip_before_snapshot: Vec<u8>,
+    tip_after_snapshot: Vec<u8>,
+}
+
+struct PreparedObservation<S> {
+    streams: Vec<(u8, S)>,
+    snapshot: InitialSnapshot,
+    tip_before_snapshot: Vec<u8>,
+    tip_after_snapshot: Vec<u8>,
 }
 
 /// Publish an initial snapshot and then monitor every configured sidechain.
@@ -50,13 +90,19 @@ pub async fn run(args: Args, mut shutdown_rx: watch::Receiver<bool>) -> Result<(
         streams,
         snapshot,
         tip_before_snapshot,
+        tip_after_snapshot,
     } = prepared;
 
-    if tip_before_snapshot != snapshot.tip_hash {
+    if !snapshot_tips_are_consistent(
+        &tip_before_snapshot,
+        &snapshot.tip_hash,
+        &tip_after_snapshot,
+    ) {
         tracing::warn!(
             tip_before = %hex::encode(&tip_before_snapshot),
             snapshot_tip = %hex::encode(&snapshot.tip_hash),
-            "mainchain tip changed while opening subscriptions and collecting the snapshot; \
+            tip_after = %hex::encode(&tip_after_snapshot),
+            "mainchain tip changed while collecting the initial snapshot; \
              buffered live events may duplicate snapshot state"
         );
     }
@@ -84,27 +130,9 @@ pub async fn run(args: Args, mut shutdown_rx: watch::Receiver<bool>) -> Result<(
         ));
     }
 
-    let runtime_result = supervise_workers(workers).await;
-    let flush_result = publisher
-        .flush()
-        .await
-        .context("flushing live enforcer events during shutdown");
-
-    match (runtime_result, flush_result) {
-        (Ok(()), Ok(())) => {
-            tracing::info!("enforcer extractor stopped");
-            Ok(())
-        }
-        (Err(primary), Ok(())) => Err(primary),
-        (Ok(()), Err(flush_error)) => Err(flush_error),
-        (Err(primary), Err(flush_error)) => {
-            tracing::error!(
-                error = %format!("{flush_error:#}"),
-                "final NATS flush also failed while handling a fatal extractor error"
-            );
-            Err(primary)
-        }
-    }
+    supervise_workers(workers).await?;
+    tracing::info!("enforcer extractor stopped");
+    Ok(())
 }
 
 async fn prepare_startup(args: &Args) -> Result<PreparedStartup> {
@@ -115,9 +143,34 @@ async fn prepare_startup(args: &Args) -> Result<PreparedStartup> {
     let mut client = EnforcerClient::connect(&args.enforcer_endpoint, args.request_timeout())
         .await
         .context("connecting the enforcer client")?;
-    tracing::info!(endpoint = %args.enforcer_endpoint, "connected to enforcer");
 
-    let subscriptions = args.sidechains.iter().copied().map(|sidechain| {
+    let observation = prepare_observation(&mut client, &args.sidechains)
+        .await
+        .context("preparing enforcer subscriptions and initial snapshot")?;
+    let PreparedObservation {
+        streams,
+        snapshot,
+        tip_before_snapshot,
+        tip_after_snapshot,
+    } = observation;
+
+    Ok(PreparedStartup {
+        publisher,
+        streams,
+        snapshot,
+        tip_before_snapshot,
+        tip_after_snapshot,
+    })
+}
+
+async fn prepare_observation<C>(
+    client: &mut C,
+    sidechains: &[u8],
+) -> Result<PreparedObservation<C::Stream>>
+where
+    C: StartupSource,
+{
+    let subscriptions = sidechains.iter().copied().map(|sidechain| {
         let mut subscription_client = client.clone();
         async move {
             let stream = subscription_client
@@ -132,19 +185,29 @@ async fn prepare_startup(args: &Args) -> Result<PreparedStartup> {
         .await
         .context("opening all sidechain subscriptions")?;
 
-    let tip_before_snapshot = current_tip_hash(&mut client)
+    let tip_before_snapshot = client
+        .current_tip_hash()
         .await
         .context("reading the mainchain tip before collecting the snapshot")?;
-    let snapshot = collect_snapshot(&mut client, &args.sidechains)
+    let snapshot = client
+        .collect_snapshot(sidechains)
         .await
         .context("collecting the initial enforcer snapshot")?;
+    let tip_after_snapshot = client
+        .current_tip_hash()
+        .await
+        .context("reading the mainchain tip after collecting the snapshot")?;
 
-    Ok(PreparedStartup {
-        publisher,
+    Ok(PreparedObservation {
         streams,
         snapshot,
         tip_before_snapshot,
+        tip_after_snapshot,
     })
+}
+
+fn snapshot_tips_are_consistent(tip_before: &[u8], snapshot_tip: &[u8], tip_after: &[u8]) -> bool {
+    tip_before == snapshot_tip && snapshot_tip == tip_after
 }
 
 async fn monitor_sidechain(
@@ -292,6 +355,7 @@ fn log_published_event(sidechain: u8, event: &Event) {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
@@ -303,8 +367,12 @@ mod tests {
     use tokio::sync::{Notify, watch};
     use tokio::time::timeout;
 
-    use super::{forward_stream, supervise_workers};
+    use super::{
+        StartupFuture, StartupSource, forward_stream, prepare_observation,
+        snapshot_tips_are_consistent, supervise_workers,
+    };
     use crate::proto::{common, mainchain};
+    use crate::snapshot::InitialSnapshot;
 
     fn reverse_hex(byte: u8) -> Option<common::ReverseHex> {
         Some(common::ReverseHex {
@@ -361,6 +429,120 @@ mod tests {
             panic!("expected enforcer envelope");
         };
         event.event.as_ref().expect("normalized enforcer event")
+    }
+
+    #[derive(Clone)]
+    struct FakeStartupSource {
+        calls: Arc<Mutex<Vec<String>>>,
+        tips: Arc<Mutex<VecDeque<Vec<u8>>>>,
+        snapshot_tip: Vec<u8>,
+    }
+
+    impl StartupSource for FakeStartupSource {
+        type Stream = futures_util::stream::Pending<
+            std::result::Result<mainchain::SubscribeEventsResponse, tonic::Status>,
+        >;
+
+        fn subscribe_events(&mut self, sidechain: u8) -> StartupFuture<'_, Self::Stream> {
+            let calls = Arc::clone(&self.calls);
+            Box::pin(async move {
+                calls
+                    .lock()
+                    .expect("startup call lock")
+                    .push(format!("subscribe:{sidechain}"));
+                Ok(stream::pending())
+            })
+        }
+
+        fn current_tip_hash(&mut self) -> StartupFuture<'_, Vec<u8>> {
+            let calls = Arc::clone(&self.calls);
+            let tips = Arc::clone(&self.tips);
+            Box::pin(async move {
+                calls
+                    .lock()
+                    .expect("startup call lock")
+                    .push("tip".to_owned());
+                Ok(tips
+                    .lock()
+                    .expect("startup tip lock")
+                    .pop_front()
+                    .expect("configured fake tip"))
+            })
+        }
+
+        fn collect_snapshot<'a>(
+            &'a mut self,
+            _sidechains: &'a [u8],
+        ) -> StartupFuture<'a, InitialSnapshot> {
+            let calls = Arc::clone(&self.calls);
+            let snapshot_tip = self.snapshot_tip.clone();
+            Box::pin(async move {
+                calls
+                    .lock()
+                    .expect("startup call lock")
+                    .push("snapshot".to_owned());
+                Ok(InitialSnapshot {
+                    events: Vec::new(),
+                    tip_hash: snapshot_tip,
+                })
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn startup_opens_every_subscription_before_collecting_the_snapshot() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut source = FakeStartupSource {
+            calls: Arc::clone(&calls),
+            tips: Arc::new(Mutex::new(VecDeque::from([vec![0x11; 32], vec![0x11; 32]]))),
+            snapshot_tip: vec![0x11; 32],
+        };
+
+        let observation = prepare_observation(&mut source, &[9, 98])
+            .await
+            .expect("prepared observation");
+
+        assert_eq!(
+            observation
+                .streams
+                .iter()
+                .map(|(sidechain, _)| *sidechain)
+                .collect::<Vec<_>>(),
+            vec![9, 98]
+        );
+
+        let calls = calls.lock().expect("startup call lock");
+        let tip_positions = calls
+            .iter()
+            .enumerate()
+            .filter_map(|(index, call)| (call == "tip").then_some(index))
+            .collect::<Vec<_>>();
+        let snapshot_position = calls
+            .iter()
+            .position(|call| call == "snapshot")
+            .expect("snapshot call");
+
+        assert_eq!(tip_positions.len(), 2);
+        assert!(
+            calls
+                .iter()
+                .enumerate()
+                .filter(|(_, call)| call.starts_with("subscribe:"))
+                .all(|(index, _)| index < tip_positions[0])
+        );
+        assert!(tip_positions[0] < snapshot_position);
+        assert!(snapshot_position < tip_positions[1]);
+    }
+
+    #[test]
+    fn detects_tip_changes_anywhere_in_the_snapshot_window() {
+        let tip = vec![0x11; 32];
+        let different_tip = vec![0x22; 32];
+
+        assert!(snapshot_tips_are_consistent(&tip, &tip, &tip));
+        assert!(!snapshot_tips_are_consistent(&different_tip, &tip, &tip));
+        assert!(!snapshot_tips_are_consistent(&tip, &different_tip, &tip));
+        assert!(!snapshot_tips_are_consistent(&tip, &tip, &different_tip));
     }
 
     #[tokio::test]

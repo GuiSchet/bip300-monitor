@@ -8,11 +8,10 @@ use clap::{Parser, ValueEnum};
 use shared::nats::NatsArgs;
 
 /// Logging verbosity used when `RUST_LOG` does not provide a more specific filter.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 pub enum LogLevel {
     Error,
     Warn,
-    #[default]
     Info,
     Debug,
     Trace,
@@ -80,7 +79,7 @@ pub struct Args {
     #[arg(
         long,
         env = "BIP300_MONITOR_SHUTDOWN_TIMEOUT_SECONDS",
-        default_value_t = 5,
+        default_value_t = 15,
         value_parser = clap::value_parser!(u64).range(1..)
     )]
     pub shutdown_timeout_seconds: u64,
@@ -89,6 +88,14 @@ pub struct Args {
 impl Args {
     /// Validate invariants that are not expressible directly through clap.
     pub fn validate(&self) -> Result<()> {
+        if self.shutdown_timeout_seconds <= self.nats.nats_flush_timeout_seconds {
+            bail!(
+                "shutdown timeout ({}s) must be greater than the NATS flush timeout ({}s)",
+                self.shutdown_timeout_seconds,
+                self.nats.nats_flush_timeout_seconds
+            );
+        }
+
         let mut unique = HashSet::with_capacity(self.sidechains.len());
         for sidechain in &self.sidechains {
             if !unique.insert(sidechain) {
@@ -132,8 +139,44 @@ mod tests {
         assert_eq!(args.log_level, LogLevel::Info);
         assert_eq!(args.request_timeout_seconds, 10);
         assert_eq!(args.nats.nats_flush_timeout_seconds, 10);
-        assert_eq!(args.shutdown_timeout_seconds, 5);
+        assert_eq!(args.shutdown_timeout_seconds, 15);
         args.validate().expect("unique sidechains");
+    }
+
+    #[test]
+    fn validates_the_shutdown_and_flush_timeout_relationship() {
+        let valid = Args::try_parse_from([
+            "enforcer-extractor",
+            "--sidechain",
+            "9",
+            "--nats-flush-timeout-seconds",
+            "10",
+            "--shutdown-timeout-seconds",
+            "11",
+        ])
+        .expect("syntactically valid arguments");
+        valid.validate().expect("shutdown has time to flush");
+
+        for shutdown_timeout in ["10", "9"] {
+            let invalid = Args::try_parse_from([
+                "enforcer-extractor",
+                "--sidechain",
+                "9",
+                "--nats-flush-timeout-seconds",
+                "10",
+                "--shutdown-timeout-seconds",
+                shutdown_timeout,
+            ])
+            .expect("syntactically valid arguments");
+            let error = invalid
+                .validate()
+                .expect_err("shutdown must outlast a NATS flush");
+            assert!(
+                error
+                    .to_string()
+                    .contains("must be greater than the NATS flush timeout")
+            );
+        }
     }
 
     #[test]

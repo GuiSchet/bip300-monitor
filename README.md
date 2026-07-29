@@ -63,7 +63,9 @@ a second signal or the configured timeout forces termination.
 Core NATS delivery remains at-most-once and non-durable. A successful client
 flush is not a server or consumer acknowledgement, and this pilot does not
 backfill downtime gaps. Detailed event and delivery semantics are documented in
-[`proto/README.md`](proto/README.md).
+[`proto/README.md`](proto/README.md). Persistent NATS failures terminate the
+extractor; deployments must restart it, and every restart republishes the
+snapshot.
 
 ## Build
 
@@ -83,9 +85,10 @@ NATS_SERVER_BINARY=/path/to/nats-server \
   cargo test --workspace --all-features --jobs 2
 ```
 
-Drynet gate: with `--request-timeout-seconds 5`, confirm that subscriptions to
-an idle enforcer remain open for more than five seconds and that `SIGTERM`
-produces a clean exit within the configured shutdown timeout.
+Drynet gate: confirm that an idle enforcer remains subscribed beyond
+`--request-timeout-seconds 5`; that normal `SIGTERM` exits with code 0 before
+the 15-second shutdown timeout; and that an in-flight publication with NATS
+unavailable reports its flush error before that outer deadline.
 
 To verify API compatibility against a running enforcer:
 

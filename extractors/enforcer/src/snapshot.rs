@@ -50,7 +50,7 @@ pub(crate) async fn current_tip_hash(client: &mut EnforcerClient) -> Result<Vec<
     tip_hash(&chain_tip)
 }
 
-/// Publish the complete snapshot and confirm the batch with one bounded flush.
+/// Publish the complete snapshot and flush the batch with one bounded wait.
 pub(crate) async fn publish_snapshot(
     publisher: &EventPublisher,
     snapshot: InitialSnapshot,
