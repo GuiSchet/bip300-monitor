@@ -6,11 +6,12 @@ pub mod client;
 pub mod config;
 pub mod convert;
 mod event;
-pub mod logging;
 pub mod proto;
 pub mod runtime;
 mod snapshot;
 
 pub use client::EnforcerClient;
-pub use config::{Args, LogLevel};
+pub use config::Args;
 pub use runtime::run;
+pub use shared::logging;
+pub use shared::logging::LogLevel;

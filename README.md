@@ -4,17 +4,22 @@ Rust tooling to monitor BIP300/301 enforcers.
 
 ## Status
 
-This project is an early pilot. The first extractor will consume the enforcer's
-public read-only API and publish live protobuf events to Core NATS.
+This project is an early pilot. The enforcer extractor consumes the enforcer's
+public read-only API and publishes normalized protobuf events to Core NATS.
 
 ## Architecture
 
 ```text
 BIP300/301 enforcer ── Connect/gRPC ──► enforcer-extractor ── protobuf ──► NATS
+                                                                           │
+                                                                           ▼
+                                                                     event-logger
 ```
 
-- `shared` contains common event, NATS, and metrics infrastructure.
+- `shared` contains common event, NATS, diagnostics, and lifecycle
+  infrastructure.
 - `extractors/enforcer` contains the enforcer client and extraction runtime.
+- `tools/event-logger` decodes the events received from NATS and logs them.
 
 The enforcer extractor generates a standard gRPC client from a minimal vendored
 copy of the enforcer's public validator API. It does not link to the enforcer
@@ -67,6 +72,25 @@ backfill downtime gaps. Detailed event and delivery semantics are documented in
 extractor; deployments must restart it, and every restart republishes the
 snapshot.
 
+## Inspecting events
+
+The event logger proves the consumer side of the pipeline by subscribing to
+`bip300.enforcer` and decoding the received protobuf envelopes:
+
+```bash
+cargo run -p event-logger -- --nats-url nats://127.0.0.1:4222
+```
+
+It prints one summary per event. Add `--full-events` to also print the complete
+normalized payload as one-line JSON with byte fields in hexadecimal.
+
+## Container images
+
+CI publishes separate public `linux/amd64` images for the extractor and logger.
+Their names, immutable tags, local builds, and Docker Hub setup are documented
+in [`docs/container-images.md`](docs/container-images.md). The images are
+network-neutral; eCash Drynet configuration belongs in its deployment Compose.
+
 ## Build
 
 ```bash
@@ -99,9 +123,9 @@ cargo run --example get_chain_info -- \
 
 ## Next
 
-Planned work includes operational metrics, gRPC resubscription, and gap
-backfill. Pending withdrawal vote counts require a future extension to the
-enforcer's public API.
+Planned work includes operational metrics, a complete eCash Drynet deployment,
+gRPC resubscription, and gap backfill. Pending withdrawal vote counts require a
+future extension to the enforcer's public API.
 
 ## License
 

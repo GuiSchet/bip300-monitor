@@ -264,8 +264,6 @@ dependencies = [
  "tonic-prost",
  "tonic-prost-build",
  "tracing",
- "tracing-log",
- "tracing-subscriber",
 ]
 
 [[package]]
@@ -282,6 +280,19 @@ checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "event-logger"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "hex",
+ "serde_json",
+ "shared",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -1145,11 +1156,14 @@ dependencies = [
  "anyhow",
  "async-nats",
  "clap",
+ "futures-util",
  "prost",
  "prost-build",
  "serde",
  "tokio",
  "tracing",
+ "tracing-log",
+ "tracing-subscriber",
 ]
 
 [[package]]

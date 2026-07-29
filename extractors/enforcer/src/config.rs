@@ -4,31 +4,9 @@ use std::collections::HashSet;
 use std::time::Duration;
 
 use anyhow::{Result, bail};
-use clap::{Parser, ValueEnum};
+use clap::Parser;
+use shared::logging::LogLevel;
 use shared::nats::NatsArgs;
-
-/// Logging verbosity used when `RUST_LOG` does not provide a more specific filter.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
-pub enum LogLevel {
-    Error,
-    Warn,
-    Info,
-    Debug,
-    Trace,
-}
-
-impl LogLevel {
-    /// Convert the CLI value into a tracing filter.
-    pub const fn as_filter(self) -> tracing::level_filters::LevelFilter {
-        match self {
-            Self::Error => tracing::level_filters::LevelFilter::ERROR,
-            Self::Warn => tracing::level_filters::LevelFilter::WARN,
-            Self::Info => tracing::level_filters::LevelFilter::INFO,
-            Self::Debug => tracing::level_filters::LevelFilter::DEBUG,
-            Self::Trace => tracing::level_filters::LevelFilter::TRACE,
-        }
-    }
-}
 
 /// Runtime configuration for the enforcer extractor.
 #[derive(Clone, Parser)]
@@ -119,8 +97,9 @@ impl Args {
 #[cfg(test)]
 mod tests {
     use clap::Parser;
+    use shared::logging::LogLevel;
 
-    use super::{Args, LogLevel};
+    use super::Args;
 
     #[test]
     fn parses_explicit_sidechains_and_defaults() {

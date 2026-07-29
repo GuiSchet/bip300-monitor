@@ -4,9 +4,7 @@ use std::net::TcpListener;
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
-use futures_util::StreamExt;
-use prost::Message;
-use shared::nats::{EventPublisher, NatsArgs};
+use shared::nats::{EventPublisher, EventSubscriber, NatsArgs};
 use shared::nats_subjects::Subject;
 use shared::protobuf::enforcer_extractor::{
     Bip300Constants, ChainInfo, EnforcerEvent, Network, enforcer_event,
@@ -69,14 +67,16 @@ impl Drop for TestNatsServer {
 #[tokio::test]
 async fn publishes_and_decodes_the_monitor_envelope() {
     let server = TestNatsServer::start().await;
-    let subscriber = async_nats::connect(&server.address)
-        .await
-        .expect("subscriber connection");
-    let mut subscription = subscriber
-        .subscribe(Subject::Enforcer.to_string())
-        .await
-        .expect("enforcer subscription");
-    subscriber.flush().await.expect("flush subscription");
+    let mut subscriber = EventSubscriber::connect(
+        &NatsArgs {
+            nats_url: server.address.clone(),
+            ..NatsArgs::default()
+        },
+        Subject::Enforcer,
+        "bip300-monitor-integration-test-subscriber",
+    )
+    .await
+    .expect("event subscriber connection");
 
     let publisher = EventPublisher::connect(&NatsArgs {
         nats_url: server.address.clone(),
@@ -101,13 +101,43 @@ async fn publishes_and_decodes_the_monitor_envelope() {
         .await
         .expect("publish and flush event");
 
-    let message = timeout(Duration::from_secs(2), subscription.next())
+    let received = timeout(Duration::from_secs(2), subscriber.next_event())
         .await
         .expect("event received before timeout")
-        .expect("subscription remains open");
-    let received = Event::decode(message.payload).expect("valid monitor protobuf");
+        .expect("valid monitor event");
 
     assert_eq!(received, expected);
+    subscriber.close().await.expect("subscriber shutdown");
+}
+
+#[tokio::test]
+async fn subscriber_rejects_an_invalid_protobuf_payload() {
+    let server = TestNatsServer::start().await;
+    let mut subscriber = EventSubscriber::connect(
+        &NatsArgs {
+            nats_url: server.address.clone(),
+            ..NatsArgs::default()
+        },
+        Subject::Enforcer,
+        "bip300-monitor-invalid-payload-test",
+    )
+    .await
+    .expect("event subscriber connection");
+    let publisher = async_nats::connect(&server.address)
+        .await
+        .expect("raw publisher connection");
+
+    publisher
+        .publish(Subject::Enforcer.to_string(), vec![0xff, 0x00].into())
+        .await
+        .expect("publish invalid payload");
+    publisher.flush().await.expect("flush invalid payload");
+
+    let error = timeout(Duration::from_secs(2), subscriber.next_event())
+        .await
+        .expect("payload received before timeout")
+        .expect_err("invalid protobuf must fail");
+    assert!(format!("{error:#}").contains("decoding event"));
 }
 
 #[tokio::test]

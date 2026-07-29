@@ -1,19 +1,20 @@
-//! Core NATS configuration and protobuf event publication.
+//! Core NATS configuration and protobuf event transport.
 
 use std::fs;
 use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use async_nats::{Client, ConnectOptions, Event as NatsEvent};
+use async_nats::{Client, ConnectOptions, Event as NatsEvent, Subscriber};
 use clap::Args as ClapArgs;
+use futures_util::StreamExt;
 use prost::Message;
 use tokio::time::timeout;
 
 use crate::nats_subjects::Subject;
 use crate::protobuf::event::Event;
 
-const CLIENT_NAME: &str = "bip300-monitor-enforcer";
+const ENFORCER_PUBLISHER_CLIENT_NAME: &str = "bip300-monitor-enforcer-extractor";
 const DEFAULT_ADDRESS: &str = "nats://127.0.0.1:4222";
 
 /// Reusable command-line arguments for a Core NATS connection.
@@ -79,7 +80,7 @@ impl NatsArgs {
 }
 
 /// Prepare connection options without exposing credentials in logs.
-pub fn connect_options(args: &NatsArgs) -> Result<ConnectOptions> {
+pub fn connect_options(args: &NatsArgs, client_name: &'static str) -> Result<ConnectOptions> {
     let password = match (&args.nats_password, &args.nats_password_file) {
         (Some(_), Some(_)) => {
             bail!("only one of `nats_password` and `nats_password_file` may be set")
@@ -98,7 +99,7 @@ pub fn connect_options(args: &NatsArgs) -> Result<ConnectOptions> {
     };
 
     let options = ConnectOptions::new()
-        .name(CLIENT_NAME)
+        .name(client_name)
         .event_callback(|event| async move {
             match event {
                 NatsEvent::Connected => tracing::info!("connected to Core NATS"),
@@ -139,7 +140,7 @@ pub struct EventPublisher {
 impl EventPublisher {
     /// Connect a publisher using the supplied NATS configuration.
     pub async fn connect(args: &NatsArgs) -> Result<Self> {
-        let client = connect_options(args)?
+        let client = connect_options(args, ENFORCER_PUBLISHER_CLIENT_NAME)?
             .connect(&args.nats_url)
             .await
             .with_context(|| format!("connecting to Core NATS at `{}`", args.nats_url))?;
@@ -166,16 +167,91 @@ impl EventPublisher {
 
     /// Wait until the NATS client transport buffer has been flushed.
     pub async fn flush(&self) -> Result<()> {
-        timeout(self.flush_timeout, self.client.flush())
-            .await
-            .with_context(|| {
-                format!(
-                    "timed out after {}s while flushing the Core NATS connection",
-                    self.flush_timeout.as_secs()
-                )
-            })?
-            .context("flushing the Core NATS connection")
+        flush_client(&self.client, self.flush_timeout).await
     }
+}
+
+/// Subscriber that decodes monitor protobuf envelopes from one stable subject.
+pub struct EventSubscriber {
+    client: Client,
+    subscriber: Subscriber,
+    subject: Subject,
+    flush_timeout: Duration,
+}
+
+impl EventSubscriber {
+    /// Connect and register a subscription before returning.
+    pub async fn connect(
+        args: &NatsArgs,
+        subject: Subject,
+        client_name: &'static str,
+    ) -> Result<Self> {
+        let client = connect_options(args, client_name)?
+            .connect(&args.nats_url)
+            .await
+            .with_context(|| format!("connecting to Core NATS at `{}`", args.nats_url))?;
+        let subscriber = client
+            .subscribe(subject.to_string())
+            .await
+            .with_context(|| format!("subscribing to NATS subject `{subject}`"))?;
+        flush_client(&client, args.flush_timeout())
+            .await
+            .with_context(|| format!("confirming the NATS subscription to `{subject}`"))?;
+
+        Ok(Self {
+            client,
+            subscriber,
+            subject,
+            flush_timeout: args.flush_timeout(),
+        })
+    }
+
+    /// Receive and decode the next event.
+    pub async fn next_event(&mut self) -> Result<Event> {
+        let message = self
+            .subscriber
+            .next()
+            .await
+            .with_context(|| format!("NATS subscription to `{}` ended", self.subject))?;
+
+        Event::decode(message.payload)
+            .with_context(|| format!("decoding event from NATS subject `{}`", self.subject))
+    }
+
+    /// Remove the subscription and flush the client transport.
+    pub async fn close(mut self) -> Result<()> {
+        timeout(self.flush_timeout, async {
+            self.subscriber
+                .unsubscribe()
+                .await
+                .with_context(|| format!("unsubscribing from NATS subject `{}`", self.subject))?;
+            self.client
+                .flush()
+                .await
+                .context("flushing the Core NATS connection after unsubscribe")
+        })
+        .await
+        .with_context(|| {
+            format!(
+                "timed out after {}s while closing the subscription to `{}`",
+                self.flush_timeout.as_secs(),
+                self.subject
+            )
+        })?
+        .context("closing the event subscription")
+    }
+}
+
+async fn flush_client(client: &Client, flush_timeout: Duration) -> Result<()> {
+    timeout(flush_timeout, client.flush())
+        .await
+        .with_context(|| {
+            format!(
+                "timed out after {}s while flushing the Core NATS connection",
+                flush_timeout.as_secs()
+            )
+        })?
+        .context("flushing the Core NATS connection")
 }
 
 #[cfg(test)]
@@ -185,14 +261,19 @@ mod tests {
 
     use super::{NatsArgs, connect_options};
 
+    const TEST_CLIENT_NAME: &str = "bip300-monitor-test";
+
     #[test]
     fn accepts_anonymous_and_password_authentication() {
-        connect_options(&NatsArgs::default()).expect("anonymous options");
-        connect_options(&NatsArgs {
-            nats_username: Some("monitor".to_owned()),
-            nats_password: Some("secret".to_owned()),
-            ..NatsArgs::default()
-        })
+        connect_options(&NatsArgs::default(), TEST_CLIENT_NAME).expect("anonymous options");
+        connect_options(
+            &NatsArgs {
+                nats_username: Some("monitor".to_owned()),
+                nats_password: Some("secret".to_owned()),
+                ..NatsArgs::default()
+            },
+            TEST_CLIENT_NAME,
+        )
         .expect("user/password options");
     }
 
@@ -204,11 +285,14 @@ mod tests {
         ));
         fs::write(&path, "secret\r\n").expect("write password fixture");
 
-        let result = connect_options(&NatsArgs {
-            nats_username: Some("monitor".to_owned()),
-            nats_password_file: Some(path.clone()),
-            ..NatsArgs::default()
-        });
+        let result = connect_options(
+            &NatsArgs {
+                nats_username: Some("monitor".to_owned()),
+                nats_password_file: Some(path.clone()),
+                ..NatsArgs::default()
+            },
+            TEST_CLIENT_NAME,
+        );
 
         fs::remove_file(path).expect("remove password fixture");
         result.expect("password file options");
@@ -216,10 +300,13 @@ mod tests {
 
     #[test]
     fn rejects_incomplete_credentials() {
-        let result = connect_options(&NatsArgs {
-            nats_username: Some("monitor".to_owned()),
-            ..NatsArgs::default()
-        });
+        let result = connect_options(
+            &NatsArgs {
+                nats_username: Some("monitor".to_owned()),
+                ..NatsArgs::default()
+            },
+            TEST_CLIENT_NAME,
+        );
         let error = match result {
             Ok(_) => panic!("username without password must fail"),
             Err(error) => error,

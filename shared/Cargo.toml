@@ -10,10 +10,13 @@ repository.workspace = true
 anyhow = { workspace = true }
 async-nats = { workspace = true }
 clap = { workspace = true }
+futures-util = { workspace = true }
 prost = { workspace = true }
 serde = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+tracing-log = { workspace = true }
+tracing-subscriber = { workspace = true }
 
 [build-dependencies]
 prost-build = { workspace = true }

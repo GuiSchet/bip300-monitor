@@ -4,6 +4,8 @@ on:
   push:
     branches:
       - main
+    tags:
+      - "v*.*.*"
   pull_request:
   workflow_dispatch:
 
@@ -17,6 +19,7 @@ concurrency:
 env:
   CARGO_BUILD_JOBS: "2"
   CARGO_TERM_COLOR: always
+  DOCKER_METADATA_SHORT_SHA_LENGTH: "12"
 
 jobs:
   quality:
@@ -52,3 +55,78 @@ jobs:
 
       - name: Test workspace
         run: cargo test --workspace --all-features --jobs 2 --locked
+
+  images:
+    name: Container image (${{ matrix.target }})
+    needs: quality
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: enforcer-extractor
+            image: guischet/bip300-enforcer-extractor
+            absent_binary: event-logger
+          - target: event-logger
+            image: guischet/bip300-event-logger
+            absent_binary: enforcer-extractor
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+
+      - name: Generate image metadata
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ${{ matrix.image }}
+          flavor: latest=false
+          tags: |
+            type=ref,event=branch,enable=${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+            type=sha,prefix=sha-
+            type=semver,pattern={{version}},enable=${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}
+            type=semver,pattern={{major}}.{{minor}},enable=${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}
+            type=raw,value=latest,enable=${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}
+
+      - name: Log in to Docker Hub
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          username: guischet
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and optionally publish image
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          file: Dockerfile
+          target: ${{ matrix.target }}
+          platforms: linux/amd64
+          build-args: |
+            CARGO_BUILD_JOBS=2
+            VCS_REF=${{ github.sha }}
+            VERSION=${{ steps.meta.outputs.version }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=${{ matrix.target }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.target }}
+          load: ${{ github.event_name == 'pull_request' }}
+          push: ${{ github.event_name != 'pull_request' }}
+          provenance: ${{ github.event_name != 'pull_request' && 'mode=max' || 'false' }}
+          sbom: ${{ github.event_name != 'pull_request' }}
+
+      - name: Smoke test image
+        env:
+          IMAGE_REF: ${{ matrix.image }}:${{ steps.meta.outputs.version }}
+        run: >-
+          scripts/container-smoke.sh
+          "${IMAGE_REF}"
+          "${{ matrix.target }}"
+          "${{ matrix.absent_binary }}"
