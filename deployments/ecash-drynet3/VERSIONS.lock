@@ -19,9 +19,9 @@ ENFORCER_IMAGE=ghcr.io/layertwo-labs/bip300301_enforcer:sha-e401e33@sha256:a08ff
 
 NATS_IMAGE=docker.io/library/nats:2.14.3-alpine@sha256:c11af972c99ae542de8925e6a7d9c533aa1eb039660420d2074beed6089b3bf0
 
-MONITOR_IMAGE_COMMIT=0eae13f43bdb4a00a794619f8cb3e9aa4642641c
-ENFORCER_EXTRACTOR_IMAGE=docker.io/guischet/bip300-enforcer-extractor:sha-0eae13f43bdb@sha256:97b935bfd290bb1cf7bf8b4deb2051b18bacd4a8e0da0e06c31c04b407f73d9d
-EVENT_LOGGER_IMAGE=docker.io/guischet/bip300-event-logger:sha-0eae13f43bdb@sha256:fedfbac0bb906ec3a5b5488b37484ccbde16020193f77070c45a285df30c2c1f
+MONITOR_IMAGE_COMMIT=7295bce0e4e8530225f25549d652d7827e824931
+ENFORCER_EXTRACTOR_IMAGE=docker.io/guischet/bip300-enforcer-extractor:sha-7295bce0e4e8@sha256:bb7ce9ca41169ef493910e496d6dfeaef90732b8321dd116b4fac18d27c2ed1e
+EVENT_LOGGER_IMAGE=docker.io/guischet/bip300-event-logger:sha-7295bce0e4e8@sha256:6527c316d1150fc7eb3caa40e9ec55311b8c0e9e66d43cb377d7dc35af38a895
 
 JUST_VERSION=1.57.0
 JUST_TARGET=x86_64-unknown-linux-musl
