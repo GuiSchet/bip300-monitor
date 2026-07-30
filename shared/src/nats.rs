@@ -14,7 +14,6 @@ use tokio::time::timeout;
 use crate::nats_subjects::Subject;
 use crate::protobuf::event::Event;
 
-const ENFORCER_PUBLISHER_CLIENT_NAME: &str = "bip300-monitor-enforcer-extractor";
 const DEFAULT_ADDRESS: &str = "nats://127.0.0.1:4222";
 
 /// Reusable command-line arguments for a Core NATS connection.
@@ -139,8 +138,8 @@ pub struct EventPublisher {
 
 impl EventPublisher {
     /// Connect a publisher using the supplied NATS configuration.
-    pub async fn connect(args: &NatsArgs) -> Result<Self> {
-        let client = connect_options(args, ENFORCER_PUBLISHER_CLIENT_NAME)?
+    pub async fn connect(args: &NatsArgs, client_name: &'static str) -> Result<Self> {
+        let client = connect_options(args, client_name)?
             .connect(&args.nats_url)
             .await
             .with_context(|| format!("connecting to Core NATS at `{}`", args.nats_url))?;
@@ -169,6 +168,20 @@ impl EventPublisher {
     pub async fn flush(&self) -> Result<()> {
         flush_client(&self.client, self.flush_timeout).await
     }
+}
+
+/// One message received from an event subject.
+#[derive(Debug)]
+pub enum ReceivedEvent {
+    /// A valid protobuf event envelope.
+    Decoded(Event),
+    /// A message that could not be decoded as the expected protobuf envelope.
+    Invalid {
+        /// Protobuf decoding failure.
+        error: prost::DecodeError,
+        /// Size of the rejected NATS payload.
+        payload_len: usize,
+    },
 }
 
 /// Subscriber that decodes monitor protobuf envelopes from one stable subject.
@@ -206,16 +219,19 @@ impl EventSubscriber {
         })
     }
 
-    /// Receive and decode the next event.
-    pub async fn next_event(&mut self) -> Result<Event> {
+    /// Receive the next message, distinguishing invalid payloads from transport failure.
+    pub async fn next_event(&mut self) -> Result<ReceivedEvent> {
         let message = self
             .subscriber
             .next()
             .await
             .with_context(|| format!("NATS subscription to `{}` ended", self.subject))?;
 
-        Event::decode(message.payload)
-            .with_context(|| format!("decoding event from NATS subject `{}`", self.subject))
+        let payload_len = message.payload.len();
+        Ok(match Event::decode(message.payload) {
+            Ok(event) => ReceivedEvent::Decoded(event),
+            Err(error) => ReceivedEvent::Invalid { error, payload_len },
+        })
     }
 
     /// Remove the subscription and flush the client transport.

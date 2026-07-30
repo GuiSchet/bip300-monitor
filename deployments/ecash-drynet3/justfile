@@ -9,9 +9,17 @@ default:
 init:
     ./scripts/init.sh
 
-# Pull the pinned images and start the current stack.
+# Pull and start the pinned Drynet3 node.
 up:
     ./scripts/up.sh
+
+# Start the enforcer after the Drynet3 node is synchronized.
+enforcer-up:
+    ./scripts/enforcer-up.sh
+
+# Start NATS, the event logger, and the enforcer extractor in safe order.
+monitor-up:
+    ./scripts/monitor-up.sh
 
 # Download, verify, and load the pinned AssumeUTXO snapshot.
 snapshot:
@@ -21,9 +29,13 @@ snapshot:
 status:
     ./scripts/status.sh
 
-# Verify that the node is synchronized and ready for the next stage.
+# Verify the complete node-to-logger observation pipeline.
 verify:
     ./scripts/verify.sh
+
+# Wait for a new Drynet block and verify live delivery for every configured slot.
+verify-live:
+    ./scripts/verify-live.sh
 
 # Follow all logs, or only one named service.
 logs service="":

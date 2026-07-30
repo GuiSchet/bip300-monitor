@@ -4,7 +4,7 @@ use std::net::TcpListener;
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
-use shared::nats::{EventPublisher, EventSubscriber, NatsArgs};
+use shared::nats::{EventPublisher, EventSubscriber, NatsArgs, ReceivedEvent};
 use shared::nats_subjects::Subject;
 use shared::protobuf::enforcer_extractor::{
     Bip300Constants, ChainInfo, EnforcerEvent, Network, enforcer_event,
@@ -78,10 +78,13 @@ async fn publishes_and_decodes_the_monitor_envelope() {
     .await
     .expect("event subscriber connection");
 
-    let publisher = EventPublisher::connect(&NatsArgs {
-        nats_url: server.address.clone(),
-        ..NatsArgs::default()
-    })
+    let publisher = EventPublisher::connect(
+        &NatsArgs {
+            nats_url: server.address.clone(),
+            ..NatsArgs::default()
+        },
+        "bip300-monitor-integration-test-publisher",
+    )
     .await
     .expect("publisher connection");
     let payload = EnforcerEvent {
@@ -106,12 +109,15 @@ async fn publishes_and_decodes_the_monitor_envelope() {
         .expect("event received before timeout")
         .expect("valid monitor event");
 
+    let ReceivedEvent::Decoded(received) = received else {
+        panic!("expected a decoded event");
+    };
     assert_eq!(received, expected);
     subscriber.close().await.expect("subscriber shutdown");
 }
 
 #[tokio::test]
-async fn subscriber_rejects_an_invalid_protobuf_payload() {
+async fn subscriber_reports_an_invalid_payload_and_continues() {
     let server = TestNatsServer::start().await;
     let mut subscriber = EventSubscriber::connect(
         &NatsArgs {
@@ -131,23 +137,52 @@ async fn subscriber_rejects_an_invalid_protobuf_payload() {
         .publish(Subject::Enforcer.to_string(), vec![0xff, 0x00].into())
         .await
         .expect("publish invalid payload");
+    let expected = Event::new(MonitorEvent::Enforcer(EnforcerEvent {
+        event: Some(enforcer_event::Event::ChainInfo(ChainInfo {
+            network: Network::Regtest as i32,
+            bip300_constants: Some(Bip300Constants::default()),
+        })),
+    }))
+    .expect("system clock after Unix epoch");
+    publisher
+        .publish(
+            Subject::Enforcer.to_string(),
+            prost::Message::encode_to_vec(&expected).into(),
+        )
+        .await
+        .expect("publish valid payload after invalid payload");
     publisher.flush().await.expect("flush invalid payload");
 
-    let error = timeout(Duration::from_secs(2), subscriber.next_event())
+    let invalid = timeout(Duration::from_secs(2), subscriber.next_event())
         .await
         .expect("payload received before timeout")
-        .expect_err("invalid protobuf must fail");
-    assert!(format!("{error:#}").contains("decoding event"));
+        .expect("subscription remains usable");
+    let ReceivedEvent::Invalid { payload_len, .. } = invalid else {
+        panic!("expected an invalid event");
+    };
+    assert_eq!(payload_len, 2);
+
+    let received = timeout(Duration::from_secs(2), subscriber.next_event())
+        .await
+        .expect("valid payload received before timeout")
+        .expect("subscription remains usable");
+    let ReceivedEvent::Decoded(received) = received else {
+        panic!("expected a decoded event");
+    };
+    assert_eq!(received, expected);
 }
 
 #[tokio::test]
 async fn detected_server_loss_makes_publish_and_flush_time_out() {
     let mut server = TestNatsServer::start().await;
-    let publisher = EventPublisher::connect(&NatsArgs {
-        nats_url: server.address.clone(),
-        nats_flush_timeout_seconds: 1,
-        ..NatsArgs::default()
-    })
+    let publisher = EventPublisher::connect(
+        &NatsArgs {
+            nats_url: server.address.clone(),
+            nats_flush_timeout_seconds: 1,
+            ..NatsArgs::default()
+        },
+        "bip300-monitor-server-loss-test",
+    )
     .await
     .expect("publisher connection");
     let payload = EnforcerEvent {

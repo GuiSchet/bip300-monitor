@@ -23,6 +23,7 @@ use crate::{EnforcerClient, convert};
 
 type EventStream = Streaming<mainchain::SubscribeEventsResponse>;
 type StartupFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>>;
+const NATS_CLIENT_NAME: &str = "bip300-monitor-enforcer-extractor";
 
 trait StartupSource: Clone + Send {
     type Stream: Send;
@@ -136,7 +137,7 @@ pub async fn run(args: Args, mut shutdown_rx: watch::Receiver<bool>) -> Result<(
 }
 
 async fn prepare_startup(args: &Args) -> Result<PreparedStartup> {
-    let publisher = EventPublisher::connect(&args.nats)
+    let publisher = EventPublisher::connect(&args.nats, NATS_CLIENT_NAME)
         .await
         .context("connecting the event publisher")?;
 

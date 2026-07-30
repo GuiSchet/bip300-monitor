@@ -271,11 +271,13 @@ fn encode_byte_fields(value: &mut Value) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use shared::protobuf::enforcer_extractor as events;
     use shared::protobuf::event::Event;
     use shared::protobuf::event::event::MonitorEvent;
 
-    use super::render;
+    use super::{BYTE_FIELDS, render};
 
     fn envelope(payload: events::enforcer_event::Event) -> Event {
         Event {
@@ -514,5 +516,29 @@ mod tests {
                 .to_string()
                 .contains("concrete event")
         );
+    }
+
+    #[test]
+    fn hexadecimal_field_list_covers_every_proto_bytes_field() {
+        let proto = include_str!("../../../proto/enforcer_extractor.proto");
+        let proto_fields = proto
+            .lines()
+            .filter_map(|line| {
+                if line.trim_start().starts_with("//") {
+                    return None;
+                }
+                let tokens = line.split_whitespace().collect::<Vec<_>>();
+                let bytes_index = tokens.iter().position(|token| *token == "bytes")?;
+                tokens
+                    .get(bytes_index + 1)
+                    .map(|field| field.trim_end_matches(';').to_owned())
+            })
+            .collect::<BTreeSet<_>>();
+        let rendered_fields = BYTE_FIELDS
+            .iter()
+            .map(|field| (*field).to_owned())
+            .collect::<BTreeSet<_>>();
+
+        assert_eq!(rendered_fields, proto_fields);
     }
 }

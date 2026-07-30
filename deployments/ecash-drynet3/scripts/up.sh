@@ -10,8 +10,8 @@ load_deployment_env
 require_command docker
 
 compose config --quiet
-info "pulling pinned Drynet3 images"
-compose pull
+info "pulling the pinned Drynet3 node image"
+compose pull ecash-node
 info "starting the Drynet3 node"
 compose up --detach ecash-node
 compose ps

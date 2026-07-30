@@ -19,11 +19,45 @@ require_command() {
     command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"
 }
 
+require_positive_integer() {
+    local name="$1"
+    local value="$2"
+    [[ "${value}" =~ ^[0-9]+$ ]] || die "${name} must be numeric"
+    ((value > 0)) || die "${name} must be greater than zero"
+}
+
 load_versions() {
     [[ -f "${VERSIONS_FILE}" ]] || die "missing ${VERSIONS_FILE}"
     # This file is tracked in the repository and contains assignments only.
     # shellcheck disable=SC1090
     source "${VERSIONS_FILE}"
+}
+
+normalize_assignment_key() {
+    local key="$1"
+
+    key="${key#"${key%%[![:space:]]*}"}"
+    key="${key%"${key##*[![:space:]]}"}"
+    printf '%s\n' "${key}"
+}
+
+reject_version_overrides() {
+    local env_file="$1"
+    local -A locked_keys=()
+    local key
+
+    while IFS='=' read -r key _; do
+        key="$(normalize_assignment_key "${key}")"
+        [[ "${key}" =~ ^[A-Z][A-Z0-9_]*$ ]] || continue
+        locked_keys["${key}"]=1
+    done <"${VERSIONS_FILE}"
+
+    while IFS='=' read -r key _; do
+        key="$(normalize_assignment_key "${key}")"
+        [[ "${key}" =~ ^[A-Z][A-Z0-9_]*$ ]] || continue
+        [[ -z "${locked_keys[${key}]+present}" ]] ||
+            die "${env_file} must not override locked variable ${key}"
+    done <"${env_file}"
 }
 
 deployment_env_file() {
@@ -34,6 +68,7 @@ load_deployment_env() {
     local env_file
     env_file="$(deployment_env_file)"
     [[ -f "${env_file}" ]] || die "missing ${env_file}; run 'just init' first"
+    reject_version_overrides "${env_file}"
 
     set -a
     # The local file is created from the repository's simple KEY=VALUE example.
@@ -46,6 +81,21 @@ load_deployment_env() {
     : "${PGID:?PGID must be set}"
     [[ "${PUID}" =~ ^[0-9]+$ ]] || die "PUID must be numeric"
     [[ "${PGID}" =~ ^[0-9]+$ ]] || die "PGID must be numeric"
+    require_positive_integer \
+        ENFORCER_SYNC_WAIT_SECONDS "${ENFORCER_SYNC_WAIT_SECONDS:-300}"
+    require_positive_integer \
+        SNAPSHOT_HEADER_WAIT_SECONDS "${SNAPSHOT_HEADER_WAIT_SECONDS:-1800}"
+    require_positive_integer \
+        MONITOR_STARTUP_WAIT_SECONDS "${MONITOR_STARTUP_WAIT_SECONDS:-60}"
+    require_positive_integer \
+        MONITOR_EVENT_WAIT_SECONDS "${MONITOR_EVENT_WAIT_SECONDS:-60}"
+    require_positive_integer \
+        LIVE_BLOCK_WAIT_SECONDS "${LIVE_BLOCK_WAIT_SECONDS:-3600}"
+    require_positive_integer \
+        LIVE_EVENT_WAIT_SECONDS "${LIVE_EVENT_WAIT_SECONDS:-60}"
+
+    # Restore every repository pin after loading operator-owned configuration.
+    load_versions
 }
 
 data_root() {
@@ -60,8 +110,8 @@ compose() {
     local env_file
     env_file="$(deployment_env_file)"
     docker compose \
-        --env-file "${VERSIONS_FILE}" \
         --env-file "${env_file}" \
+        --env-file "${VERSIONS_FILE}" \
         --file "${DEPLOYMENT_ROOT}/compose.yaml" \
         "$@"
 }
@@ -74,10 +124,127 @@ node_cli() {
         "$@"
 }
 
+service_is_running() {
+    compose ps --status running --quiet "$1" | grep -q .
+}
+
+require_service_running() {
+    service_is_running "$1" || die "$1 is not running"
+}
+
+enforcer_rpc() {
+    local method="$1"
+    compose exec -T enforcer \
+        curl --fail-with-body --silent --show-error --max-time 30 \
+        --request POST \
+        --header 'Content-Type: application/json' \
+        --data '{}' \
+        "http://127.0.0.1:50051/cusf.mainchain.v1.ValidatorService/${method}"
+}
+
+nats_monitor() {
+    local endpoint="$1"
+    compose exec -T nats \
+        wget -qO- "http://127.0.0.1:8222${endpoint}"
+}
+
+nats_is_healthy() {
+    local health
+    health="$(nats_monitor /healthz 2>/dev/null)" &&
+        jq -e '.status == "ok"' <<<"${health}" >/dev/null
+}
+
+nats_has_client() {
+    local client_name="$1"
+    local connections
+    connections="$(nats_monitor /connz 2>/dev/null)" &&
+        jq -e --arg client_name "${client_name}" \
+            '.connections | any(.name == $client_name)' \
+            <<<"${connections}" >/dev/null
+}
+
+nats_has_enforcer_subscription() {
+    local subscriptions
+    subscriptions="$(nats_monitor '/subsz?subs=true' 2>/dev/null)" &&
+        jq -e \
+            '.subscriptions_list | any(.account == "$G" and .subject == "bip300.enforcer")' \
+            <<<"${subscriptions}" >/dev/null
+}
+
+wait_for_nats_health() {
+    local wait_seconds="${MONITOR_STARTUP_WAIT_SECONDS:-60}"
+    local deadline="$((SECONDS + wait_seconds))"
+    until nats_is_healthy; do
+        ((SECONDS < deadline)) ||
+            die "Core NATS was not healthy after ${wait_seconds}s"
+        sleep 2
+    done
+}
+
+wait_for_event_logger_subscription() {
+    local wait_seconds="${MONITOR_STARTUP_WAIT_SECONDS:-60}"
+    local deadline="$((SECONDS + wait_seconds))"
+    until nats_has_client bip300-monitor-event-logger &&
+        nats_has_enforcer_subscription; do
+        ((SECONDS < deadline)) ||
+            die "event logger subscription was not ready after ${wait_seconds}s"
+        sleep 2
+    done
+}
+
+wait_for_nats_client() {
+    local client_name="$1"
+    local wait_seconds="${MONITOR_STARTUP_WAIT_SECONDS:-60}"
+    local deadline="$((SECONDS + wait_seconds))"
+    until nats_has_client "${client_name}"; do
+        ((SECONDS < deadline)) ||
+            die "NATS client ${client_name} was not connected after ${wait_seconds}s"
+        sleep 2
+    done
+}
+
+logs_contain_live_event() {
+    local logs="$1"
+    local message="$2"
+    local sidechain="$3"
+    local block_hash="$4"
+    local line
+    local slot_pattern
+
+    [[ "${sidechain}" =~ ^[0-9]+$ ]] || return 1
+    slot_pattern="(^|[[:space:]\"])sidechain=${sidechain}([^0-9]|$)"
+
+    while IFS= read -r line; do
+        if [[ "${line}" == *"${message}"* &&
+            "${line}" =~ ${slot_pattern} &&
+            "${line}" == *"${block_hash}"* ]]; then
+            return 0
+        fi
+    done <<<"${logs}"
+    return 1
+}
+
 require_drynet_activation_block() {
     local activation_hash
     activation_hash="$(node_cli getblockhash "${DRYNET_ACTIVATION_HEIGHT}")" ||
         die "Drynet3 activation block is unavailable"
     [[ "${activation_hash}" == "${DRYNET_ACTIVATION_BLOCK_HASH}" ]] ||
         die "unexpected block at height ${DRYNET_ACTIVATION_HEIGHT}: ${activation_hash}"
+}
+
+require_node_ready() {
+    local blockchain_info
+    require_service_running ecash-node
+    blockchain_info="$(node_cli getblockchaininfo)"
+
+    jq -e '.chain == "main"' <<<"${blockchain_info}" >/dev/null ||
+        die "ecash-node is not using the expected main-chain network magic"
+    jq -e --argjson height "${DRYNET_ACTIVATION_HEIGHT}" \
+        '.blocks >= $height and .headers >= $height' \
+        <<<"${blockchain_info}" >/dev/null ||
+        die "ecash-node has not reached Drynet3 activation height ${DRYNET_ACTIVATION_HEIGHT}"
+    jq -e '.initialblockdownload == false' <<<"${blockchain_info}" >/dev/null ||
+        die "ecash-node is still in initial block download"
+
+    require_drynet_activation_block
 }
