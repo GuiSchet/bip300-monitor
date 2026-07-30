@@ -9,6 +9,9 @@ workflow=false
 
 while IFS= read -r path; do
     case "${path}" in
+        rustfmt.toml)
+            rust=true
+            ;;
         Cargo.toml | Cargo.lock | rust-toolchain.toml | build.rs | \
             extractors/* | proto/* | shared/* | tools/*)
             rust=true

@@ -8,7 +8,7 @@ source "$(dirname -- "${BASH_SOURCE[0]}")/lib.sh"
 load_versions
 export COMPOSE_ENV_FILE="${DEPLOYMENT_ROOT}/.env.example"
 
-for command_name in docker jq just shellcheck shfmt yamllint; do
+for command_name in docker jq just mktemp shellcheck shfmt yamllint; do
     require_command "${command_name}"
 done
 
@@ -19,6 +19,68 @@ shfmt --diff --indent 4 "${DEPLOYMENT_ROOT}"/scripts/*.sh
 yamllint --config-file "${DEPLOYMENT_ROOT}/.yamllint.yml" \
     "${DEPLOYMENT_ROOT}/compose.yaml"
 just --justfile "${DEPLOYMENT_ROOT}/justfile" --fmt --check
+
+override_env="$(mktemp)"
+trap 'rm -f -- "${override_env}"' EXIT
+for override in \
+    'ENFORCER_IMAGE=example.invalid/unpinned:latest' \
+    '   ENFORCER_IMAGE=example.invalid/unpinned:latest'; do
+    cp "${DEPLOYMENT_ROOT}/.env.example" "${override_env}"
+    printf '\n%s\n' "${override}" >>"${override_env}"
+    if (
+        COMPOSE_ENV_FILE="${override_env}"
+        load_deployment_env
+    ) >/dev/null 2>&1; then
+        die "deployment configuration accepted an override of ENFORCER_IMAGE"
+    fi
+done
+
+for invalid_live_event_wait in 0 invalid; do
+    cp "${DEPLOYMENT_ROOT}/.env.example" "${override_env}"
+    printf '\nLIVE_EVENT_WAIT_SECONDS=%s\n' "${invalid_live_event_wait}" >>"${override_env}"
+    if (
+        COMPOSE_ENV_FILE="${override_env}"
+        load_deployment_env
+    ) >/dev/null 2>&1; then
+        die "deployment configuration accepted invalid LIVE_EVENT_WAIT_SECONDS=${invalid_live_event_wait}"
+    fi
+done
+
+live_hash='0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef'
+extractor_slot_9="INFO published live enforcer event sidechain=9 height=123 hash=${live_hash}"
+extractor_slot_98="INFO published live enforcer event sidechain=98 height=123 hash=${live_hash}"
+logger_slot_9="INFO received enforcer event summary=\"sidechain=9 height=123 hash=${live_hash}\""
+logger_slot_98="INFO received enforcer event summary=\"sidechain=98 height=123 hash=${live_hash}\""
+
+logs_contain_live_event \
+    "${extractor_slot_9}" "published live enforcer event" 9 "${live_hash}" ||
+    die "live event matcher rejected extractor slot 9"
+logs_contain_live_event \
+    "${extractor_slot_98}" "published live enforcer event" 98 "${live_hash}" ||
+    die "live event matcher rejected extractor slot 98"
+logs_contain_live_event \
+    "${logger_slot_9}" "received enforcer event" 9 "${live_hash}" ||
+    die "live event matcher rejected quoted logger slot 9"
+logs_contain_live_event \
+    "${logger_slot_98}" "received enforcer event" 98 "${live_hash}" ||
+    die "live event matcher rejected quoted logger slot 98"
+
+if logs_contain_live_event \
+    "${extractor_slot_98}" "published live enforcer event" 9 "${live_hash}"; then
+    die "live event matcher confused slot 98 with slot 9"
+fi
+if logs_contain_live_event \
+    "${logger_slot_9}" "received enforcer event" 98 "${live_hash}"; then
+    die "live event matcher confused slot 9 with slot 98"
+fi
+if logs_contain_live_event \
+    "${extractor_slot_9}" "received enforcer event" 9 "${live_hash}"; then
+    die "live event matcher accepted the wrong log message"
+fi
+if logs_contain_live_event \
+    "${logger_slot_9}" "received enforcer event" 9 "${live_hash%?}0"; then
+    die "live event matcher accepted the wrong block hash"
+fi
 
 config_json="$(compose config --format json)"
 jq -e '.services | keys == ["ecash-node", "enforcer", "enforcer-extractor", "event-logger", "nats"]' \

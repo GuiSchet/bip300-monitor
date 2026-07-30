@@ -21,21 +21,51 @@ verify_snapshot() {
     local path="$1"
     local actual_size
     actual_size="$(stat --format='%s' "${path}")"
-    [[ "${actual_size}" == "${DRYNET_SNAPSHOT_SIZE}" ]] ||
-        die "snapshot size is ${actual_size}, expected ${DRYNET_SNAPSHOT_SIZE}"
+    if [[ "${actual_size}" != "${DRYNET_SNAPSHOT_SIZE}" ]]; then
+        printf 'snapshot size is %s, expected %s\n' \
+            "${actual_size}" "${DRYNET_SNAPSHOT_SIZE}" >&2
+        return 1
+    fi
     printf '%s  %s\n' "${DRYNET_SNAPSHOT_SHA256}" "${path}" | sha256sum --check
 }
 
 if [[ -f "${snapshot_path}" ]]; then
     info "verifying existing snapshot"
-    verify_snapshot "${snapshot_path}"
-else
+    verify_snapshot "${snapshot_path}" || die "existing snapshot failed verification"
+elif [[ -f "${partial_path}" ]]; then
+    partial_size="$(stat --format='%s' "${partial_path}")"
+    if ((partial_size > DRYNET_SNAPSHOT_SIZE)); then
+        info "discarding oversized partial snapshot (${partial_size} bytes)"
+        rm -f -- "${partial_path}"
+    elif ((partial_size == DRYNET_SNAPSHOT_SIZE)); then
+        info "verifying complete partial snapshot before downloading"
+        if verify_snapshot "${partial_path}"; then
+            mv -- "${partial_path}" "${snapshot_path}"
+        else
+            info "discarding corrupt complete partial snapshot"
+            rm -f -- "${partial_path}"
+        fi
+    else
+        info "resuming partial snapshot at ${partial_size} bytes"
+    fi
+fi
+
+if [[ ! -f "${snapshot_path}" ]]; then
     info "downloading the pinned Drynet3 snapshot (resume is enabled)"
-    curl --fail --location --show-error \
+    curl --fail --location --show-error --retry 3 \
         --continue-at - \
         --output "${partial_path}" \
         "${DRYNET_SNAPSHOT_URL}"
-    verify_snapshot "${partial_path}"
+    if ! verify_snapshot "${partial_path}"; then
+        partial_size="$(stat --format='%s' "${partial_path}")"
+        if ((partial_size >= DRYNET_SNAPSHOT_SIZE)); then
+            info "discarding non-resumable invalid partial snapshot"
+            rm -f -- "${partial_path}"
+        else
+            info "retaining the partial snapshot so the next run can resume it"
+        fi
+        die "downloaded snapshot failed verification"
+    fi
     mv -- "${partial_path}" "${snapshot_path}"
 fi
 

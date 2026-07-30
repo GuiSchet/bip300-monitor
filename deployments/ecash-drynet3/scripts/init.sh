@@ -28,6 +28,7 @@ resolved_data_root="$(data_root)"
 
 for directory in \
     "${resolved_data_root}/node" \
+    "${resolved_data_root}/node/blocks" \
     "${resolved_data_root}/snapshots" \
     "${resolved_data_root}/rpc-cookie" \
     "${resolved_data_root}/enforcer"; do

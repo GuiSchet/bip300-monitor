@@ -33,6 +33,33 @@ load_versions() {
     source "${VERSIONS_FILE}"
 }
 
+normalize_assignment_key() {
+    local key="$1"
+
+    key="${key#"${key%%[![:space:]]*}"}"
+    key="${key%"${key##*[![:space:]]}"}"
+    printf '%s\n' "${key}"
+}
+
+reject_version_overrides() {
+    local env_file="$1"
+    local -A locked_keys=()
+    local key
+
+    while IFS='=' read -r key _; do
+        key="$(normalize_assignment_key "${key}")"
+        [[ "${key}" =~ ^[A-Z][A-Z0-9_]*$ ]] || continue
+        locked_keys["${key}"]=1
+    done <"${VERSIONS_FILE}"
+
+    while IFS='=' read -r key _; do
+        key="$(normalize_assignment_key "${key}")"
+        [[ "${key}" =~ ^[A-Z][A-Z0-9_]*$ ]] || continue
+        [[ -z "${locked_keys[${key}]+present}" ]] ||
+            die "${env_file} must not override locked variable ${key}"
+    done <"${env_file}"
+}
+
 deployment_env_file() {
     printf '%s\n' "${COMPOSE_ENV_FILE:-${DEPLOYMENT_ROOT}/.env}"
 }
@@ -41,6 +68,7 @@ load_deployment_env() {
     local env_file
     env_file="$(deployment_env_file)"
     [[ -f "${env_file}" ]] || die "missing ${env_file}; run 'just init' first"
+    reject_version_overrides "${env_file}"
 
     set -a
     # The local file is created from the repository's simple KEY=VALUE example.
@@ -56,9 +84,18 @@ load_deployment_env() {
     require_positive_integer \
         ENFORCER_SYNC_WAIT_SECONDS "${ENFORCER_SYNC_WAIT_SECONDS:-300}"
     require_positive_integer \
+        SNAPSHOT_HEADER_WAIT_SECONDS "${SNAPSHOT_HEADER_WAIT_SECONDS:-1800}"
+    require_positive_integer \
         MONITOR_STARTUP_WAIT_SECONDS "${MONITOR_STARTUP_WAIT_SECONDS:-60}"
     require_positive_integer \
         MONITOR_EVENT_WAIT_SECONDS "${MONITOR_EVENT_WAIT_SECONDS:-60}"
+    require_positive_integer \
+        LIVE_BLOCK_WAIT_SECONDS "${LIVE_BLOCK_WAIT_SECONDS:-3600}"
+    require_positive_integer \
+        LIVE_EVENT_WAIT_SECONDS "${LIVE_EVENT_WAIT_SECONDS:-60}"
+
+    # Restore every repository pin after loading operator-owned configuration.
+    load_versions
 }
 
 data_root() {
@@ -73,8 +110,8 @@ compose() {
     local env_file
     env_file="$(deployment_env_file)"
     docker compose \
-        --env-file "${VERSIONS_FILE}" \
         --env-file "${env_file}" \
+        --env-file "${VERSIONS_FILE}" \
         --file "${DEPLOYMENT_ROOT}/compose.yaml" \
         "$@"
 }
@@ -164,6 +201,27 @@ wait_for_nats_client() {
             die "NATS client ${client_name} was not connected after ${wait_seconds}s"
         sleep 2
     done
+}
+
+logs_contain_live_event() {
+    local logs="$1"
+    local message="$2"
+    local sidechain="$3"
+    local block_hash="$4"
+    local line
+    local slot_pattern
+
+    [[ "${sidechain}" =~ ^[0-9]+$ ]] || return 1
+    slot_pattern="(^|[[:space:]\"])sidechain=${sidechain}([^0-9]|$)"
+
+    while IFS= read -r line; do
+        if [[ "${line}" == *"${message}"* &&
+            "${line}" =~ ${slot_pattern} &&
+            "${line}" == *"${block_hash}"* ]]; then
+            return 0
+        fi
+    done <<<"${logs}"
+    return 1
 }
 
 require_drynet_activation_block() {

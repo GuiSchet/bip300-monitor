@@ -82,16 +82,21 @@ cargo run -p event-logger -- --nats-url nats://127.0.0.1:4222
 ```
 
 It prints one summary per event. Add `--full-events` to also print the complete
-normalized payload as one-line JSON with byte fields in hexadecimal.
+normalized payload as one-line JSON with byte fields in hexadecimal. An
+individual undecodable, unknown, or invalid event is reported as a warning and
+discarded; loss of the NATS subscription remains fatal.
 
 ## Container images
 
 CI publishes separate public `linux/amd64` images for the extractor and logger.
+See [container images](docs/container-images.md) for tags, reproducible pins,
+Docker Hub setup, and local builds.
 
 ## Deployments
 
 Reproducible, network-specific infrastructure lives under `deployments/`.
-The first target currently includes a pinned node and validator enforcer:
+The first target includes a pinned node, validator enforcer, Core NATS,
+enforcer extractor, and event logger:
 [eCash Drynet3 deployment](deployments/ecash-drynet3/README.md).
 
 ## Build

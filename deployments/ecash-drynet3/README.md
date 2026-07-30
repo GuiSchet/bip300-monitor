@@ -68,9 +68,25 @@ health, both monitor client connections, the `bip300.enforcer` subscription,
 and evidence that the logger received at least one normalized event. Full event
 JSON is enabled by default; inspect it with `just logs event-logger`.
 
-`ENFORCER_SYNC_WAIT_SECONDS`, `MONITOR_STARTUP_WAIT_SECONDS`, and
-`MONITOR_EVENT_WAIT_SECONDS` control the bounded waits. Repository format and
-configuration checks run separately in GitHub Actions.
+Before accepting a VM deployment, exercise the continuous stream with:
+
+```bash
+just verify-live
+```
+
+It first runs the fast verification, then waits for a new Drynet3 block and
+requires the extractor and logger to report that block for every configured
+sidechain slot. `LIVE_BLOCK_WAIT_SECONDS` bounds the wait for chain activity;
+`LIVE_EVENT_WAIT_SECONDS` bounds its delivery through every configured slot. A
+timeout before a new block means the live path was not exercised.
+
+`SNAPSHOT_HEADER_WAIT_SECONDS`, `ENFORCER_SYNC_WAIT_SECONDS`,
+`MONITOR_STARTUP_WAIT_SECONDS`, and `MONITOR_EVENT_WAIT_SECONDS` control startup
+and the fast snapshot verification. `LIVE_BLOCK_WAIT_SECONDS` controls the wait
+for chain activity, while `LIVE_EVENT_WAIT_SECONDS` independently bounds live
+delivery. Repository format and configuration checks run separately in GitHub
+Actions. Values in `VERSIONS.lock` are repository-owned pins and cannot be
+overridden from `.env`.
 
 Useful commands are listed by `just --list`. `just down` stops the containers
 without deleting `${ECASH_DATA_ROOT}`.

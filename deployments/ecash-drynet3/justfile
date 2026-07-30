@@ -33,6 +33,10 @@ status:
 verify:
     ./scripts/verify.sh
 
+# Wait for a new Drynet block and verify live delivery for every configured slot.
+verify-live:
+    ./scripts/verify-live.sh
+
 # Follow all logs, or only one named service.
 logs service="":
     ./scripts/logs.sh "{{ service }}"

@@ -190,6 +190,8 @@ services:
     depends_on:
       enforcer:
         condition: service_healthy
+      # This only orders container startup. Use `just monitor-up` so the logger
+      # subscription is confirmed before the extractor publishes its snapshot.
       event-logger:
         condition: service_started
       nats:

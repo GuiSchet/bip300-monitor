@@ -50,12 +50,27 @@ if ! service_is_running nats; then
 fi
 
 info "Core NATS health"
-nats_monitor /healthz | jq '{status}'
+if health="$(nats_monitor /healthz 2>/dev/null)" &&
+    jq -e '.status' <<<"${health}" >/dev/null; then
+    jq '{status}' <<<"${health}"
+else
+    info "Core NATS monitoring is temporarily unavailable"
+fi
 
 info "monitor NATS clients"
-nats_monitor /connz |
-    jq '[.connections[] | select(.name | startswith("bip300-monitor-")) | {name, subscriptions, in_msgs, out_msgs}]'
+if connections="$(nats_monitor /connz 2>/dev/null)" &&
+    jq -e '.connections' <<<"${connections}" >/dev/null; then
+    jq '[.connections[] | select(.name | startswith("bip300-monitor-")) | {name, subscriptions, in_msgs, out_msgs}]' \
+        <<<"${connections}"
+else
+    info "NATS client details are temporarily unavailable"
+fi
 
 info "enforcer event subscriptions"
-nats_monitor '/subsz?subs=true' |
-    jq '[.subscriptions_list[] | select(.subject == "bip300.enforcer") | {account, subject, msgs}]'
+if subscriptions="$(nats_monitor '/subsz?subs=true' 2>/dev/null)" &&
+    jq -e '.subscriptions_list' <<<"${subscriptions}" >/dev/null; then
+    jq '[.subscriptions_list[] | select(.subject == "bip300.enforcer") | {account, subject, msgs}]' \
+        <<<"${subscriptions}"
+else
+    info "NATS subscription details are temporarily unavailable"
+fi
