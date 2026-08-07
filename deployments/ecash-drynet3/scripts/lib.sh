@@ -248,3 +248,37 @@ require_node_ready() {
 
     require_drynet_activation_block
 }
+
+node_history_is_ready() {
+    local chainstates="${1:-}"
+
+    if [[ -z "${chainstates}" ]]; then
+        chainstates="$(node_cli getchainstates 2>/dev/null)" || return 1
+    fi
+
+    jq -e '
+        (.chainstates | type == "array")
+        and (.chainstates | length == 1)
+        and (.chainstates[0].validated == true)
+    ' <<<"${chainstates}" >/dev/null 2>&1
+}
+
+require_node_history_ready() {
+    local active_blocks
+    local chainstate_count
+    local chainstates
+    local historical_blocks
+
+    chainstates="$(node_cli getchainstates)" ||
+        die "ecash-node did not return chainstate information"
+    jq -e '.chainstates | type == "array" and length >= 1' \
+        <<<"${chainstates}" >/dev/null ||
+        die "ecash-node returned no usable chainstate"
+
+    node_history_is_ready "${chainstates}" && return 0
+
+    chainstate_count="$(jq -r '.chainstates | length' <<<"${chainstates}")"
+    historical_blocks="$(jq -r '.chainstates[0].blocks // "unavailable"' <<<"${chainstates}")"
+    active_blocks="$(jq -r '.chainstates[-1].blocks // "unavailable"' <<<"${chainstates}")"
+    die "ecash-node AssumeUTXO history is not fully validated (chainstates=${chainstate_count}, historical_blocks=${historical_blocks}, active_blocks=${active_blocks}); wait until 'getchainstates' reports one validated chainstate"
+}

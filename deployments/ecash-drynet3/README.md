@@ -38,13 +38,20 @@ just snapshot
 just status
 ```
 
-Once the node reaches the active Drynet3 tip, start the pinned validator-only
-enforcer. Wallet and mining services are deliberately disabled:
+Once the node reaches the active Drynet3 tip and finishes validating the
+AssumeUTXO history, start the pinned validator-only enforcer. Wallet and mining
+services are deliberately disabled:
 
 ```bash
 just enforcer-up
 just status
 ```
+
+`initialblockdownload=false` only means the snapshot-backed chainstate can
+serve the active tip. It does not mean every historical block is available.
+`just status` reports `history_ready=true` only after `getchainstates` returns
+one fully validated chainstate; `just enforcer-up` refuses to start before that
+point so the enforcer cannot enter a restart loop on unavailable blocks.
 
 The first enforcer synchronization can take time. It reads the node's block
 files directly when available and uses RPC for anything still missing. Once it

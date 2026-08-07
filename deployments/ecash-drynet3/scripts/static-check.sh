@@ -46,6 +46,23 @@ for invalid_live_event_wait in 0 invalid; do
     fi
 done
 
+ready_chainstates='{"headers":978601,"chainstates":[{"blocks":978601,"validated":true}]}'
+syncing_chainstates='{"headers":978601,"chainstates":[{"blocks":763703,"validated":true},{"blocks":978601,"snapshot_blockhash":"snapshot","validated":false}]}'
+unvalidated_chainstate='{"headers":978601,"chainstates":[{"blocks":978601,"snapshot_blockhash":"snapshot","validated":false}]}'
+empty_chainstates='{"headers":978601,"chainstates":[]}'
+
+node_history_is_ready "${ready_chainstates}" ||
+    die "node history readiness rejected one validated chainstate"
+for incomplete_chainstates in \
+    "${syncing_chainstates}" \
+    "${unvalidated_chainstate}" \
+    "${empty_chainstates}" \
+    'not-json'; do
+    if node_history_is_ready "${incomplete_chainstates}"; then
+        die "node history readiness accepted incomplete or invalid chainstates"
+    fi
+done
+
 live_hash='0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef'
 extractor_slot_9="INFO published live enforcer event sidechain=9 height=123 hash=${live_hash}"
 extractor_slot_98="INFO published live enforcer event sidechain=98 height=123 hash=${live_hash}"
