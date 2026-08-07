@@ -18,14 +18,33 @@ node_cli getblockchaininfo |
     jq '{chain, blocks, headers, verificationprogress, initialblockdownload}'
 
 info "chainstates"
-node_cli getchainstates | jq '{headers, chainstates}'
+chainstates="$(node_cli getchainstates)"
+jq '{headers, chainstates}' <<<"${chainstates}"
+
+info "AssumeUTXO history"
+jq '{
+    history_ready: (
+        (.chainstates | length) == 1
+        and .chainstates[0].validated == true
+    ),
+    chainstate_count: (.chainstates | length),
+    historical_blocks: (.chainstates[0].blocks // null),
+    active_blocks: (.chainstates[-1].blocks // null),
+    remaining_blocks: (
+        if (.chainstates | length) > 1 then
+            .chainstates[-1].blocks - .chainstates[0].blocks
+        else
+            0
+        end
+    )
+}' <<<"${chainstates}"
 
 info "peers"
 node_cli getpeerinfo |
     jq '[.[] | {addr, inbound, startingheight, synced_headers, synced_blocks}]'
 
 if ! service_is_running enforcer; then
-    info "enforcer is not running; start it with 'just enforcer-up' after the node is ready"
+    info "enforcer is not running; start it with 'just enforcer-up' after AssumeUTXO history is fully validated"
     exit 0
 fi
 

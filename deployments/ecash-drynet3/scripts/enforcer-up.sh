@@ -12,6 +12,7 @@ require_command jq
 
 compose config --quiet
 require_node_ready
+require_node_history_ready
 
 info "pulling the pinned enforcer image"
 compose pull enforcer

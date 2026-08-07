@@ -12,11 +12,9 @@ require_command jq
 
 compose config --quiet
 require_node_ready
+require_node_history_ready
 
 blockchain_info="$(node_cli getblockchaininfo)"
-chainstates="$(node_cli getchainstates)"
-jq -e '.chainstates | length >= 1' <<<"${chainstates}" >/dev/null ||
-    die "ecash-node returned no usable chainstate"
 
 config_json="$(compose config --format json)"
 jq -e '[.services[]?.ports[]?] | length == 0' <<<"${config_json}" >/dev/null ||
