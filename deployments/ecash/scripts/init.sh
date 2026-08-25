@@ -5,12 +5,13 @@ set -euo pipefail
 # shellcheck source=lib.sh
 source "$(dirname -- "${BASH_SOURCE[0]}")/lib.sh"
 
+load_versions
 case "$(uname -m)" in
 x86_64 | amd64) ;;
-*) die "the pinned Drynet3 node image requires an x86_64 host" ;;
+*) die "the pinned ${NETWORK_ID} node image requires an x86_64 host" ;;
 esac
 
-for command_name in curl docker jq realpath sha256sum tar; do
+for command_name in curl docker jq mktemp realpath sha256sum tar; do
     require_command "${command_name}"
 done
 docker compose version >/dev/null
@@ -29,6 +30,7 @@ resolved_data_root="$(data_root)"
 for directory in \
     "${resolved_data_root}/node" \
     "${resolved_data_root}/node/blocks" \
+    "${resolved_data_root}/config" \
     "${resolved_data_root}/snapshots" \
     "${resolved_data_root}/rpc-cookie" \
     "${resolved_data_root}/enforcer"; do
@@ -41,6 +43,7 @@ for directory in \
 done
 
 chmod 0750 "${resolved_data_root}/rpc-cookie"
+render_node_config "${resolved_data_root}/config/ecash.conf"
 
 compose config --quiet
-info "Drynet3 deployment initialized at ${resolved_data_root}"
+info "${NETWORK_ID} deployment initialized at ${resolved_data_root}"

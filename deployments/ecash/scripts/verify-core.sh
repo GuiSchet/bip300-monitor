@@ -7,8 +7,9 @@ source "$(dirname -- "${BASH_SOURCE[0]}")/lib.sh"
 
 load_versions
 load_deployment_env
-require_command docker
-require_command jq
+for command_name in docker jq; do
+    require_command "${command_name}"
+done
 
 compose config --quiet
 require_node_ready
@@ -22,12 +23,13 @@ jq -e '[.services[]?.ports[]?] | length == 0' <<<"${config_json}" >/dev/null ||
 
 require_service_running enforcer
 chain_info="$(enforcer_rpc GetChainInfo)" || die "enforcer RPC is not ready"
-jq -e '.network == "NETWORK_MAINNET"' <<<"${chain_info}" >/dev/null ||
+jq -e --arg network "${ENFORCER_API_NETWORK}" '.network == $network' \
+    <<<"${chain_info}" >/dev/null ||
     die "enforcer reported an unexpected network"
-jq -e --argjson height "${DRYNET_ACTIVATION_HEIGHT}" \
+jq -e --argjson height "${ECASH_ACTIVATION_HEIGHT}" \
     '.bip300Constants.activationHeight == $height' \
     <<<"${chain_info}" >/dev/null ||
-    die "enforcer is not using the Drynet3 activation height"
+    die "enforcer is not using the ${NETWORK_ID} activation height"
 
 wait_seconds="${ENFORCER_SYNC_WAIT_SECONDS:-300}"
 deadline="$((SECONDS + wait_seconds))"
@@ -45,7 +47,7 @@ while ((SECONDS < deadline)); do
         [[ "${enforcer_height}" == "${node_height}" ]] &&
         [[ "${enforcer_hash}" == "${node_hash}" ]]; then
         headers="$(jq -r '.headers' <<<"${blockchain_info}")"
-        info "Drynet3 node and enforcer verification passed (blocks=${node_height}, headers=${headers})"
+        info "${NETWORK_ID} node and enforcer verification passed (blocks=${node_height}, headers=${headers})"
         exit 0
     fi
     sleep 5

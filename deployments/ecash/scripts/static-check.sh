@@ -7,8 +7,9 @@ source "$(dirname -- "${BASH_SOURCE[0]}")/lib.sh"
 
 load_versions
 export COMPOSE_ENV_FILE="${DEPLOYMENT_ROOT}/.env.example"
+load_deployment_env
 
-for command_name in docker jq just mktemp shellcheck shfmt yamllint; do
+for command_name in cmp docker git jq just mktemp shellcheck shfmt yamllint; do
     require_command "${command_name}"
 done
 
@@ -21,19 +22,28 @@ yamllint --config-file "${DEPLOYMENT_ROOT}/.yamllint.yml" \
 just --justfile "${DEPLOYMENT_ROOT}/justfile" --fmt --check
 
 override_env="$(mktemp)"
-trap 'rm -f -- "${override_env}"' EXIT
+rendered_node_config="$(mktemp)"
+trap 'rm -f -- "${override_env}" "${rendered_node_config}"' EXIT
 for override in \
     'ENFORCER_IMAGE=example.invalid/unpinned:latest' \
-    '   ENFORCER_IMAGE=example.invalid/unpinned:latest'; do
+    'NETWORK_ID=unreviewed-network' \
+    'COMPOSE_PROJECT_NAME=stale-project' \
+    'ECASH_DATA_ROOT=/srv/bip300-monitor/stale-network' \
+    '   ECASH_ACTIVATION_HEIGHT=1'; do
     cp "${DEPLOYMENT_ROOT}/.env.example" "${override_env}"
     printf '\n%s\n' "${override}" >>"${override_env}"
     if (
         COMPOSE_ENV_FILE="${override_env}"
         load_deployment_env
     ) >/dev/null 2>&1; then
-        die "deployment configuration accepted an override of ENFORCER_IMAGE"
+        die "deployment configuration accepted a locked override: ${override}"
     fi
 done
+
+[[ "${COMPOSE_PROJECT_NAME}" == "bip300-ecash-${NETWORK_ID}" ]] ||
+    die "Compose project name is not derived from NETWORK_ID"
+[[ "${ECASH_DATA_ROOT}" == "${DEPLOYMENT_ROOT}/data/${NETWORK_ID}" ]] ||
+    die "data root is not derived from ECASH_DATA_BASE and NETWORK_ID"
 
 for invalid_live_event_wait in 0 invalid; do
     cp "${DEPLOYMENT_ROOT}/.env.example" "${override_env}"
@@ -46,10 +56,10 @@ for invalid_live_event_wait in 0 invalid; do
     fi
 done
 
-ready_chainstates='{"headers":978601,"chainstates":[{"blocks":978601,"validated":true}]}'
-syncing_chainstates='{"headers":978601,"chainstates":[{"blocks":763703,"validated":true},{"blocks":978601,"snapshot_blockhash":"snapshot","validated":false}]}'
-unvalidated_chainstate='{"headers":978601,"chainstates":[{"blocks":978601,"snapshot_blockhash":"snapshot","validated":false}]}'
-empty_chainstates='{"headers":978601,"chainstates":[]}'
+ready_chainstates='{"headers":996259,"chainstates":[{"blocks":996259,"validated":true}]}'
+syncing_chainstates='{"headers":996259,"chainstates":[{"blocks":763703,"validated":true},{"blocks":996259,"snapshot_blockhash":"snapshot","validated":false}]}'
+unvalidated_chainstate='{"headers":996259,"chainstates":[{"blocks":996259,"snapshot_blockhash":"snapshot","validated":false}]}'
+empty_chainstates='{"headers":996259,"chainstates":[]}'
 
 node_history_is_ready "${ready_chainstates}" ||
     die "node history readiness rejected one validated chainstate"
@@ -99,6 +109,46 @@ if logs_contain_live_event \
     die "live event matcher accepted the wrong block hash"
 fi
 
+snapshot_logs="$(printf '%s\n' \
+    'INFO received enforcer event event=chain_info summary=network_mainnet' \
+    'INFO received enforcer event event="chain_tip" summary=height=996259' \
+    'INFO received enforcer event event=sidechain_proposals summary=proposal_count=0' \
+    'INFO received enforcer event event=active_sidechains summary=sidechain_count=0' \
+    'INFO received enforcer event event=ctip summary="sidechain=9 present=false"' \
+    'INFO received enforcer event event="ctip" summary="sidechain=98 present=false"' \
+    'INFO received enforcer event event=block_connected summary="sidechain=9 height=996260"')"
+for snapshot_kind in chain_info chain_tip sidechain_proposals active_sidechains; do
+    [[ "$(count_snapshot_events "${snapshot_logs}" "${snapshot_kind}")" == 1 ]] ||
+        die "semantic snapshot matcher rejected ${snapshot_kind}"
+done
+[[ "$(count_snapshot_events "${snapshot_logs}" ctip 9)" == 1 ]] ||
+    die "semantic snapshot matcher rejected CTIP slot 9"
+[[ "$(count_snapshot_events "${snapshot_logs}" ctip 98)" == 1 ]] ||
+    die "semantic snapshot matcher rejected quoted CTIP slot 98"
+[[ "$(count_snapshot_events "${snapshot_logs}" ctip 8)" == 0 ]] ||
+    die "semantic snapshot matcher accepted the wrong CTIP slot"
+[[ "$(count_snapshot_events "${snapshot_logs}" block_connected 9)" == 1 ]] ||
+    die "semantic snapshot matcher did not isolate a live event kind"
+
+duplicate_chain_info="${snapshot_logs}"$'\nINFO received enforcer event event=chain_info summary=duplicate'
+[[ "$(count_snapshot_events "${duplicate_chain_info}" chain_info)" == 2 ]] ||
+    die "semantic snapshot matcher did not expose duplicate snapshot events"
+
+logs_contain_snapshot_completion \
+    'INFO sidechain_count=2 published initial enforcer snapshot' 2 ||
+    die "snapshot completion matcher rejected a valid message"
+if logs_contain_snapshot_completion \
+    'INFO sidechain_count=1 published initial enforcer snapshot' 2; then
+    die "snapshot completion matcher accepted the wrong sidechain count"
+fi
+if logs_contain_snapshot_completion \
+    'INFO sidechain_count=2 published live enforcer event' 2; then
+    die "snapshot completion matcher accepted the wrong message"
+fi
+
+[[ "$(latest_timestamp '2026-08-25T10:00:00.000000000Z' '2026-08-25T10:00:01.000000000Z')" == '2026-08-25T10:00:01.000000000Z' ]] ||
+    die "latest timestamp helper selected a stale container instance"
+
 config_json="$(compose config --format json)"
 jq -e '.services | keys == ["ecash-node", "enforcer", "enforcer-extractor", "event-logger", "nats"]' \
     <<<"${config_json}" >/dev/null
@@ -115,6 +165,8 @@ jq -e --arg image "${EVENT_LOGGER_IMAGE}" \
     '.services["event-logger"].image == $image' \
     <<<"${config_json}" >/dev/null
 jq -e '[.services[]?.ports[]?] | length == 0' <<<"${config_json}" >/dev/null
+jq -e '[.services[]? | select(.network_mode == "host")] | length == 0' \
+    <<<"${config_json}" >/dev/null
 jq -e '.services.enforcer.depends_on["ecash-node"].condition == "service_healthy"' \
     <<<"${config_json}" >/dev/null
 jq -e '[.services.enforcer.volumes[] | select(.target == "/rpc-cookie" and .read_only == true)] | length == 1' \
@@ -126,6 +178,10 @@ jq -e '.services.enforcer.command | all(. != "--enable-wallet" and . != "--enabl
     <<<"${config_json}" >/dev/null
 jq -e '.services.enforcer.healthcheck.test | any(contains("GetChainTip"))' \
     <<<"${config_json}" >/dev/null
+jq -e --arg source "${ECASH_DATA_ROOT}/config/ecash.conf" \
+    '[.services["ecash-node"].volumes[]
+      | select(.source == $source and .target == "/etc/ecash/ecash.conf" and .read_only == true)]
+     | length == 1' <<<"${config_json}" >/dev/null
 
 jq -e '.services.nats.user == "10002:10002" and .services.nats.read_only == true' \
     <<<"${config_json}" >/dev/null
@@ -159,30 +215,69 @@ jq -e '.services["enforcer-extractor"].environment.BIP300_MONITOR_NATS_URL == "n
     <<<"${config_json}" >/dev/null
 
 for expected_arg in \
-    '--network-preset=drynet3' \
-    '--node-rpc-addr=ecash-node:8332' \
+    "--network-preset=${ENFORCER_NETWORK_PRESET}" \
+    "--node-rpc-addr=ecash-node:${ECASH_NODE_RPC_PORT}" \
     '--node-rpc-cookie-path=/rpc-cookie/.cookie' \
-    '--node-zmq-addr-sequence=tcp://ecash-node:29000' \
+    "--node-zmq-addr-sequence=tcp://ecash-node:${ECASH_NODE_ZMQ_PORT}" \
     '--node-blocks-dir=/node-blocks' \
     '--serve-grpc-addr=0.0.0.0:50051' \
-    '--bitcoin-core-expected-version=31'; do
+    "--bitcoin-core-expected-version=${ECASH_NODE_EXPECTED_VERSION}"; do
     jq -e --arg expected_arg "${expected_arg}" \
         '.services.enforcer.command | index($expected_arg) != null' \
         <<<"${config_json}" >/dev/null
 done
 
-grep -Fxq 'connect=drynet3.drivechain.dev:8337' \
-    "${DEPLOYMENT_ROOT}/config/drynet3/drivechain-ecash.conf"
-grep -Fxq 'listen=0' \
-    "${DEPLOYMENT_ROOT}/config/drynet3/drivechain-ecash.conf"
-grep -Fxq 'rpcallowip=172.30.0.0/24' \
-    "${DEPLOYMENT_ROOT}/config/drynet3/drivechain-ecash.conf"
-grep -Fxq 'rpccookiefile=/rpc-cookie/.cookie' \
-    "${DEPLOYMENT_ROOT}/config/drynet3/drivechain-ecash.conf"
-[[ "${DRYNET_ACTIVATION_BLOCK_HASH}" =~ ^[[:xdigit:]]{64}$ ]]
+for expected_arg in \
+    '-conf=/etc/ecash/ecash.conf' \
+    "-port=${ECASH_NODE_P2P_PORT}" \
+    "-rpcport=${ECASH_NODE_RPC_PORT}"; do
+    jq -e --arg expected_arg "${expected_arg}" \
+        '.services["ecash-node"].command | index($expected_arg) != null' \
+        <<<"${config_json}" >/dev/null
+done
+
+render_node_config "${rendered_node_config}"
+grep -Fxq '# Locked network values. Generated by scripts/init.sh.' \
+    "${rendered_node_config}"
+grep -Fxq "# network_id=${NETWORK_ID} magic=${ECASH_NETWORK_MAGIC}" \
+    "${rendered_node_config}"
+grep -Fxq 'listen=0' "${rendered_node_config}"
+grep -Fxq "port=${ECASH_NODE_P2P_PORT}" "${rendered_node_config}"
+grep -Fxq "rpcport=${ECASH_NODE_RPC_PORT}" "${rendered_node_config}"
+grep -Fxq 'rpcallowip=172.30.0.0/24' "${rendered_node_config}"
+grep -Fxq 'rpccookiefile=/rpc-cookie/.cookie' "${rendered_node_config}"
+grep -Fxq "zmqpubsequence=tcp://0.0.0.0:${ECASH_NODE_ZMQ_PORT}" \
+    "${rendered_node_config}"
+expected_peer_count=0
+while IFS= read -r peer; do
+    grep -Fxq "addnode=${peer}" "${rendered_node_config}"
+    ((expected_peer_count += 1))
+done < <(network_peers)
+actual_peer_count="$(grep -c '^addnode=' "${rendered_node_config}")"
+[[ "${actual_peer_count}" == "${expected_peer_count}" ]] ||
+    die "rendered node configuration contains an unexpected peer"
+
+[[ "${LOCK_FORMAT}" == 2 ]]
+[[ "${ECASH_NETWORK_MAGIC}" =~ ^[[:xdigit:]]{8}$ ]]
+[[ "${ECASH_ACTIVATION_BLOCK_HASH}" =~ ^[[:xdigit:]]{64}$ ]]
+[[ "${ECASH_SNAPSHOT_SHA256}" =~ ^[[:xdigit:]]{64}$ ]]
+[[ "${ECASH_NODE_COMMIT}" =~ ^[[:xdigit:]]{40}$ ]]
 [[ "${ENFORCER_COMMIT}" =~ ^[[:xdigit:]]{40}$ ]]
 [[ "${MONITOR_IMAGE_COMMIT}" =~ ^[[:xdigit:]]{40}$ ]]
+[[ "${ECASH_NODE_IMAGE}" == *":${ECASH_NODE_BRANCH}@sha256:"* ]]
+[[ "${ENFORCER_IMAGE}" == *":sha-${ENFORCER_COMMIT:0:7}@sha256:"* ]]
 [[ "${ENFORCER_EXTRACTOR_IMAGE}" == *":sha-${MONITOR_IMAGE_COMMIT:0:12}@sha256:"* ]]
 [[ "${EVENT_LOGGER_IMAGE}" == *":sha-${MONITOR_IMAGE_COMMIT:0:12}@sha256:"* ]]
 
-info "Drynet3 deployment checks passed"
+legacy_prefix=DRYNET
+if grep -R -n --exclude-dir=data "${legacy_prefix}_" "${DEPLOYMENT_ROOT}"; then
+    die "deployment still contains a legacy drynet variable"
+fi
+
+repository_root="$(git -C "${DEPLOYMENT_ROOT}" rev-parse --show-toplevel)"
+if grep -Fq "hashFiles('deployments/ecash" \
+    "${repository_root}/.github/workflows/ci.yml"; then
+    die "deployment CI gate is guarded by hashFiles and can be skipped"
+fi
+
+info "${NETWORK_ID} eCash deployment checks passed"

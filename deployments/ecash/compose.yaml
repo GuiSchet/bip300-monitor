@@ -1,5 +1,5 @@
 ---
-name: ${COMPOSE_PROJECT_NAME:-bip300-ecash-drynet3}
+name: ${COMPOSE_PROJECT_NAME:?COMPOSE_PROJECT_NAME must be set}
 
 services:
   ecash-node:
@@ -12,22 +12,24 @@ services:
       GID: ${PGID:-1000}
       UID: ${PUID:-1000}
     command:
-      - -conf=/etc/ecash/drivechain-ecash.conf
+      - -conf=/etc/ecash/ecash.conf
+      - -port=${ECASH_NODE_P2P_PORT:?ECASH_NODE_P2P_PORT must be set by VERSIONS.lock}
+      - -rpcport=${ECASH_NODE_RPC_PORT:?ECASH_NODE_RPC_PORT must be set by VERSIONS.lock}
       - -printtoconsole=1
     volumes:
       - type: bind
-        source: ${ECASH_DATA_ROOT:-./data}/node
+        source: ${ECASH_DATA_ROOT:?ECASH_DATA_ROOT must be derived from NETWORK_ID}/node
         target: /data
       - type: bind
-        source: ${ECASH_DATA_ROOT:-./data}/snapshots
+        source: ${ECASH_DATA_ROOT:?ECASH_DATA_ROOT must be derived from NETWORK_ID}/snapshots
         target: /snapshots
         read_only: true
       - type: bind
-        source: ${ECASH_DATA_ROOT:-./data}/rpc-cookie
+        source: ${ECASH_DATA_ROOT:?ECASH_DATA_ROOT must be derived from NETWORK_ID}/rpc-cookie
         target: /rpc-cookie
       - type: bind
-        source: ./config/drynet3/drivechain-ecash.conf
-        target: /etc/ecash/drivechain-ecash.conf
+        source: ${ECASH_DATA_ROOT:?ECASH_DATA_ROOT must be derived from NETWORK_ID}/config/ecash.conf
+        target: /etc/ecash/ecash.conf
         read_only: true
     networks:
       ecash-internal:
@@ -36,7 +38,8 @@ services:
         - CMD-SHELL
         - >-
           bitcoin-cli -datadir=/data
-          -conf=/etc/ecash/drivechain-ecash.conf
+          -conf=/etc/ecash/ecash.conf
+          -rpcport=${ECASH_NODE_RPC_PORT}
           -rpcwait getblockchaininfo >/dev/null
       interval: 30s
       timeout: 20s
@@ -59,24 +62,24 @@ services:
       RUST_LOG: ${ENFORCER_RUST_LOG:-info}
     command:
       - --data-dir=/data
-      - --network-preset=drynet3
-      - --node-rpc-addr=ecash-node:8332
+      - --network-preset=${ENFORCER_NETWORK_PRESET:?ENFORCER_NETWORK_PRESET must be set by VERSIONS.lock}
+      - --node-rpc-addr=ecash-node:${ECASH_NODE_RPC_PORT}
       - --node-rpc-cookie-path=/rpc-cookie/.cookie
-      - --node-zmq-addr-sequence=tcp://ecash-node:29000
+      - --node-zmq-addr-sequence=tcp://ecash-node:${ECASH_NODE_ZMQ_PORT}
       - --node-blocks-dir=/node-blocks
       - --serve-grpc-addr=0.0.0.0:50051
-      - --bitcoin-core-expected-version=31
+      - --bitcoin-core-expected-version=${ECASH_NODE_EXPECTED_VERSION:?ECASH_NODE_EXPECTED_VERSION must be set by VERSIONS.lock}
       - --log-level=INFO
     volumes:
       - type: bind
-        source: ${ECASH_DATA_ROOT:-./data}/enforcer
+        source: ${ECASH_DATA_ROOT:?ECASH_DATA_ROOT must be derived from NETWORK_ID}/enforcer
         target: /data
       - type: bind
-        source: ${ECASH_DATA_ROOT:-./data}/rpc-cookie
+        source: ${ECASH_DATA_ROOT:?ECASH_DATA_ROOT must be derived from NETWORK_ID}/rpc-cookie
         target: /rpc-cookie
         read_only: true
       - type: bind
-        source: ${ECASH_DATA_ROOT:-./data}/node/blocks
+        source: ${ECASH_DATA_ROOT:?ECASH_DATA_ROOT must be derived from NETWORK_ID}/node/blocks
         target: /node-blocks
         read_only: true
     depends_on:
@@ -115,7 +118,7 @@ services:
     user: 10002:10002
     command:
       - nats-server
-      - --name=bip300-ecash-drynet3
+      - --name=${COMPOSE_PROJECT_NAME}
       - --port=4222
       - --http_port=8222
     networks:
@@ -213,7 +216,7 @@ services:
 
 networks:
   ecash-internal:
-    name: ${COMPOSE_PROJECT_NAME:-bip300-ecash-drynet3}-internal
+    name: ${COMPOSE_PROJECT_NAME:?COMPOSE_PROJECT_NAME must be set}-internal
     driver: bridge
     ipam:
       config:

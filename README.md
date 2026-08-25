@@ -94,10 +94,12 @@ Docker Hub setup, and local builds.
 
 ## Deployments
 
-Reproducible, network-specific infrastructure lives under `deployments/`.
-The first target includes a pinned node, validator enforcer, Core NATS,
-enforcer extractor, and event logger:
-[eCash Drynet3 deployment](deployments/ecash-drynet3/README.md).
+Reproducible infrastructure lives under `deployments/`. The eCash target
+generates its node configuration and isolated runtime identity from a network
+lock, so the same topology can move between network generations. Its current
+lock targets Alphanet and includes a
+pinned node, validator enforcer, Core NATS, enforcer extractor, and event
+logger: [eCash deployment](deployments/ecash/README.md).
 
 ## Build
 
@@ -117,7 +119,7 @@ NATS_SERVER_BINARY=/path/to/nats-server \
   cargo test --workspace --all-features --jobs 2
 ```
 
-Drynet gate: confirm that an idle enforcer remains subscribed beyond
+Network gate: confirm that an idle enforcer remains subscribed beyond
 `--request-timeout-seconds 5`; that normal `SIGTERM` exits with code 0 before
 the 15-second shutdown timeout; and that an in-flight publication with NATS
 unavailable reports its flush error before that outer deadline.
