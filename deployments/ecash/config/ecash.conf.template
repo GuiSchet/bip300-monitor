@@ -1,0 +1,17 @@
+# Base eCash observer configuration. init.sh appends every network-owned value
+# from VERSIONS.lock and writes the result below the network-specific data root.
+server=1
+listen=0
+discover=0
+dnsseed=1
+
+rest=1
+txindex=1
+disablewallet=1
+
+rpcbind=0.0.0.0
+rpcallowip=172.30.0.0/24
+rpccookiefile=/rpc-cookie/.cookie
+rpcthreads=8
+
+printtoconsole=1

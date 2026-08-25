@@ -7,9 +7,13 @@ source "$(dirname -- "${BASH_SOURCE[0]}")/lib.sh"
 
 load_versions
 load_deployment_env
-for command_name in date docker jq; do
+for command_name in chmod date dirname docker jq mktemp mv rm; do
     require_command "${command_name}"
 done
+(($# <= 1)) || die "usage: verify-live.sh [result-file]"
+result_file="${1:-}"
+result_tmp=""
+trap '[[ -z "${result_tmp}" ]] || rm -f -- "${result_tmp}"' EXIT
 
 "${DEPLOYMENT_ROOT}/scripts/verify.sh"
 
@@ -21,7 +25,7 @@ baseline_height="$(jq -er '.blocks' <<<"${blockchain_info}")"
 baseline_hash="$(node_cli getblockhash "${baseline_height}")"
 block_deadline="$((SECONDS + block_wait_seconds))"
 
-info "waiting up to ${block_wait_seconds}s for a new Drynet3 block after ${baseline_height}"
+info "waiting up to ${block_wait_seconds}s for a new ${NETWORK_ID} block after ${baseline_height}"
 while :; do
     blockchain_info="$(node_cli getblockchaininfo)"
     live_height="$(jq -er '.blocks' <<<"${blockchain_info}")"
@@ -30,7 +34,7 @@ while :; do
         break
     fi
     ((SECONDS < block_deadline)) ||
-        die "no new Drynet3 block arrived within ${block_wait_seconds}s; live delivery was not exercised"
+        die "no new ${NETWORK_ID} block arrived within ${block_wait_seconds}s; live delivery was not exercised"
     sleep 10
 done
 
@@ -68,7 +72,20 @@ while :; do
     done
 
     if [[ "${all_delivered}" == true ]]; then
-        info "live Drynet3 event delivery passed (height=${live_height}, hash=${live_hash}, slots=${configured_sidechains})"
+        if [[ -n "${result_file}" ]]; then
+            result_directory="$(dirname -- "${result_file}")"
+            [[ -d "${result_directory}" ]] ||
+                die "live verification result directory does not exist: ${result_directory}"
+            result_tmp="$(mktemp "${result_directory}/.verified-live.XXXXXX")"
+            jq -n \
+                --argjson height "${live_height}" \
+                --arg hash "${live_hash}" \
+                '{height: $height, hash: $hash}' >"${result_tmp}"
+            chmod 0600 "${result_tmp}"
+            mv -- "${result_tmp}" "${result_file}"
+            result_tmp=""
+        fi
+        info "live ${NETWORK_ID} event delivery passed (height=${live_height}, hash=${live_hash}, slots=${configured_sidechains})"
         exit 0
     fi
     ((SECONDS < event_deadline)) ||

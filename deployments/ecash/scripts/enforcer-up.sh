@@ -16,7 +16,7 @@ require_node_history_ready
 
 info "pulling the pinned enforcer image"
 compose pull enforcer
-info "starting the Drynet3 enforcer"
+info "starting the ${NETWORK_ID} enforcer"
 compose up --detach enforcer
 compose ps enforcer
 info "the initial validator sync may take time; run 'just status', then 'just monitor-up'"

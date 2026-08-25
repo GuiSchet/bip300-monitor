@@ -10,6 +10,13 @@ load_deployment_env
 require_command docker
 require_command jq
 
+info "locked deployment"
+jq -n \
+    --arg network "${NETWORK_ID}" \
+    --arg magic "${ECASH_NETWORK_MAGIC}" \
+    --argjson activationHeight "${ECASH_ACTIVATION_HEIGHT}" \
+    '{network: $network, magic: $magic, activationHeight: $activationHeight}'
+
 compose ps
 require_service_running ecash-node
 

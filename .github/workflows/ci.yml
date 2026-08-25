@@ -240,7 +240,7 @@ jobs:
           provenance: false
           sbom: false
 
-  # Deployment checks will grow with deployments/ecash-drynet3. Keeping the
+  # Deployment checks live under deployments/ecash. Keeping the
   # job separate means infrastructure PRs remain fast and cannot publish code.
   deployment:
     name: Deployment checks
@@ -267,8 +267,7 @@ jobs:
             yamllint
 
       - name: Install pinned just
-        if: hashFiles('deployments/ecash-drynet3/scripts/install-just.sh') != ''
-        working-directory: deployments/ecash-drynet3
+        working-directory: deployments/ecash
         env:
           JUST_INSTALL_DIR: ${{ runner.temp }}/just/bin
         run: |
@@ -286,9 +285,8 @@ jobs:
 
           echo "No tracked deployment .env files found."
 
-      - name: Validate eCash Drynet3 deployment
-        if: hashFiles('deployments/ecash-drynet3/scripts/static-check.sh') != ''
-        working-directory: deployments/ecash-drynet3
+      - name: Validate eCash deployment
+        working-directory: deployments/ecash
         run: ./scripts/static-check.sh
 
   # Other jobs may be intentionally skipped, which makes their individual

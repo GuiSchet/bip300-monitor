@@ -9,11 +9,15 @@ default:
 init:
     ./scripts/init.sh
 
-# Pull and start the pinned Drynet3 node.
+# Check resources, endpoints, images, and network isolation without starting services.
+preflight:
+    ./scripts/preflight.sh
+
+# Pull and start the pinned eCash node for the locked network.
 up:
     ./scripts/up.sh
 
-# Start the enforcer after the Drynet3 node is synchronized.
+# Start the enforcer after the eCash node is synchronized.
 enforcer-up:
     ./scripts/enforcer-up.sh
 
@@ -33,9 +37,13 @@ status:
 verify:
     ./scripts/verify.sh
 
-# Wait for a new Drynet block and verify live delivery for every configured slot.
+# Wait for a new block and verify live delivery for every configured slot.
 verify-live:
     ./scripts/verify-live.sh
+
+# Run fast and live verification, then write the deployment acceptance marker.
+accept:
+    ./scripts/accept.sh
 
 # Follow all logs, or only one named service.
 logs service="":
