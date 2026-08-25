@@ -308,21 +308,29 @@ wait_for_nats_client() {
     done
 }
 
+line_contains_sidechain() {
+    local line="$1"
+    local sidechain="$2"
+    local slot_pattern
+
+    [[ "${sidechain}" =~ ^[0-9]+$ ]] || return 1
+    slot_pattern="(^|[[:space:]])(summary=\"?)?sidechain=${sidechain}([^0-9]|$)"
+    [[ "${line}" =~ ${slot_pattern} ]]
+}
+
 logs_contain_live_event() {
     local logs="$1"
     local message="$2"
     local sidechain="$3"
     local block_hash="$4"
     local line
-    local slot_pattern
 
     [[ "${sidechain}" =~ ^[0-9]+$ ]] || return 1
-    slot_pattern="(^|[[:space:]\"])sidechain=${sidechain}([^0-9]|$)"
 
     while IFS= read -r line; do
-        if [[ "${line}" == *"${message}"* &&
-            "${line}" =~ ${slot_pattern} &&
-            "${line}" == *"${block_hash}"* ]]; then
+        if [[ "${line}" == *"${message}"* ]] &&
+            line_contains_sidechain "${line}" "${sidechain}" &&
+            [[ "${line}" == *"${block_hash}"* ]]; then
             return 0
         fi
     done <<<"${logs}"
@@ -359,19 +367,18 @@ count_snapshot_events() {
     local count=0
     local event_pattern
     local line
-    local slot_pattern
 
     [[ "${kind}" =~ ^[a-z_]+$ ]] || return 1
     event_pattern="(^|[[:space:]])event=\"?${kind}\"?([[:space:]]|$)"
     if [[ -n "${sidechain}" ]]; then
         [[ "${sidechain}" =~ ^[0-9]+$ ]] || return 1
-        slot_pattern="(^|[[:space:]\"])sidechain=${sidechain}([^0-9]|$)"
     fi
 
     while IFS= read -r line; do
         [[ "${line}" == *"received enforcer event"* ]] || continue
         [[ "${line}" =~ ${event_pattern} ]] || continue
-        if [[ -n "${sidechain}" && ! "${line}" =~ ${slot_pattern} ]]; then
+        if [[ -n "${sidechain}" ]] &&
+            ! line_contains_sidechain "${line}" "${sidechain}"; then
             continue
         fi
         ((count += 1))

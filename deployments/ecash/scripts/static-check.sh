@@ -74,10 +74,12 @@ for incomplete_chainstates in \
 done
 
 live_hash='0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef'
-extractor_slot_9="INFO published live enforcer event sidechain=9 height=123 hash=${live_hash}"
-extractor_slot_98="INFO published live enforcer event sidechain=98 height=123 hash=${live_hash}"
-logger_slot_9="INFO received enforcer event summary=\"sidechain=9 height=123 hash=${live_hash}\""
-logger_slot_98="INFO received enforcer event summary=\"sidechain=98 height=123 hash=${live_hash}\""
+extractor_slot_9="INFO enforcer_extractor: published live enforcer event event=\"block_connected\" sidechain=9 height=123 block_hash=${live_hash}"
+extractor_slot_98="INFO enforcer_extractor: published live enforcer event event=\"block_connected\" sidechain=98 height=123 block_hash=${live_hash}"
+logger_slot_9="INFO event_logger: received enforcer event subject=bip300.enforcer timestamp_ms=1 event=\"block_connected\" summary=sidechain=9 height=123 block_hash=${live_hash}"
+logger_slot_98="INFO event_logger: received enforcer event subject=bip300.enforcer timestamp_ms=1 event=\"block_connected\" summary=sidechain=98 height=123 block_hash=${live_hash}"
+quoted_logger_slot_9="INFO event_logger: received enforcer event event=\"block_connected\" summary=\"sidechain=9 height=123 block_hash=${live_hash}\""
+payload_only_slot_9="INFO event_logger: received enforcer event event=\"block_connected\" payload=sidechain=9 summary=height=123 block_hash=${live_hash}"
 
 logs_contain_live_event \
     "${extractor_slot_9}" "published live enforcer event" 9 "${live_hash}" ||
@@ -87,10 +89,13 @@ logs_contain_live_event \
     die "live event matcher rejected extractor slot 98"
 logs_contain_live_event \
     "${logger_slot_9}" "received enforcer event" 9 "${live_hash}" ||
-    die "live event matcher rejected quoted logger slot 9"
+    die "live event matcher rejected real logger slot 9"
 logs_contain_live_event \
     "${logger_slot_98}" "received enforcer event" 98 "${live_hash}" ||
-    die "live event matcher rejected quoted logger slot 98"
+    die "live event matcher rejected real logger slot 98"
+logs_contain_live_event \
+    "${quoted_logger_slot_9}" "received enforcer event" 9 "${live_hash}" ||
+    die "live event matcher rejected quoted logger compatibility"
 
 if logs_contain_live_event \
     "${extractor_slot_98}" "published live enforcer event" 9 "${live_hash}"; then
@@ -108,15 +113,19 @@ if logs_contain_live_event \
     "${logger_slot_9}" "received enforcer event" 9 "${live_hash%?}0"; then
     die "live event matcher accepted the wrong block hash"
 fi
+if logs_contain_live_event \
+    "${payload_only_slot_9}" "received enforcer event" 9 "${live_hash}"; then
+    die "live event matcher accepted sidechain data from an unrelated field"
+fi
 
 snapshot_logs="$(printf '%s\n' \
-    'INFO received enforcer event event=chain_info summary=network_mainnet' \
+    'INFO received enforcer event event="chain_info" summary=network_mainnet' \
     'INFO received enforcer event event="chain_tip" summary=height=996259' \
-    'INFO received enforcer event event=sidechain_proposals summary=proposal_count=0' \
-    'INFO received enforcer event event=active_sidechains summary=sidechain_count=0' \
-    'INFO received enforcer event event=ctip summary="sidechain=9 present=false"' \
-    'INFO received enforcer event event="ctip" summary="sidechain=98 present=false"' \
-    'INFO received enforcer event event=block_connected summary="sidechain=9 height=996260"')"
+    'INFO received enforcer event event="sidechain_proposals" summary=proposal_count=0' \
+    'INFO received enforcer event event="active_sidechains" summary=sidechain_count=0' \
+    'INFO received enforcer event event="ctip" summary=sidechain=9 present=false' \
+    'INFO received enforcer event event="ctip" summary=sidechain=98 present=false' \
+    'INFO received enforcer event event="block_connected" summary=sidechain=9 height=996260')"
 for snapshot_kind in chain_info chain_tip sidechain_proposals active_sidechains; do
     [[ "$(count_snapshot_events "${snapshot_logs}" "${snapshot_kind}")" == 1 ]] ||
         die "semantic snapshot matcher rejected ${snapshot_kind}"
@@ -124,7 +133,7 @@ done
 [[ "$(count_snapshot_events "${snapshot_logs}" ctip 9)" == 1 ]] ||
     die "semantic snapshot matcher rejected CTIP slot 9"
 [[ "$(count_snapshot_events "${snapshot_logs}" ctip 98)" == 1 ]] ||
-    die "semantic snapshot matcher rejected quoted CTIP slot 98"
+    die "semantic snapshot matcher rejected CTIP slot 98"
 [[ "$(count_snapshot_events "${snapshot_logs}" ctip 8)" == 0 ]] ||
     die "semantic snapshot matcher accepted the wrong CTIP slot"
 [[ "$(count_snapshot_events "${snapshot_logs}" block_connected 9)" == 1 ]] ||
