@@ -49,6 +49,19 @@ pub struct Args {
     )]
     pub sidechains: Vec<u8>,
 
+    /// Maximum number of blocks a single startup backfill may recover.
+    ///
+    /// A range walk returns every block in one message, so an unbounded gap
+    /// would be one enormous response. Past this bound the extractor records a
+    /// window ending at the tip and warns that the rest was skipped.
+    #[arg(
+        long,
+        env = "BIP300_MONITOR_BACKFILL_MAX_BLOCKS",
+        default_value_t = 2_000,
+        value_parser = clap::value_parser!(u32).range(1..)
+    )]
+    pub backfill_max_blocks: u32,
+
     /// Timeout in seconds for connections, unary requests, and stream setup.
     #[arg(
         long,

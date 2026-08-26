@@ -15,6 +15,7 @@ use tokio::sync::watch;
 use tokio::task::JoinSet;
 use tonic::{Status, Streaming};
 
+use crate::backfill;
 use crate::config::Args;
 use crate::event::envelope;
 use crate::proto::mainchain;
@@ -135,6 +136,28 @@ pub async fn run(args: Args, mut shutdown_rx: watch::Receiver<bool>) -> Result<(
     if *shutdown_rx.borrow() {
         tracing::info!("shutdown requested after the initial snapshot");
         return Ok(());
+    }
+
+    // Before any live event is forwarded, recover whatever passed while the
+    // extractor was not subscribed. The live streams are already open, so this
+    // only competes with buffered events, and the identity of an observation
+    // makes an overlap idempotent rather than duplicated.
+    let mut backfill_client = client.clone();
+    for sidechain in &args.sidechains {
+        backfill::run(
+            &mut backfill_client,
+            &recorder,
+            *sidechain,
+            &snapshot.anchor,
+            args.backfill_max_blocks,
+        )
+        .await
+        .with_context(|| format!("backfilling sidechain {sidechain}"))?;
+
+        if *shutdown_rx.borrow() {
+            tracing::info!("shutdown requested during the backfill");
+            return Ok(());
+        }
     }
 
     // Every slot worker reports the blocks it sees here, so one state worker can

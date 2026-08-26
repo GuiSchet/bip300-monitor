@@ -78,10 +78,26 @@ termination.
 Every restart republishes the snapshot. That is idempotent in the record — one
 observation of one kind, for one slot, at one block is a single row — and it
 re-establishes current state for live consumers, which Core NATS cannot replay.
-What a restart does **not** yet recover is the blocks that passed while the
-extractor was down: `SubscribeEvents` starts at subscription time, so that gap
-needs the backfill listed under [Next](#next). Detailed event semantics are
-documented in [`proto/README.md`](proto/README.md).
+
+A restart also backfills. `SubscribeEvents` delivers from the moment of
+subscription and its request carries no cursor, so the blocks that passed while
+the extractor was down are a real hole. The record says where to resume: the
+checkpoint is `max(height)` over the recorded blocks of a slot, and because a
+row is committed before anything is published it can never name a block that was
+not stored. Three cases are handled explicitly, because each has a way of going
+wrong quietly:
+
+- **Within the bound.** `GetTwoWayPegData` walks from the checkpoint, which is
+  exclusive, up to the tip.
+- **Nothing recorded yet.** Omitting the start makes the enforcer walk back to
+  genesis, so a first sight takes a bounded window instead.
+- **A gap past `--backfill-max-blocks`, or a checkpoint that is no longer an
+  ancestor of the tip** — the shape a reorg past it leaves. Both fall back to a
+  bounded window and **warn**, because skipped history that is only logged at
+  debug reads later as "nothing happened".
+
+Detailed event semantics are documented in
+[`proto/README.md`](proto/README.md).
 
 ## Inspecting events
 
@@ -160,15 +176,10 @@ deliberately out of scope.
 
 Planned work, in order:
 
-1. **Gap backfill.** `GetTwoWayPegData` and `GetBlockInfo` can replay the blocks
-   missed while the extractor was down. `SubscribeEvents` does not replay
-   history, so a restart leaves a real hole that nothing else can close. The
-   checkpoint is a query against the record, not a file, so it cannot claim an
-   event that was never stored.
-2. **Slot discovery.** Deriving the monitored slots from `GetSidechains`
+1. **Slot discovery.** Deriving the monitored slots from `GetSidechains`
    instead of requiring `--sidechain`, so a newly activated sidechain is not
    invisible until the next restart.
-3. **An independent oracle.** The enforcer parses the BIP300 coinbase messages
+2. **An independent oracle.** The enforcer parses the BIP300 coinbase messages
    but only publishes aggregates: per-block M2, M4 and M7 votes never leave it,
    and BMM bid amounts appear in no API at all. Deriving that state from the raw
    block and comparing it against what the enforcer reports turns the monitor

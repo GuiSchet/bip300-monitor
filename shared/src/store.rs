@@ -305,6 +305,42 @@ impl Store {
         Ok(inserted)
     }
 
+    /// Newest recorded block of one kind for one sidechain slot.
+    ///
+    /// The hash is what a range backfill needs as its starting point; the
+    /// height only bounds how much it may ask for.
+    pub async fn last_recorded_block(
+        &self,
+        kind: &str,
+        sidechain: u8,
+    ) -> Result<Option<(Vec<u8>, u32)>> {
+        let sidechain = i16::from(sidechain);
+        let client = self.client.lock().await;
+        let row = client
+            .query_opt(
+                "SELECT block_hash, height FROM event
+                 WHERE source = $1 AND kind = $2 AND sidechain = $3
+                   AND block_hash IS NOT NULL AND height IS NOT NULL
+                 ORDER BY height DESC
+                 LIMIT 1",
+                &[&self.source, &kind, &sidechain],
+            )
+            .await
+            .with_context(|| {
+                format!("reading the last recorded {kind} block for sidechain {sidechain}")
+            })?;
+
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let hash: Vec<u8> = row.get(0);
+        let height: i32 = row.get(1);
+        let height = u32::try_from(height)
+            .with_context(|| format!("recorded height {height} is negative"))?;
+
+        Ok(Some((hash, height)))
+    }
+
     /// Height of the newest recorded event of one kind for one sidechain slot.
     ///
     /// This is the backfill checkpoint: because the record is written before

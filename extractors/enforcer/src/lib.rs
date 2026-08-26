@@ -2,6 +2,7 @@
 
 //! Live event extractor for the BIP300/301 enforcer.
 
+mod backfill;
 pub mod client;
 pub mod config;
 pub mod convert;
