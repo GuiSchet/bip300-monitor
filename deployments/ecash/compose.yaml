@@ -45,6 +45,8 @@ services:
       timeout: 20s
       retries: 20
       start_period: 2m
+    security_opt:
+      - no-new-privileges:true
     logging:
       driver: json-file
       options:

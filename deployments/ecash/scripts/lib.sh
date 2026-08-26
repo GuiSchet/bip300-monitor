@@ -415,6 +415,35 @@ require_activation_block() {
         die "unexpected block at height ${ECASH_ACTIVATION_HEIGHT}: ${activation_hash}"
 }
 
+require_rpc_cookie_readable() {
+    local cookie
+    local cookie_gid
+    local cookie_mode
+    local cookie_uid
+    local mode
+
+    cookie="$(data_root)/rpc-cookie/.cookie"
+    [[ -f "${cookie}" ]] ||
+        die "the node RPC cookie does not exist yet: ${cookie}; wait for ecash-node to finish starting"
+
+    read -r cookie_uid cookie_gid cookie_mode < <(
+        stat --format='%u %g %a' "${cookie}"
+    )
+    mode="$((8#${cookie_mode}))"
+
+    if [[ "${cookie_uid}" == "${PUID}" ]] && ((mode & 0400)); then
+        return 0
+    fi
+    if [[ "${cookie_gid}" == "${PGID}" ]] && ((mode & 0040)); then
+        return 0
+    fi
+    if ((mode & 0004)); then
+        return 0
+    fi
+
+    die "the node RPC cookie ${cookie} is owned by ${cookie_uid}:${cookie_gid} with mode ${cookie_mode}, but the enforcer runs as ${PUID}:${PGID} and cannot read it; the node image did not honour UID/GID"
+}
+
 require_node_peer() {
     local peer_count
     peer_count="$(node_cli getconnectioncount)" ||

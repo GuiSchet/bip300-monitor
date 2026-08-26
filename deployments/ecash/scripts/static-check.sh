@@ -9,7 +9,7 @@ load_versions
 export COMPOSE_ENV_FILE="${DEPLOYMENT_ROOT}/.env.example"
 load_deployment_env
 
-for command_name in cmp docker git jq just mktemp shellcheck shfmt yamllint; do
+for command_name in cmp docker git jq just mktemp shellcheck shfmt stat yamllint; do
     require_command "${command_name}"
 done
 
@@ -23,7 +23,9 @@ just --justfile "${DEPLOYMENT_ROOT}/justfile" --fmt --check
 
 override_env="$(mktemp)"
 rendered_node_config="$(mktemp)"
-trap 'rm -f -- "${override_env}" "${rendered_node_config}"' EXIT
+cookie_root="$(mktemp -d)"
+trap 'rm -f -- "${override_env}" "${rendered_node_config}"
+    rm -rf -- "${cookie_root}"' EXIT
 for override in \
     'ENFORCER_IMAGE=example.invalid/unpinned:latest' \
     'NETWORK_ID=unreviewed-network' \
@@ -72,6 +74,50 @@ for incomplete_chainstates in \
         die "node history readiness accepted incomplete or invalid chainstates"
     fi
 done
+
+# The enforcer reads a cookie the node image creates, so the check has to accept
+# owner, group, and world readability and reject the root:root 0600 case.
+mkdir -p "${cookie_root}/rpc-cookie"
+cookie_path="${cookie_root}/rpc-cookie/.cookie"
+touch "${cookie_path}"
+cookie_uid="$(id -u)"
+cookie_gid="$(id -g)"
+foreign_uid="$((cookie_uid + 1))"
+foreign_gid="$((cookie_gid + 1))"
+
+cookie_is_readable() {
+    local mode="$1"
+    local uid="$2"
+    local gid="$3"
+
+    chmod "${mode}" "${cookie_path}"
+    (
+        ECASH_DATA_ROOT="${cookie_root}"
+        PUID="${uid}"
+        PGID="${gid}"
+        require_rpc_cookie_readable
+    ) >/dev/null 2>&1
+}
+
+cookie_is_readable 600 "${cookie_uid}" "${cookie_gid}" ||
+    die "RPC cookie check rejected a cookie owned by the enforcer user"
+cookie_is_readable 640 "${foreign_uid}" "${cookie_gid}" ||
+    die "RPC cookie check rejected a cookie readable through its group"
+cookie_is_readable 644 "${foreign_uid}" "${foreign_gid}" ||
+    die "RPC cookie check rejected a world-readable cookie"
+if cookie_is_readable 600 "${foreign_uid}" "${foreign_gid}"; then
+    die "RPC cookie check accepted a cookie the enforcer cannot read"
+fi
+if cookie_is_readable 000 "${cookie_uid}" "${cookie_gid}"; then
+    die "RPC cookie check accepted an unreadable cookie"
+fi
+rm -f -- "${cookie_path}"
+if (
+    ECASH_DATA_ROOT="${cookie_root}"
+    require_rpc_cookie_readable
+) >/dev/null 2>&1; then
+    die "RPC cookie check accepted a missing cookie"
+fi
 
 live_hash='0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef'
 extractor_slot_9="INFO enforcer_extractor: published live enforcer event event=\"block_connected\" sidechain=9 height=123 block_hash=${live_hash}"
@@ -192,6 +238,16 @@ jq -e --arg source "${ECASH_DATA_ROOT}/config/ecash.conf" \
       | select(.source == $source and .target == "/etc/ecash/ecash.conf" and .read_only == true)]
      | length == 1' <<<"${config_json}" >/dev/null
 
+# ecash-node is the one service that intentionally omits `user:`, because its
+# image entrypoint drops to UID/GID itself. Pin that exception so it stays
+# deliberate, and require the hardening the other services already carry.
+jq -e '.services["ecash-node"] | has("user") | not' <<<"${config_json}" >/dev/null
+jq -e --arg uid "${PUID}" --arg gid "${PGID}" \
+    '.services["ecash-node"].environment | .UID == $uid and .GID == $gid' \
+    <<<"${config_json}" >/dev/null
+jq -e '.services["ecash-node"].security_opt
+    | index("no-new-privileges:true") != null' <<<"${config_json}" >/dev/null
+
 jq -e '.services.nats.user == "10002:10002" and .services.nats.read_only == true' \
     <<<"${config_json}" >/dev/null
 jq -e '.services.nats.command
@@ -288,5 +344,10 @@ if grep -Fq "hashFiles('deployments/ecash" \
     "${repository_root}/.github/workflows/ci.yml"; then
     die "deployment CI gate is guarded by hashFiles and can be skipped"
 fi
+
+# Promoting ENFORCER_IMAGE without re-vendoring proto/upstream would pair a new
+# enforcer with stale client stubs. This is the offline half of that gate; CI
+# also re-downloads the upstream files.
+"${repository_root}/.github/scripts/check-proto-vendor.sh" --offline
 
 info "${NETWORK_ID} eCash deployment checks passed"

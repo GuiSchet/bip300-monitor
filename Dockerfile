@@ -18,7 +18,9 @@ RUN apt-get update \
       protobuf-compiler \
     && rm -rf /var/lib/apt/lists/*
 
-COPY Cargo.toml Cargo.lock ./
+# rust-toolchain.toml has to reach the build, or the image silently compiles
+# with the RUST_IMAGE toolchain while CI validates a different one.
+COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY proto ./proto
 COPY shared ./shared
 COPY extractors ./extractors
