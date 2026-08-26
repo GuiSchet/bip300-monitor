@@ -312,10 +312,16 @@ wait_for_event_logger_subscription() {
     done
 }
 
-postgres_psql() {
+# The statement arrives on stdin rather than through `--command` because psql
+# does not interpolate `:'variable'` in a `--command` string. Passing values as
+# psql variables is what keeps a shell value from being spliced into SQL.
+postgres_query() {
+    local statement="$1"
+    shift
+
     compose exec -T postgres \
         psql --username="${POSTGRES_USER}" --dbname="${POSTGRES_DB}" \
-        --no-align --tuples-only --quiet "$@"
+        --no-align --tuples-only --quiet "$@" <<<"${statement}"
 }
 
 postgres_is_healthy() {
@@ -421,6 +427,61 @@ count_snapshot_events() {
         ((count += 1))
     done <<<"${logs}"
     printf '%s\n' "${count}"
+}
+
+# Counts rows the record itself holds, which is the authoritative check: the log
+# lines only show what reached a live consumer.
+#
+# `since` matters. The record is durable, so without it a previous run's rows
+# would satisfy the check and a completely broken instance would still verify.
+record_event_count() {
+    local kind="$1"
+    local since="$2"
+    local sidechain="${3:-}"
+    local -a filters=(--set=kind="${kind}" --set=since="${since}")
+    local predicate="kind = :'kind' AND observed_at >= :'since'::timestamptz"
+
+    [[ "${kind}" =~ ^[a-z_]+$ ]] || return 1
+    if [[ -n "${sidechain}" ]]; then
+        [[ "${sidechain}" =~ ^[0-9]+$ ]] || return 1
+        filters+=(--set=sidechain="${sidechain}")
+        predicate+=" AND sidechain = :'sidechain'::smallint"
+    fi
+
+    postgres_query "SELECT count(*) FROM event WHERE ${predicate}" "${filters[@]}"
+}
+
+record_has_event() {
+    local count
+
+    count="$(record_event_count "$@")" || return 1
+    [[ "${count}" =~ ^[0-9]+$ ]] || return 1
+    ((count >= 1))
+}
+
+# Whether the record holds one specific block for one slot, by hash.
+record_has_block() {
+    local kind="$1"
+    local sidechain="$2"
+    local block_hash="$3"
+    local count
+
+    [[ "${kind}" =~ ^[a-z_]+$ ]] || return 1
+    [[ "${sidechain}" =~ ^[0-9]+$ ]] || return 1
+    [[ "${block_hash}" =~ ^[[:xdigit:]]{64}$ ]] || return 1
+
+    count="$(
+        postgres_query \
+            "SELECT count(*) FROM event
+             WHERE kind = :'kind'
+               AND sidechain = :'sidechain'::smallint
+               AND block_hash = decode(:'block_hash', 'hex')" \
+            --set=kind="${kind}" \
+            --set=sidechain="${sidechain}" \
+            --set=block_hash="${block_hash}"
+    )" || return 1
+    [[ "${count}" =~ ^[0-9]+$ ]] || return 1
+    ((count >= 1))
 }
 
 # The extractor republishes a snapshot kind whenever a block changes it, so a

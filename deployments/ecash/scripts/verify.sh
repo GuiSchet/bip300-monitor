@@ -13,10 +13,11 @@ require_command jq
 compose config --quiet
 "${DEPLOYMENT_ROOT}/scripts/verify-core.sh"
 
-for service in nats event-logger enforcer-extractor; do
+for service in postgres nats event-logger enforcer-extractor; do
     require_service_running "${service}"
 done
 
+wait_for_postgres_health
 wait_for_nats_health
 wait_for_event_logger_subscription
 wait_for_nats_client bip300-monitor-enforcer-extractor
@@ -39,6 +40,8 @@ while :; do
     verification_started_at="$(
         latest_timestamp "${extractor_started_before}" "${logger_started_before}"
     )"
+    # Rows outlive a container, so the record is only asked about this instance.
+    record_since="${extractor_started_before}"
     extractor_logs="$(
         compose logs --no-color --since "${verification_started_at}" \
             enforcer-extractor 2>/dev/null || true
@@ -61,17 +64,22 @@ while :; do
         "${extractor_logs}" "${#sidechains[@]}"; then
         snapshot_complete=false
     fi
-    # The BIP300 constants and the startup tip are published exactly once, so a
-    # second one would mean an unnoticed republish.
-    for event_kind in chain_info chain_tip; do
-        if [[ "$(count_snapshot_events "${logger_logs}" "${event_kind}")" != 1 ]]; then
-            snapshot_complete=false
-            break
-        fi
-    done
+
+    # The record is the authoritative check. The BIP300 constants and the
+    # startup tip are recorded exactly once per instance, so a second one would
+    # mean an unnoticed republish; every other kind is re-recorded whenever a
+    # block changes it, so more than one is expected.
+    if [[ "${snapshot_complete}" == true ]]; then
+        for event_kind in chain_info chain_tip; do
+            if [[ "$(record_event_count "${event_kind}" "${record_since}")" != 1 ]]; then
+                snapshot_complete=false
+                break
+            fi
+        done
+    fi
     if [[ "${snapshot_complete}" == true ]]; then
         for event_kind in sidechain_proposals active_sidechains; do
-            if ! has_snapshot_event "${logger_logs}" "${event_kind}"; then
+            if ! record_has_event "${event_kind}" "${record_since}"; then
                 snapshot_complete=false
                 break
             fi
@@ -79,9 +87,21 @@ while :; do
     fi
     if [[ "${snapshot_complete}" == true ]]; then
         for sidechain in "${sidechains[@]}"; do
-            if ! has_snapshot_event "${logger_logs}" ctip "${sidechain}" ||
-                ! has_snapshot_event \
-                    "${logger_logs}" withdrawal_bundle_proposals "${sidechain}"; then
+            if ! record_has_event ctip "${record_since}" "${sidechain}" ||
+                ! record_has_event \
+                    withdrawal_bundle_proposals "${record_since}" "${sidechain}"; then
+                snapshot_complete=false
+                break
+            fi
+        done
+    fi
+
+    # Independently, the logger proves that live fan-out reached a consumer.
+    # It is a separate path from the record, so it gets a separate assertion
+    # rather than being folded into the one above.
+    if [[ "${snapshot_complete}" == true ]]; then
+        for event_kind in chain_info active_sidechains; do
+            if ! has_snapshot_event "${logger_logs}" "${event_kind}"; then
                 snapshot_complete=false
                 break
             fi
@@ -102,9 +122,9 @@ while :; do
             "${logger_started_before}" != "${extractor_started_before}" ]]; then
             die "event-logger started after enforcer-extractor, so it never received the initial snapshot and Core NATS cannot replay it; restart the enforcer-extractor container to republish, then run 'just verify' again"
         fi
-        die "current monitor instances did not deliver one complete semantic snapshot after ${wait_seconds}s"
+        die "current monitor instances did not record one complete semantic snapshot after ${wait_seconds}s"
     fi
     sleep 2
 done
 
-info "${NETWORK_ID} observation pipeline verification passed (fresh semantic snapshot, slots=${configured_sidechains})"
+info "${NETWORK_ID} observation pipeline verification passed (fresh semantic snapshot recorded and fanned out, slots=${configured_sidechains})"

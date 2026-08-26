@@ -57,6 +57,12 @@ while :; do
     )"
     all_delivered=true
     for sidechain in "${sidechains[@]}"; do
+        # The record is what has to hold the block. The two log assertions
+        # additionally prove the live fan-out path still reaches a consumer.
+        if ! record_has_block block_connected "${sidechain}" "${live_hash}"; then
+            all_delivered=false
+            break
+        fi
         if ! logs_contain_live_event \
             "${extractor_logs}" "published live enforcer event" \
             "${sidechain}" "${live_hash}"; then
@@ -89,6 +95,6 @@ while :; do
         exit 0
     fi
     ((SECONDS < event_deadline)) ||
-        die "block ${live_hash} reached the node but was not delivered for every configured slot within ${event_wait_seconds}s"
+        die "block ${live_hash} reached the node but was not recorded and delivered for every configured slot within ${event_wait_seconds}s"
     sleep 2
 done

@@ -125,6 +125,17 @@ if missing_cookie_is_readable >/dev/null 2>&1; then
     die "RPC cookie check accepted a missing cookie"
 fi
 
+# psql does not interpolate `:'variable'` inside a `--command` string, so a
+# record helper that used one would either fail outright or, worse, invite
+# someone to splice shell values into the SQL instead.
+if grep -nE 'psql[^|]*--command' "${DEPLOYMENT_ROOT}/scripts/lib.sh"; then
+    die "record helpers must pass SQL on stdin so psql interpolates its variables"
+fi
+grep -Fq 'record_event_count' "${DEPLOYMENT_ROOT}/scripts/verify.sh" ||
+    die "verify.sh does not assert the record; log lines only show live fan-out"
+grep -Fq 'record_has_block' "${DEPLOYMENT_ROOT}/scripts/verify-live.sh" ||
+    die "verify-live.sh does not assert that the live block reached the record"
+
 live_hash='0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef'
 extractor_slot_9="INFO enforcer_extractor: published live enforcer event event=\"block_connected\" sidechain=9 height=123 block_hash=${live_hash}"
 extractor_slot_98="INFO enforcer_extractor: published live enforcer event event=\"block_connected\" sidechain=98 height=123 block_hash=${live_hash}"
