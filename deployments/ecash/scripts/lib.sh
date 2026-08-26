@@ -52,9 +52,17 @@ load_versions() {
     : "${ECASH_SNAPSHOT_SHA256:?ECASH_SNAPSHOT_SHA256 must be locked}"
     : "${ENFORCER_NETWORK_PRESET:?ENFORCER_NETWORK_PRESET must be locked}"
     : "${ENFORCER_API_NETWORK:?ENFORCER_API_NETWORK must be locked}"
+    : "${POSTGRES_IMAGE:?POSTGRES_IMAGE must be locked}"
+    : "${POSTGRES_DB:?POSTGRES_DB must be locked}"
+    : "${POSTGRES_USER:?POSTGRES_USER must be locked}"
 
     [[ "${NETWORK_ID}" =~ ^[a-z0-9][a-z0-9-]*$ ]] ||
         die "NETWORK_ID has an invalid format"
+    # Both end up unquoted inside psql invocations and the healthcheck.
+    [[ "${POSTGRES_DB}" =~ ^[a-z_][a-z0-9_]*$ ]] ||
+        die "POSTGRES_DB has an invalid format"
+    [[ "${POSTGRES_USER}" =~ ^[a-z_][a-z0-9_]*$ ]] ||
+        die "POSTGRES_USER has an invalid format"
     [[ "${ECASH_ACTIVATION_BLOCK_HASH}" =~ ^[[:xdigit:]]{64}$ ]] ||
         die "ECASH_ACTIVATION_BLOCK_HASH must contain 64 hexadecimal characters"
     require_positive_integer ECASH_NODE_P2P_PORT "${ECASH_NODE_P2P_PORT}"
@@ -300,6 +308,28 @@ wait_for_event_logger_subscription() {
         nats_has_enforcer_subscription; do
         ((SECONDS < deadline)) ||
             die "event logger subscription was not ready after ${wait_seconds}s"
+        sleep 2
+    done
+}
+
+postgres_psql() {
+    compose exec -T postgres \
+        psql --username="${POSTGRES_USER}" --dbname="${POSTGRES_DB}" \
+        --no-align --tuples-only --quiet "$@"
+}
+
+postgres_is_healthy() {
+    compose exec -T postgres \
+        pg_isready --host=127.0.0.1 \
+        --username="${POSTGRES_USER}" --dbname="${POSTGRES_DB}" >/dev/null 2>&1
+}
+
+wait_for_postgres_health() {
+    local wait_seconds="${MONITOR_STARTUP_WAIT_SECONDS:-60}"
+    local deadline="$((SECONDS + wait_seconds))"
+    until postgres_is_healthy; do
+        ((SECONDS < deadline)) ||
+            die "Postgres was not ready after ${wait_seconds}s"
         sleep 2
     done
 }

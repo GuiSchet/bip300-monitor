@@ -129,6 +129,7 @@ for image in \
     "${ECASH_NODE_IMAGE}" \
     "${ENFORCER_IMAGE}" \
     "${NATS_IMAGE}" \
+    "${POSTGRES_IMAGE}" \
     "${ENFORCER_EXTRACTOR_IMAGE}" \
     "${EVENT_LOGGER_IMAGE}"; do
     # The enforcer index publishes an arm64 child as well, and pinning that one

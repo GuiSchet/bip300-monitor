@@ -148,6 +148,49 @@ services:
         max-file: "5"
         max-size: 20m
 
+  postgres:
+    image: ${POSTGRES_IMAGE:?POSTGRES_IMAGE must be set by VERSIONS.lock}
+    init: true
+    restart: unless-stopped
+    stop_grace_period: 1m
+    user: ${PUID:-1000}:${PGID:-1000}
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:?POSTGRES_DB must be set by VERSIONS.lock}
+      POSTGRES_USER: ${POSTGRES_USER:?POSTGRES_USER must be set by VERSIONS.lock}
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres-password
+      # Set explicitly so the cluster lives inside the bind mount regardless of
+      # where the image would otherwise place it.
+      PGDATA: /var/lib/postgresql/data/pgdata
+    volumes:
+      - type: bind
+        source: ${ECASH_DATA_ROOT:?ECASH_DATA_ROOT must be derived from NETWORK_ID}/postgres
+        target: /var/lib/postgresql/data
+      - type: bind
+        source: ${ECASH_DATA_ROOT:?ECASH_DATA_ROOT must be derived from NETWORK_ID}/secrets/postgres-password
+        target: /run/secrets/postgres-password
+        read_only: true
+    networks:
+      ecash-internal:
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          pg_isready --host=127.0.0.1
+          --username=${POSTGRES_USER} --dbname=${POSTGRES_DB}
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    logging:
+      driver: json-file
+      options:
+        max-file: "5"
+        max-size: 20m
+
   event-logger:
     image: ${EVENT_LOGGER_IMAGE:?EVENT_LOGGER_IMAGE must be set by VERSIONS.lock}
     init: true
@@ -183,9 +226,20 @@ services:
     init: true
     restart: unless-stopped
     stop_grace_period: 20s
-    user: 10001:10001
+    # Its own UID, but PGID as the group so it can read the group-readable
+    # Postgres password without sharing an identity with any other service.
+    user: 10001:${PGID:-1000}
+    volumes:
+      - type: bind
+        source: ${ECASH_DATA_ROOT:?ECASH_DATA_ROOT must be derived from NETWORK_ID}/secrets/postgres-password
+        target: /run/secrets/postgres-password
+        read_only: true
     environment:
       BIP300_MONITOR_NATS_URL: nats://nats:4222
+      BIP300_MONITOR_POSTGRES_HOST: postgres
+      BIP300_MONITOR_POSTGRES_DB: ${POSTGRES_DB:?POSTGRES_DB must be set by VERSIONS.lock}
+      BIP300_MONITOR_POSTGRES_USER: ${POSTGRES_USER:?POSTGRES_USER must be set by VERSIONS.lock}
+      BIP300_MONITOR_POSTGRES_PASSWORD_FILE: /run/secrets/postgres-password
       BIP300_MONITOR_ENFORCER_ENDPOINT: http://enforcer:50051
       BIP300_MONITOR_SIDECHAINS: ${BIP300_MONITOR_SIDECHAINS:-9,98}
       BIP300_MONITOR_LOG_LEVEL: ${BIP300_MONITOR_LOG_LEVEL:-info}
@@ -200,6 +254,8 @@ services:
       event-logger:
         condition: service_started
       nats:
+        condition: service_healthy
+      postgres:
         condition: service_healthy
     networks:
       ecash-internal:

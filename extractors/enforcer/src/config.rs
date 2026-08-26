@@ -7,14 +7,19 @@ use anyhow::{Result, bail};
 use clap::Parser;
 use shared::logging::LogLevel;
 use shared::nats::NatsArgs;
+use shared::store::PostgresArgs;
 
 /// Runtime configuration for the enforcer extractor.
 #[derive(Clone, Parser)]
 #[command(version, about, long_about = None)]
 pub struct Args {
-    /// Core NATS connection settings.
+    /// Core NATS connection settings, used for best-effort live fan-out.
     #[command(flatten)]
     pub nats: NatsArgs,
+
+    /// Postgres connection settings for the authoritative record.
+    #[command(flatten)]
+    pub postgres: PostgresArgs,
 
     /// Default log level when RUST_LOG does not provide a filter.
     #[arg(

@@ -2,8 +2,8 @@
 
 Single-VM infrastructure for exercising `bip300-monitor` against a pinned
 eCash/Drivechain network. The active lock targets **Alphanet** and deploys its
-L1 node, validator enforcer, Core NATS transport, enforcer extractor, and event
-logger. Network-specific values live in `VERSIONS.lock` and
+L1 node, validator enforcer, Postgres record, Core NATS transport, enforcer
+extractor, and event logger. Network-specific values live in `VERSIONS.lock` and
 the node configuration is generated from those values plus
 `config/ecash.conf.template`. The scripts and Compose topology are shared so a
 future Beta or Mainnet transition does not require another deployment copy.
@@ -108,14 +108,29 @@ from `NETWORK_ID`. Never point a new network at an existing chainstate.
 
 ## Network exposure
 
-Compose publishes no host ports. Node RPC, REST, ZMQ, enforcer gRPC, NATS, and
-NATS monitoring remain reachable only on the internal Docker network. The node
-accepts no inbound peers. The enforcer authenticates with a shared RPC cookie;
-no RPC password is stored in the repository or container arguments.
+Compose publishes no host ports. Node RPC, REST, ZMQ, enforcer gRPC, Postgres,
+NATS, and NATS monitoring remain reachable only on the internal Docker network.
+The node accepts no inbound peers. The enforcer authenticates with a shared RPC
+cookie, and Postgres with a password `just init` generates into
+`${ECASH_DATA_ROOT}/secrets/postgres-password`. Neither is stored in the
+repository or in container arguments.
 
-This pilot uses anonymous Core NATS without JetStream. Messages exist only in
-flight, so a server or consumer outage can require restarting the extractor to
-republish its snapshot.
+That secret is group-readable so the extractor can read it while keeping a UID
+of its own: it runs as `10001:${PGID}`, and Postgres as `${PUID}:${PGID}`.
+
+## Where the data lives
+
+Postgres is the authoritative record. NATS stays as best-effort live fan-out to
+the event logger, so a message lost there costs nothing once the row is
+committed: the extractor writes to Postgres first and publishes afterwards. A
+failed write is fatal; a failed publication is a warning.
+
+Two different gaps follow from that, and only one of them is about transport:
+
+- **The extractor was down.** `SubscribeEvents` does not replay history, so a
+  restart leaves a real hole that only a backfill can close.
+- **A live consumer missed a message.** Cosmetic, because the record already
+  has it.
 
 ## Persistent layout
 
@@ -125,7 +140,9 @@ ${ECASH_DATA_ROOT}/
 ├── config/
 ├── enforcer/
 ├── node/
+├── postgres/
 ├── rpc-cookie/
+├── secrets/
 └── snapshots/
 ```
 

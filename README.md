@@ -5,19 +5,25 @@ Rust tooling to monitor BIP300/301 enforcers.
 ## Status
 
 This project is an early pilot. The enforcer extractor consumes the enforcer's
-public read-only API and publishes normalized protobuf events to Core NATS.
+public read-only API, records normalized protobuf events in Postgres, and fans
+them out to Core NATS for live consumers.
 
 ## Architecture
 
 ```text
-BIP300/301 enforcer ── Connect/gRPC ──► enforcer-extractor ── protobuf ──► NATS
-                                                                           │
-                                                                           ▼
-                                                                     event-logger
+                                                    ┌──► Postgres  (the record)
+BIP300/301 enforcer ─ Connect/gRPC ─► enforcer-extractor
+                                                    └──► NATS ──► event-logger
+                                                         (live fan-out)
 ```
 
-- `shared` contains common event, NATS, diagnostics, and lifecycle
-  infrastructure.
+Postgres is authoritative. The extractor commits there first and publishes to
+NATS afterwards, so a failed write is fatal while a failed publication is only a
+warning: the row is already durable, and a live consumer missing a message costs
+nothing but its own freshness.
+
+- `shared` contains the event contract, the Postgres record, NATS, JSON
+  rendering, diagnostics, and lifecycle infrastructure.
 - `extractors/enforcer` contains the enforcer client and extraction runtime.
 - `tools/event-logger` decodes the events received from NATS and logs them.
 
@@ -38,8 +44,8 @@ hashes before an event can be published.
 
 ## Continuous extraction
 
-The executable publishes an initial state snapshot to the `bip300.enforcer`
-Core NATS subject and then follows live block events until it receives
+The executable records an initial state snapshot and then follows live block
+events until it receives
 `SIGINT` or `SIGTERM`. Whenever a block moves the mainchain tip it also re-reads
 the state that the tip changes — sidechain proposals, active sidechains, the
 CTIP of each slot, and the withdrawal bundles still being voted on — and
@@ -64,17 +70,18 @@ produce duplicates; consumers should deduplicate block events by type,
 sidechain slot, and block hash. Ordering is preserved within each slot, not
 across slots.
 
-HTTP/2 and TCP keepalives detect dead gRPC connections. Every live publication
-uses a bounded NATS client flush, and a fatal stream, conversion, or publication
-error stops all slot workers. `SIGINT` and `SIGTERM` trigger graceful shutdown;
-a second signal or the configured timeout forces termination.
+HTTP/2 and TCP keepalives detect dead gRPC connections. A fatal stream,
+conversion, or record error stops all slot workers. `SIGINT` and `SIGTERM`
+trigger graceful shutdown; a second signal or the configured timeout forces
+termination.
 
-Core NATS delivery remains at-most-once and non-durable. A successful client
-flush is not a server or consumer acknowledgement, and this pilot does not
-backfill downtime gaps. Detailed event and delivery semantics are documented in
-[`proto/README.md`](proto/README.md). Persistent NATS failures terminate the
-extractor; deployments must restart it, and every restart republishes the
-snapshot.
+Every restart republishes the snapshot. That is idempotent in the record — one
+observation of one kind, for one slot, at one block is a single row — and it
+re-establishes current state for live consumers, which Core NATS cannot replay.
+What a restart does **not** yet recover is the blocks that passed while the
+extractor was down: `SubscribeEvents` starts at subscription time, so that gap
+needs the backfill listed under [Next](#next). Detailed event semantics are
+documented in [`proto/README.md`](proto/README.md).
 
 ## Inspecting events
 
@@ -102,14 +109,23 @@ Reproducible infrastructure lives under `deployments/`. The eCash target
 generates its node configuration and isolated runtime identity from a network
 lock, so the same topology can move between network generations. Its current
 lock targets Alphanet and includes a
-pinned node, validator enforcer, Core NATS, enforcer extractor, and event
-logger: [eCash deployment](deployments/ecash/README.md).
+pinned node, validator enforcer, Postgres record, Core NATS, enforcer extractor,
+and event logger: [eCash deployment](deployments/ecash/README.md).
 
 ## Build
 
 ```bash
 cargo check --workspace --jobs 2
 cargo test --workspace --jobs 2
+```
+
+The record integration tests need a server:
+
+```bash
+docker run --rm -d -p 55432:5432 -e POSTGRES_PASSWORD=test \
+    --name bip300-test-postgres postgres:18.2-alpine
+BIP300_MONITOR_TEST_POSTGRES_URL='host=127.0.0.1 port=55432 user=postgres password=test dbname=postgres' \
+    cargo test -p shared --features postgres_integration_tests
 ```
 
 Generating the client currently requires `protoc` to be installed. On
@@ -125,8 +141,8 @@ NATS_SERVER_BINARY=/path/to/nats-server \
 
 Network gate: confirm that an idle enforcer remains subscribed beyond
 `--request-timeout-seconds 5`; that normal `SIGTERM` exits with code 0 before
-the 15-second shutdown timeout; and that an in-flight publication with NATS
-unavailable reports its flush error before that outer deadline.
+the 15-second shutdown timeout; that stopping NATS leaves the extractor
+recording and only warns; and that stopping Postgres terminates it.
 
 To verify API compatibility against a running enforcer:
 
@@ -145,15 +161,14 @@ deliberately out of scope.
 Planned work, in order:
 
 1. **Gap backfill.** `GetTwoWayPegData` and `GetBlockInfo` can replay the blocks
-   missed while the extractor was down. Without it, a restart leaves a silent
-   hole in the series.
-2. **Persistence.** Core NATS is at-most-once and non-durable, so an event that
-   is not stored is lost. A sink that writes the envelopes to disk is what makes
-   the rest of the data worth collecting.
-3. **Slot discovery.** Deriving the monitored slots from `GetSidechains`
+   missed while the extractor was down. `SubscribeEvents` does not replay
+   history, so a restart leaves a real hole that nothing else can close. The
+   checkpoint is a query against the record, not a file, so it cannot claim an
+   event that was never stored.
+2. **Slot discovery.** Deriving the monitored slots from `GetSidechains`
    instead of requiring `--sidechain`, so a newly activated sidechain is not
    invisible until the next restart.
-4. **An independent oracle.** The enforcer parses the BIP300 coinbase messages
+3. **An independent oracle.** The enforcer parses the BIP300 coinbase messages
    but only publishes aggregates: per-block M2, M4 and M7 votes never leave it,
    and BMM bid amounts appear in no API at all. Deriving that state from the raw
    block and comparing it against what the enforcer reports turns the monitor

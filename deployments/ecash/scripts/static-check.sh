@@ -240,7 +240,7 @@ fi
     die "latest timestamp helper selected a stale container instance"
 
 config_json="$(compose config --format json)"
-jq -e '.services | keys == ["ecash-node", "enforcer", "enforcer-extractor", "event-logger", "nats"]' \
+jq -e '.services | keys == ["ecash-node", "enforcer", "enforcer-extractor", "event-logger", "nats", "postgres"]' \
     <<<"${config_json}" >/dev/null
 jq -e --arg image "${ECASH_NODE_IMAGE}" \
     '.services["ecash-node"].image == $image' <<<"${config_json}" >/dev/null
@@ -248,6 +248,8 @@ jq -e --arg image "${ENFORCER_IMAGE}" \
     '.services.enforcer.image == $image' <<<"${config_json}" >/dev/null
 jq -e --arg image "${NATS_IMAGE}" \
     '.services.nats.image == $image' <<<"${config_json}" >/dev/null
+jq -e --arg image "${POSTGRES_IMAGE}" \
+    '.services.postgres.image == $image' <<<"${config_json}" >/dev/null
 jq -e --arg image "${ENFORCER_EXTRACTOR_IMAGE}" \
     '.services["enforcer-extractor"].image == $image' \
     <<<"${config_json}" >/dev/null
@@ -293,12 +295,44 @@ jq -e '.services.nats.command
 jq -e '.services.nats.healthcheck.test | any(contains("/healthz"))' \
     <<<"${config_json}" >/dev/null
 
+# The extractor reads the generated Postgres secret, so it takes PGID as its
+# group while keeping a UID of its own. The logger touches no secret.
+jq -e --arg gid "${PGID}" \
+    '.services["enforcer-extractor"].user == "10001:" + $gid' \
+    <<<"${config_json}" >/dev/null
+jq -e '.services["event-logger"].user == "10001:10001"' \
+    <<<"${config_json}" >/dev/null
 for monitor_service in enforcer-extractor event-logger; do
     jq -e --arg service "${monitor_service}" \
-        '.services[$service].user == "10001:10001"
-         and .services[$service].read_only == true' \
+        '.services[$service].read_only == true' \
         <<<"${config_json}" >/dev/null
 done
+
+# Postgres is the authoritative record: it must be reachable only from the
+# internal network, carry no inline password, and read the generated secret.
+jq -e --arg uid "${PUID}" --arg gid "${PGID}" \
+    '.services.postgres.user == $uid + ":" + $gid' <<<"${config_json}" >/dev/null
+jq -e '.services.postgres.environment
+    | has("POSTGRES_PASSWORD") | not' <<<"${config_json}" >/dev/null
+jq -e '.services.postgres.environment.POSTGRES_PASSWORD_FILE
+    == "/run/secrets/postgres-password"' <<<"${config_json}" >/dev/null
+jq -e '.services.postgres.security_opt
+    | index("no-new-privileges:true") != null' <<<"${config_json}" >/dev/null
+jq -e '.services.postgres.healthcheck.test | any(contains("pg_isready"))' \
+    <<<"${config_json}" >/dev/null
+jq -e --arg source "${ECASH_DATA_ROOT}/secrets/postgres-password" \
+    '[.services.postgres.volumes[]
+      | select(.source == $source and .read_only == true)] | length == 1' \
+    <<<"${config_json}" >/dev/null
+jq -e --arg source "${ECASH_DATA_ROOT}/secrets/postgres-password" \
+    '[.services["enforcer-extractor"].volumes[]
+      | select(.source == $source and .read_only == true)] | length == 1' \
+    <<<"${config_json}" >/dev/null
+jq -e '.services["enforcer-extractor"].environment
+    | has("BIP300_MONITOR_POSTGRES_PASSWORD") | not' \
+    <<<"${config_json}" >/dev/null
+jq -e '.services["enforcer-extractor"].depends_on.postgres.condition
+    == "service_healthy"' <<<"${config_json}" >/dev/null
 
 jq -e '.services["event-logger"].depends_on.nats.condition == "service_healthy"' \
     <<<"${config_json}" >/dev/null
@@ -368,6 +402,7 @@ actual_peer_count="$(grep -c '^addnode=' "${rendered_node_config}")"
 [[ "${ENFORCER_IMAGE}" == *":sha-${ENFORCER_COMMIT:0:7}@sha256:"* ]]
 [[ "${ENFORCER_EXTRACTOR_IMAGE}" == *":sha-${MONITOR_IMAGE_COMMIT:0:12}@sha256:"* ]]
 [[ "${EVENT_LOGGER_IMAGE}" == *":sha-${MONITOR_IMAGE_COMMIT:0:12}@sha256:"* ]]
+[[ "${POSTGRES_IMAGE}" == *"@sha256:"* ]]
 
 legacy_prefix=DRYNET
 if grep -R -n --exclude-dir=data "${legacy_prefix}_" "${DEPLOYMENT_ROOT}"; then

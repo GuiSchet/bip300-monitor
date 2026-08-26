@@ -6,11 +6,11 @@ use std::pin::Pin;
 use anyhow::{Context, Result, bail};
 use futures_util::future::try_join_all;
 use futures_util::{Stream, StreamExt};
-use shared::nats::EventPublisher;
 use shared::nats_subjects::Subject;
 use shared::protobuf::enforcer_extractor as events;
 use shared::protobuf::event::event::MonitorEvent;
 use shared::protobuf::event::{Event, ObservedBlock};
+use shared::recorder::Recorder;
 use tokio::sync::watch;
 use tokio::task::JoinSet;
 use tonic::{Status, Streaming};
@@ -18,13 +18,15 @@ use tonic::{Status, Streaming};
 use crate::config::Args;
 use crate::event::envelope;
 use crate::proto::mainchain;
-use crate::snapshot::{self, InitialSnapshot, publish_snapshot};
+use crate::snapshot::{self, InitialSnapshot, record_snapshot};
 use crate::state;
 use crate::{EnforcerClient, convert};
 
 type EventStream = Streaming<mainchain::SubscribeEventsResponse>;
 type SourceFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>>;
 const NATS_CLIENT_NAME: &str = "bip300-monitor-enforcer-extractor";
+/// Names the writer of every row this extractor records.
+const RECORD_SOURCE: &str = "enforcer";
 
 trait StartupSource: Clone + Send {
     type Stream: Send;
@@ -68,7 +70,7 @@ impl StateSource for EnforcerClient {
 }
 
 struct PreparedStartup {
-    publisher: EventPublisher,
+    recorder: Recorder,
     client: EnforcerClient,
     streams: Vec<(u8, EventStream)>,
     snapshot: InitialSnapshot,
@@ -100,7 +102,7 @@ pub async fn run(args: Args, mut shutdown_rx: watch::Receiver<bool>) -> Result<(
     };
 
     let PreparedStartup {
-        publisher,
+        recorder,
         client,
         streams,
         snapshot,
@@ -122,9 +124,9 @@ pub async fn run(args: Args, mut shutdown_rx: watch::Receiver<bool>) -> Result<(
         );
     }
 
-    publish_snapshot(&publisher, &snapshot)
+    record_snapshot(&recorder, &snapshot)
         .await
-        .context("publishing and flushing the initial enforcer snapshot")?;
+        .context("recording the initial enforcer snapshot")?;
     tracing::info!(
         sidechain_count = args.sidechains.len(),
         "published initial enforcer snapshot"
@@ -147,7 +149,7 @@ pub async fn run(args: Args, mut shutdown_rx: watch::Receiver<bool>) -> Result<(
     for (sidechain, stream) in streams {
         workers.spawn(monitor_sidechain(
             stream,
-            publisher.clone(),
+            recorder.clone(),
             sidechain,
             block_tx.clone(),
             shutdown_rx.clone(),
@@ -156,7 +158,7 @@ pub async fn run(args: Args, mut shutdown_rx: watch::Receiver<bool>) -> Result<(
     drop(block_tx);
     workers.spawn(monitor_state(
         client,
-        publisher,
+        recorder,
         args.sidechains.clone(),
         tracker,
         snapshot_block,
@@ -170,9 +172,15 @@ pub async fn run(args: Args, mut shutdown_rx: watch::Receiver<bool>) -> Result<(
 }
 
 async fn prepare_startup(args: &Args) -> Result<PreparedStartup> {
-    let publisher = EventPublisher::connect(&args.nats, NATS_CLIENT_NAME)
-        .await
-        .context("connecting the event publisher")?;
+    let recorder = Recorder::connect(
+        &args.postgres,
+        &args.nats,
+        Subject::Enforcer,
+        RECORD_SOURCE,
+        NATS_CLIENT_NAME,
+    )
+    .await
+    .context("connecting the event recorder")?;
 
     let mut client = EnforcerClient::connect(&args.enforcer_endpoint, args.request_timeout())
         .await
@@ -189,7 +197,7 @@ async fn prepare_startup(args: &Args) -> Result<PreparedStartup> {
     } = observation;
 
     Ok(PreparedStartup {
-        publisher,
+        recorder,
         client,
         streams,
         snapshot,
@@ -249,7 +257,7 @@ fn snapshot_tips_are_consistent(tip_before: &[u8], snapshot_tip: &[u8], tip_afte
 
 async fn monitor_sidechain(
     stream: EventStream,
-    publisher: EventPublisher,
+    recorder: Recorder,
     sidechain: u8,
     block_tx: watch::Sender<Vec<u8>>,
     shutdown_rx: watch::Receiver<bool>,
@@ -257,16 +265,16 @@ async fn monitor_sidechain(
     tracing::info!(sidechain, "started sidechain event worker");
 
     forward_stream(sidechain, stream, shutdown_rx, move |event| {
-        let publisher = publisher.clone();
+        let recorder = recorder.clone();
         let block_tx = block_tx.clone();
         async move {
-            publisher
-                .publish_and_flush(Subject::Enforcer, &event)
-                .await
-                .with_context(|| {
-                    format!("publishing and flushing a live event for sidechain {sidechain}")
-                })?;
             log_published_event(sidechain, &event);
+            // The block is announced only after the record holds the event, so
+            // a state refresh can never describe a block the record is missing.
+            recorder
+                .record(event.clone())
+                .await
+                .with_context(|| format!("recording a live event for sidechain {sidechain}"))?;
             announce_block(&block_tx, sidechain, &event);
             Ok(())
         }
@@ -295,7 +303,7 @@ fn announce_block(block_tx: &watch::Sender<Vec<u8>>, sidechain: u8, event: &Even
 /// changed.
 async fn monitor_state(
     client: EnforcerClient,
-    publisher: EventPublisher,
+    recorder: Recorder,
     sidechains: Vec<u8>,
     tracker: state::Tracker,
     snapshot_block: Vec<u8>,
@@ -312,20 +320,20 @@ async fn monitor_state(
         block_rx,
         shutdown_rx,
         move |anchor: ObservedBlock, payloads: Vec<events::EnforcerEvent>| {
-            let publisher = publisher.clone();
+            let recorder = recorder.clone();
             async move {
                 let published = payloads.len();
-                for payload in payloads {
-                    log_state_event(&payload);
-                    publisher
-                        .publish(Subject::Enforcer, &envelope(payload, anchor.clone())?)
-                        .await
-                        .context("publishing a refreshed enforcer state event")?;
-                }
-                publisher
-                    .flush()
+                let events = payloads
+                    .into_iter()
+                    .map(|payload| {
+                        log_state_event(&payload);
+                        envelope(payload, anchor.clone())
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                recorder
+                    .record_batch(events)
                     .await
-                    .context("flushing refreshed enforcer state events")?;
+                    .context("recording refreshed enforcer state")?;
                 tracing::info!(published, "published refreshed enforcer state");
                 Ok(())
             }

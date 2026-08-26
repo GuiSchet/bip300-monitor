@@ -1,10 +1,9 @@
 //! Collection and publication of the enforcer's initial observable state.
 
 use anyhow::Result;
-use shared::nats::EventPublisher;
-use shared::nats_subjects::Subject;
 use shared::protobuf::enforcer_extractor as events;
 use shared::protobuf::event::ObservedBlock;
+use shared::recorder::Recorder;
 
 use crate::EnforcerClient;
 use crate::convert;
@@ -48,19 +47,17 @@ pub(crate) async fn current_tip(client: &mut EnforcerClient) -> Result<ObservedB
     state::tip_anchor(&convert::chain_tip(client.get_chain_tip().await?)?)
 }
 
-/// Publish the complete snapshot and flush the batch with one bounded wait.
+/// Record the complete snapshot in one transaction.
 ///
 /// Takes the snapshot by reference because the caller keeps its mutable-state
 /// payloads to seed the state tracker.
-pub(crate) async fn publish_snapshot(
-    publisher: &EventPublisher,
-    snapshot: &InitialSnapshot,
-) -> Result<()> {
-    for payload in snapshot.constants.iter().chain(snapshot.state.iter()) {
-        let event = envelope(payload.clone(), snapshot.anchor.clone())?;
-        publisher.publish(Subject::Enforcer, &event).await?;
-    }
-    publisher.flush().await?;
+pub(crate) async fn record_snapshot(recorder: &Recorder, snapshot: &InitialSnapshot) -> Result<()> {
+    let events = snapshot
+        .constants
+        .iter()
+        .chain(snapshot.state.iter())
+        .map(|payload| envelope(payload.clone(), snapshot.anchor.clone()))
+        .collect::<Result<Vec<_>>>()?;
 
-    Ok(())
+    recorder.record_batch(events).await
 }
