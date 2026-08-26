@@ -61,15 +61,27 @@ while :; do
         "${extractor_logs}" "${#sidechains[@]}"; then
         snapshot_complete=false
     fi
-    for event_kind in chain_info chain_tip sidechain_proposals active_sidechains; do
+    # The BIP300 constants and the startup tip are published exactly once, so a
+    # second one would mean an unnoticed republish.
+    for event_kind in chain_info chain_tip; do
         if [[ "$(count_snapshot_events "${logger_logs}" "${event_kind}")" != 1 ]]; then
             snapshot_complete=false
             break
         fi
     done
     if [[ "${snapshot_complete}" == true ]]; then
+        for event_kind in sidechain_proposals active_sidechains; do
+            if ! has_snapshot_event "${logger_logs}" "${event_kind}"; then
+                snapshot_complete=false
+                break
+            fi
+        done
+    fi
+    if [[ "${snapshot_complete}" == true ]]; then
         for sidechain in "${sidechains[@]}"; do
-            if [[ "$(count_snapshot_events "${logger_logs}" ctip "${sidechain}")" != 1 ]]; then
+            if ! has_snapshot_event "${logger_logs}" ctip "${sidechain}" ||
+                ! has_snapshot_event \
+                    "${logger_logs}" withdrawal_bundle_proposals "${sidechain}"; then
                 snapshot_complete=false
                 break
             fi

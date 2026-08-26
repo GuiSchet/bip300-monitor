@@ -118,6 +118,31 @@ pub fn ctip(
     )))
 }
 
+/// Convert `GetWithdrawalBundleProposals` into a snapshot scoped to one slot.
+pub fn withdrawal_bundle_proposals(
+    sidechain_number: u8,
+    response: mainchain::GetWithdrawalBundleProposalsResponse,
+) -> Result<events::EnforcerEvent> {
+    let proposals = response
+        .proposals
+        .into_iter()
+        .enumerate()
+        .map(|(index, proposal)| {
+            withdrawal_bundle_proposal(proposal)
+                .with_context(|| format!("converting withdrawal bundle proposal at index {index}"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    Ok(enforcer_event(
+        events::enforcer_event::Event::WithdrawalBundleProposals(
+            events::WithdrawalBundleProposalsSnapshot {
+                sidechain_number: u32::from(sidechain_number),
+                proposals,
+            },
+        ),
+    ))
+}
+
 /// Convert one live subscription item into a sidechain-scoped monitor event.
 pub fn subscription_event(
     sidechain_number: u8,
@@ -252,6 +277,19 @@ fn sidechain_declaration(
 
     Ok(events::SidechainDeclaration {
         declaration: Some(declaration),
+    })
+}
+
+fn withdrawal_bundle_proposal(
+    proposal: mainchain::get_withdrawal_bundle_proposals_response::ResponseItem,
+) -> Result<events::WithdrawalBundleProposal> {
+    Ok(events::WithdrawalBundleProposal {
+        m6id: consensus_hex(proposal.m6id, "withdrawal_bundle_proposal.m6id")?,
+        vote_count: required(proposal.vote_count, "withdrawal_bundle_proposal.vote_count")?,
+        proposal_height: required(
+            proposal.proposal_height,
+            "withdrawal_bundle_proposal.proposal_height",
+        )?,
     })
 }
 

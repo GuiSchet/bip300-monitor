@@ -1,4 +1,8 @@
 //! Read-only client for the enforcer's validator service.
+//!
+//! `ValidatorService` also exposes `GetCoinbasePSBT`, which builds a miner's
+//! voting intent, and `Stop`, which shuts the enforcer down. Neither belongs in
+//! an observer: this client must never gain a wrapper for them.
 
 use std::future::Future;
 use std::time::Duration;
@@ -113,6 +117,30 @@ impl EnforcerClient {
             .await
             .with_context(|| {
                 format!("calling ValidatorService.GetCtip for sidechain {sidechain_number}")
+            })
+            .map(tonic::Response::into_inner)
+    }
+
+    /// Fetch the withdrawal bundles of one sidechain slot that are still being
+    /// voted on.
+    ///
+    /// The terminal outcome of a bundle arrives as a block event; this is the
+    /// only way to observe the vote count while the bundle is still pending.
+    pub async fn get_withdrawal_bundle_proposals(
+        &mut self,
+        sidechain_number: u8,
+    ) -> Result<mainchain::GetWithdrawalBundleProposalsResponse> {
+        let request = mainchain::GetWithdrawalBundleProposalsRequest {
+            sidechain_id: Some(u32::from(sidechain_number)),
+        };
+        self.inner
+            .get_withdrawal_bundle_proposals(self.unary_request(request))
+            .await
+            .with_context(|| {
+                format!(
+                    "calling ValidatorService.GetWithdrawalBundleProposals for sidechain \
+                     {sidechain_number}"
+                )
             })
             .map(tonic::Response::into_inner)
     }

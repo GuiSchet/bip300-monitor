@@ -40,7 +40,11 @@ hashes before an event can be published.
 
 The executable publishes an initial state snapshot to the `bip300.enforcer`
 Core NATS subject and then follows live block events until it receives
-`SIGINT` or `SIGTERM`. Sidechain slots must be configured explicitly:
+`SIGINT` or `SIGTERM`. Whenever a block moves the mainchain tip it also re-reads
+the state that the tip changes — sidechain proposals, active sidechains, the
+CTIP of each slot, and the withdrawal bundles still being voted on — and
+republishes only what actually changed. Sidechain slots must be configured
+explicitly:
 
 ```bash
 cargo run -p enforcer-extractor -- \
@@ -133,11 +137,27 @@ cargo run --example get_chain_info -- \
 
 ## Next
 
-Planned work includes VM acceptance, operational metrics, gRPC resubscription,
-and gap backfill. Pending withdrawal vote counts are now available upstream:
-`ValidatorService.GetWithdrawalBundleProposals` returns `m6id`, `vote_count`,
-and `proposal_height`, and is part of the vendored API, so exposing them is
-extractor work rather than a blocked dependency.
+The monitor's purpose is to answer two questions with reproducible evidence:
+what the BIP300 mechanism is actually doing on the target network, and whether
+the enforcer implements it as specified. Generic L1 observability is
+deliberately out of scope.
+
+Planned work, in order:
+
+1. **Gap backfill.** `GetTwoWayPegData` and `GetBlockInfo` can replay the blocks
+   missed while the extractor was down. Without it, a restart leaves a silent
+   hole in the series.
+2. **Persistence.** Core NATS is at-most-once and non-durable, so an event that
+   is not stored is lost. A sink that writes the envelopes to disk is what makes
+   the rest of the data worth collecting.
+3. **Slot discovery.** Deriving the monitored slots from `GetSidechains`
+   instead of requiring `--sidechain`, so a newly activated sidechain is not
+   invisible until the next restart.
+4. **An independent oracle.** The enforcer parses the BIP300 coinbase messages
+   but only publishes aggregates: per-block M2, M4 and M7 votes never leave it,
+   and BMM bid amounts appear in no API at all. Deriving that state from the raw
+   block and comparing it against what the enforcer reports turns the monitor
+   into a conformance check rather than a mirror.
 
 ## License
 

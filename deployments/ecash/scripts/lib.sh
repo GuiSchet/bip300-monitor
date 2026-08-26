@@ -393,6 +393,17 @@ count_snapshot_events() {
     printf '%s\n' "${count}"
 }
 
+# The extractor republishes a snapshot kind whenever a block changes it, so a
+# verification window can legitimately hold more than one of them. Only the
+# kinds that are published exactly once may be counted exactly.
+has_snapshot_event() {
+    local count
+
+    count="$(count_snapshot_events "$@")" || return 1
+    [[ "${count}" =~ ^[0-9]+$ ]] || return 1
+    ((count >= 1))
+}
+
 normalize_timestamp() {
     local timestamp="$1"
     local fraction

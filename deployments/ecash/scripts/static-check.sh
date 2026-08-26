@@ -177,6 +177,8 @@ snapshot_logs="$(printf '%s\n' \
     'INFO received enforcer event event="active_sidechains" summary=sidechain_count=0' \
     'INFO received enforcer event event="ctip" summary=sidechain=9 present=false' \
     'INFO received enforcer event event="ctip" summary=sidechain=98 present=false' \
+    'INFO received enforcer event event="withdrawal_bundle_proposals" summary=sidechain=9 proposal_count=1 max_vote_count=3 oldest_proposal_height=996100' \
+    'INFO received enforcer event event="withdrawal_bundle_proposals" summary=sidechain=98 proposal_count=0 max_vote_count=0 oldest_proposal_height=0' \
     'INFO received enforcer event event="block_connected" summary=sidechain=9 height=996260')"
 for snapshot_kind in chain_info chain_tip sidechain_proposals active_sidechains; do
     [[ "$(count_snapshot_events "${snapshot_logs}" "${snapshot_kind}")" == 1 ]] ||
@@ -190,10 +192,27 @@ done
     die "semantic snapshot matcher accepted the wrong CTIP slot"
 [[ "$(count_snapshot_events "${snapshot_logs}" block_connected 9)" == 1 ]] ||
     die "semantic snapshot matcher did not isolate a live event kind"
+for bundle_slot in 9 98; do
+    has_snapshot_event \
+        "${snapshot_logs}" withdrawal_bundle_proposals "${bundle_slot}" ||
+        die "semantic snapshot matcher rejected bundle proposals slot ${bundle_slot}"
+done
+if has_snapshot_event "${snapshot_logs}" withdrawal_bundle_proposals 8; then
+    die "semantic snapshot matcher accepted the wrong bundle proposals slot"
+fi
 
 duplicate_chain_info="${snapshot_logs}"$'\nINFO received enforcer event event=chain_info summary=duplicate'
 [[ "$(count_snapshot_events "${duplicate_chain_info}" chain_info)" == 2 ]] ||
     die "semantic snapshot matcher did not expose duplicate snapshot events"
+
+# A refreshed snapshot kind may appear more than once in a verification window,
+# so the presence check must accept repeats while still rejecting absence.
+refreshed_ctip="${snapshot_logs}"$'\nINFO received enforcer event event="ctip" summary=sidechain=9 present=true'
+has_snapshot_event "${refreshed_ctip}" ctip 9 ||
+    die "snapshot presence check rejected a refreshed snapshot kind"
+if has_snapshot_event "${snapshot_logs}" ctip 8; then
+    die "snapshot presence check accepted a missing snapshot kind"
+fi
 
 logs_contain_snapshot_completion \
     'INFO sidechain_count=2 published initial enforcer snapshot' 2 ||

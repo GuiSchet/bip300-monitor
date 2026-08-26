@@ -19,44 +19,63 @@ use crate::config::Args;
 use crate::event::envelope;
 use crate::proto::mainchain;
 use crate::snapshot::{self, InitialSnapshot, publish_snapshot};
+use crate::state;
 use crate::{EnforcerClient, convert};
 
 type EventStream = Streaming<mainchain::SubscribeEventsResponse>;
-type StartupFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>>;
+type SourceFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>>;
 const NATS_CLIENT_NAME: &str = "bip300-monitor-enforcer-extractor";
 
 trait StartupSource: Clone + Send {
     type Stream: Send;
 
-    fn subscribe_events(&mut self, sidechain: u8) -> StartupFuture<'_, Self::Stream>;
-    fn current_tip_hash(&mut self) -> StartupFuture<'_, Vec<u8>>;
+    fn subscribe_events(&mut self, sidechain: u8) -> SourceFuture<'_, Self::Stream>;
+    fn current_tip_hash(&mut self) -> SourceFuture<'_, Vec<u8>>;
     fn collect_snapshot<'a>(
         &'a mut self,
         sidechains: &'a [u8],
-    ) -> StartupFuture<'a, InitialSnapshot>;
+    ) -> SourceFuture<'a, InitialSnapshot>;
 }
 
 impl StartupSource for EnforcerClient {
     type Stream = EventStream;
 
-    fn subscribe_events(&mut self, sidechain: u8) -> StartupFuture<'_, Self::Stream> {
+    fn subscribe_events(&mut self, sidechain: u8) -> SourceFuture<'_, Self::Stream> {
         Box::pin(EnforcerClient::subscribe_events(self, sidechain))
     }
 
-    fn current_tip_hash(&mut self) -> StartupFuture<'_, Vec<u8>> {
+    fn current_tip_hash(&mut self) -> SourceFuture<'_, Vec<u8>> {
         Box::pin(snapshot::current_tip_hash(self))
     }
 
     fn collect_snapshot<'a>(
         &'a mut self,
         sidechains: &'a [u8],
-    ) -> StartupFuture<'a, InitialSnapshot> {
+    ) -> SourceFuture<'a, InitialSnapshot> {
         Box::pin(snapshot::collect_snapshot(self, sidechains))
+    }
+}
+
+/// Source of the enforcer state that has to be re-read as the tip advances.
+trait StateSource: Send {
+    fn collect_state<'a>(
+        &'a mut self,
+        sidechains: &'a [u8],
+    ) -> SourceFuture<'a, Vec<events::EnforcerEvent>>;
+}
+
+impl StateSource for EnforcerClient {
+    fn collect_state<'a>(
+        &'a mut self,
+        sidechains: &'a [u8],
+    ) -> SourceFuture<'a, Vec<events::EnforcerEvent>> {
+        Box::pin(state::collect(self, sidechains))
     }
 }
 
 struct PreparedStartup {
     publisher: EventPublisher,
+    client: EnforcerClient,
     streams: Vec<(u8, EventStream)>,
     snapshot: InitialSnapshot,
     tip_before_snapshot: Vec<u8>,
@@ -88,6 +107,7 @@ pub async fn run(args: Args, mut shutdown_rx: watch::Receiver<bool>) -> Result<(
 
     let PreparedStartup {
         publisher,
+        client,
         streams,
         snapshot,
         tip_before_snapshot,
@@ -108,7 +128,7 @@ pub async fn run(args: Args, mut shutdown_rx: watch::Receiver<bool>) -> Result<(
         );
     }
 
-    publish_snapshot(&publisher, snapshot)
+    publish_snapshot(&publisher, &snapshot)
         .await
         .context("publishing and flushing the initial enforcer snapshot")?;
     tracing::info!(
@@ -121,15 +141,34 @@ pub async fn run(args: Args, mut shutdown_rx: watch::Receiver<bool>) -> Result<(
         return Ok(());
     }
 
+    // Every slot worker reports the blocks it sees here, so one state worker can
+    // re-read the mutable enforcer state once per tip change instead of once per
+    // slot. The original sender is dropped below: when the last slot worker
+    // exits, the state worker's wait ends on its own.
+    let snapshot_block = snapshot.tip_hash.clone();
+    let (block_tx, block_rx) = watch::channel(snapshot.tip_hash);
+    let tracker = state::Tracker::new(snapshot.state);
+
     let mut workers = JoinSet::new();
     for (sidechain, stream) in streams {
         workers.spawn(monitor_sidechain(
             stream,
             publisher.clone(),
             sidechain,
+            block_tx.clone(),
             shutdown_rx.clone(),
         ));
     }
+    drop(block_tx);
+    workers.spawn(monitor_state(
+        client,
+        publisher,
+        args.sidechains.clone(),
+        tracker,
+        snapshot_block,
+        block_rx,
+        shutdown_rx,
+    ));
 
     supervise_workers(workers).await?;
     tracing::info!("enforcer extractor stopped");
@@ -157,6 +196,7 @@ async fn prepare_startup(args: &Args) -> Result<PreparedStartup> {
 
     Ok(PreparedStartup {
         publisher,
+        client,
         streams,
         snapshot,
         tip_before_snapshot,
@@ -215,12 +255,14 @@ async fn monitor_sidechain(
     stream: EventStream,
     publisher: EventPublisher,
     sidechain: u8,
+    block_tx: watch::Sender<Vec<u8>>,
     shutdown_rx: watch::Receiver<bool>,
 ) -> Result<()> {
     tracing::info!(sidechain, "started sidechain event worker");
 
     forward_stream(sidechain, stream, shutdown_rx, move |event| {
         let publisher = publisher.clone();
+        let block_tx = block_tx.clone();
         async move {
             publisher
                 .publish_and_flush(Subject::Enforcer, &event)
@@ -229,6 +271,7 @@ async fn monitor_sidechain(
                     format!("publishing and flushing a live event for sidechain {sidechain}")
                 })?;
             log_published_event(sidechain, &event);
+            announce_block(&block_tx, sidechain, &event);
             Ok(())
         }
     })
@@ -236,6 +279,131 @@ async fn monitor_sidechain(
 
     tracing::info!(sidechain, "stopped sidechain event worker");
     Ok(())
+}
+
+/// Report the block a published live event refers to, so the state worker can
+/// refresh. A send failure only means the state worker already stopped, which
+/// its own supervision reports; it must not fail the slot worker.
+fn announce_block(block_tx: &watch::Sender<Vec<u8>>, sidechain: u8, event: &Event) {
+    let hash = match enforcer_payload(event).and_then(state::block_hash) {
+        Ok(hash) => hash.to_vec(),
+        Err(error) => {
+            tracing::warn!(
+                sidechain,
+                error = %format!("{error:#}"),
+                "could not read the block hash of a published live event"
+            );
+            return;
+        }
+    };
+    let _ = block_tx.send(hash);
+}
+
+/// Re-read the mutable enforcer state on every tip change and publish what
+/// changed.
+async fn monitor_state(
+    client: EnforcerClient,
+    publisher: EventPublisher,
+    sidechains: Vec<u8>,
+    tracker: state::Tracker,
+    snapshot_block: Vec<u8>,
+    block_rx: watch::Receiver<Vec<u8>>,
+    shutdown_rx: watch::Receiver<bool>,
+) -> Result<()> {
+    tracing::info!("started enforcer state worker");
+
+    refresh_on_new_blocks(
+        client,
+        sidechains,
+        tracker,
+        snapshot_block,
+        block_rx,
+        shutdown_rx,
+        move |payloads| {
+            let publisher = publisher.clone();
+            async move {
+                let published = payloads.len();
+                for payload in payloads {
+                    log_state_event(&payload);
+                    publisher
+                        .publish(Subject::Enforcer, &envelope(payload)?)
+                        .await
+                        .context("publishing a refreshed enforcer state event")?;
+                }
+                publisher
+                    .flush()
+                    .await
+                    .context("flushing refreshed enforcer state events")?;
+                tracing::info!(published, "published refreshed enforcer state");
+                Ok(())
+            }
+        },
+    )
+    .await?;
+
+    tracing::info!("stopped enforcer state worker");
+    Ok(())
+}
+
+async fn refresh_on_new_blocks<S, P, F>(
+    mut source: S,
+    sidechains: Vec<u8>,
+    mut tracker: state::Tracker,
+    snapshot_block: Vec<u8>,
+    mut block_rx: watch::Receiver<Vec<u8>>,
+    mut shutdown_rx: watch::Receiver<bool>,
+    mut publish: P,
+) -> Result<()>
+where
+    S: StateSource,
+    P: FnMut(Vec<events::EnforcerEvent>) -> F,
+    F: Future<Output = Result<()>>,
+{
+    // The block the initial snapshot describes. It is taken as an argument
+    // rather than read from the channel because a slot worker can report a newer
+    // block before this worker first polls, and reading the channel here would
+    // silently mark that block as already refreshed. Later values are whatever
+    // block a slot worker last published an event for, which during a reorg is
+    // the disconnected block rather than a tip.
+    let mut refreshed_at = snapshot_block;
+
+    loop {
+        tokio::select! {
+            biased;
+            () = wait_for_shutdown(&mut shutdown_rx) => return Ok(()),
+            result = block_rx.changed() => {
+                if result.is_err() {
+                    // Every slot worker dropped its sender, so no further tip
+                    // change can arrive.
+                    return Ok(());
+                }
+            }
+        }
+
+        let block = block_rx.borrow_and_update().clone();
+        // Each configured slot reports the same mainchain block, and startup can
+        // replay the snapshot tip. Only the first report of a block refreshes.
+        if block == refreshed_at {
+            continue;
+        }
+
+        // A failed refresh is fatal for the same reason a failed publication is:
+        // silently skipping it would leave a gap that looks like "nothing
+        // changed". The deployment restarts the extractor, which republishes the
+        // whole snapshot.
+        let current = source.collect_state(&sidechains).await.with_context(|| {
+            format!("refreshing enforcer state at block {}", hex::encode(&block))
+        })?;
+        refreshed_at = block;
+
+        let changed = tracker.take_changed(current)?;
+        if changed.is_empty() {
+            continue;
+        }
+        publish(changed)
+            .await
+            .context("publishing refreshed enforcer state")?;
+    }
 }
 
 async fn forward_stream<S, P, F>(
@@ -310,8 +478,53 @@ async fn abort_and_drain(workers: &mut JoinSet<Result<()>>) {
     while workers.join_next().await.is_some() {}
 }
 
+fn enforcer_payload(event: &Event) -> Result<&events::EnforcerEvent> {
+    match event.monitor_event.as_ref() {
+        Some(MonitorEvent::Enforcer(payload)) => Ok(payload),
+        None => bail!("event envelope does not contain a monitor event"),
+    }
+}
+
+fn log_state_event(payload: &events::EnforcerEvent) {
+    match payload.event.as_ref() {
+        Some(events::enforcer_event::Event::SidechainProposals(proposals)) => {
+            tracing::debug!(
+                event = "sidechain_proposals",
+                proposal_count = proposals.proposals.len(),
+                "refreshed enforcer state changed"
+            );
+        }
+        Some(events::enforcer_event::Event::ActiveSidechains(sidechains)) => {
+            tracing::debug!(
+                event = "active_sidechains",
+                sidechain_count = sidechains.sidechains.len(),
+                "refreshed enforcer state changed"
+            );
+        }
+        Some(events::enforcer_event::Event::Ctip(ctip)) => {
+            tracing::debug!(
+                event = "ctip",
+                sidechain = ctip.sidechain_number,
+                present = ctip.ctip.is_some(),
+                "refreshed enforcer state changed"
+            );
+        }
+        Some(events::enforcer_event::Event::WithdrawalBundleProposals(proposals)) => {
+            tracing::debug!(
+                event = "withdrawal_bundle_proposals",
+                sidechain = proposals.sidechain_number,
+                proposal_count = proposals.proposals.len(),
+                "refreshed enforcer state changed"
+            );
+        }
+        _ => {
+            tracing::warn!("refreshed an unexpected enforcer state payload");
+        }
+    }
+}
+
 fn log_published_event(sidechain: u8, event: &Event) {
-    let Some(MonitorEvent::Enforcer(event)) = event.monitor_event.as_ref() else {
+    let Ok(event) = enforcer_payload(event) else {
         tracing::warn!(
             sidechain,
             "published a live event with an unexpected envelope"
@@ -361,7 +574,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
-    use anyhow::anyhow;
+    use anyhow::{Context as _, anyhow};
     use futures_util::{StreamExt, stream};
     use shared::protobuf::enforcer_extractor as events;
     use shared::protobuf::event::event::MonitorEvent;
@@ -369,11 +582,12 @@ mod tests {
     use tokio::time::timeout;
 
     use super::{
-        StartupFuture, StartupSource, forward_stream, prepare_observation,
-        snapshot_tips_are_consistent, supervise_workers,
+        SourceFuture, StartupSource, StateSource, forward_stream, prepare_observation,
+        refresh_on_new_blocks, snapshot_tips_are_consistent, supervise_workers,
     };
     use crate::proto::{common, mainchain};
     use crate::snapshot::InitialSnapshot;
+    use crate::state;
 
     fn reverse_hex(byte: u8) -> Option<common::ReverseHex> {
         Some(common::ReverseHex {
@@ -432,6 +646,20 @@ mod tests {
         event.event.as_ref().expect("normalized enforcer event")
     }
 
+    fn ctip_payload(sidechain_number: u32, value_sats: u64) -> events::EnforcerEvent {
+        events::EnforcerEvent {
+            event: Some(events::enforcer_event::Event::Ctip(events::CtipSnapshot {
+                sidechain_number,
+                ctip: Some(events::Ctip {
+                    txid: vec![0x11; 32],
+                    vout: 0,
+                    value_sats,
+                    sequence_number: 1,
+                }),
+            })),
+        }
+    }
+
     #[derive(Clone)]
     struct FakeStartupSource {
         calls: Arc<Mutex<Vec<String>>>,
@@ -444,7 +672,7 @@ mod tests {
             std::result::Result<mainchain::SubscribeEventsResponse, tonic::Status>,
         >;
 
-        fn subscribe_events(&mut self, sidechain: u8) -> StartupFuture<'_, Self::Stream> {
+        fn subscribe_events(&mut self, sidechain: u8) -> SourceFuture<'_, Self::Stream> {
             let calls = Arc::clone(&self.calls);
             Box::pin(async move {
                 calls
@@ -455,7 +683,7 @@ mod tests {
             })
         }
 
-        fn current_tip_hash(&mut self) -> StartupFuture<'_, Vec<u8>> {
+        fn current_tip_hash(&mut self) -> SourceFuture<'_, Vec<u8>> {
             let calls = Arc::clone(&self.calls);
             let tips = Arc::clone(&self.tips);
             Box::pin(async move {
@@ -474,7 +702,7 @@ mod tests {
         fn collect_snapshot<'a>(
             &'a mut self,
             _sidechains: &'a [u8],
-        ) -> StartupFuture<'a, InitialSnapshot> {
+        ) -> SourceFuture<'a, InitialSnapshot> {
             let calls = Arc::clone(&self.calls);
             let snapshot_tip = self.snapshot_tip.clone();
             Box::pin(async move {
@@ -483,9 +711,48 @@ mod tests {
                     .expect("startup call lock")
                     .push("snapshot".to_owned());
                 Ok(InitialSnapshot {
-                    events: Vec::new(),
+                    constants: Vec::new(),
+                    state: Vec::new(),
                     tip_hash: snapshot_tip,
                 })
+            })
+        }
+    }
+
+    /// Returns a scripted state collection per call, counts the calls, and
+    /// signals each one so a test can sequence tip reports deterministically.
+    struct FakeStateSource {
+        collections: Arc<Mutex<VecDeque<Vec<events::EnforcerEvent>>>>,
+        calls: Arc<Mutex<usize>>,
+        collected: Arc<Notify>,
+    }
+
+    impl FakeStateSource {
+        fn new(collections: Vec<Vec<events::EnforcerEvent>>) -> Self {
+            Self {
+                collections: Arc::new(Mutex::new(VecDeque::from(collections))),
+                calls: Arc::new(Mutex::new(0)),
+                collected: Arc::new(Notify::new()),
+            }
+        }
+    }
+
+    impl StateSource for FakeStateSource {
+        fn collect_state<'a>(
+            &'a mut self,
+            _sidechains: &'a [u8],
+        ) -> SourceFuture<'a, Vec<events::EnforcerEvent>> {
+            let collections = Arc::clone(&self.collections);
+            let calls = Arc::clone(&self.calls);
+            let collected = Arc::clone(&self.collected);
+            Box::pin(async move {
+                *calls.lock().expect("state call lock") += 1;
+                let collection = collections
+                    .lock()
+                    .expect("state collection lock")
+                    .pop_front();
+                collected.notify_one();
+                collection.context("configured fake state collection")
             })
         }
     }
@@ -647,6 +914,122 @@ mod tests {
                 .to_string()
                 .contains("sidechain 9 event stream ended unexpectedly")
         );
+    }
+
+    #[tokio::test]
+    async fn state_refreshes_once_per_block_and_publishes_only_changes() {
+        let snapshot_tip = vec![0x11; 32];
+        let (block_tx, block_rx) = watch::channel(snapshot_tip.clone());
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        // One collection per expected refresh: unchanged, then changed.
+        let source =
+            FakeStateSource::new(vec![vec![ctip_payload(9, 100)], vec![ctip_payload(9, 250)]]);
+        let calls = Arc::clone(&source.calls);
+        let collected = Arc::clone(&source.collected);
+        let published = Arc::new(Mutex::new(Vec::new()));
+        let output = Arc::clone(&published);
+        let publish_shutdown = shutdown_tx.clone();
+
+        let worker = tokio::spawn(refresh_on_new_blocks(
+            source,
+            vec![9],
+            state::Tracker::new(vec![ctip_payload(9, 100)]),
+            snapshot_tip.clone(),
+            block_rx,
+            shutdown_rx,
+            move |payloads| {
+                let output = Arc::clone(&output);
+                let publish_shutdown = publish_shutdown.clone();
+                async move {
+                    output.lock().expect("published state lock").push(payloads);
+                    publish_shutdown.send(true).expect("send shutdown");
+                    Ok(())
+                }
+            },
+        ));
+
+        // A replayed snapshot tip must not refresh. The channel only keeps the
+        // latest value, so waiting for the refresh is what makes the count of
+        // the following reports deterministic.
+        block_tx.send(snapshot_tip).expect("replay snapshot tip");
+        block_tx.send(vec![0x22; 32]).expect("first new block");
+        collected.notified().await;
+
+        // The same block reported by another slot must not refresh again.
+        block_tx
+            .send(vec![0x22; 32])
+            .expect("same block, other slot");
+        block_tx.send(vec![0x33; 32]).expect("second new block");
+
+        timeout(Duration::from_secs(1), worker)
+            .await
+            .expect("state worker finishes")
+            .expect("join state worker")
+            .expect("clean state worker shutdown");
+
+        let published = published.lock().expect("published state lock");
+        assert_eq!(
+            *published,
+            vec![vec![ctip_payload(9, 250)]],
+            "only the changed payload is published"
+        );
+        assert_eq!(
+            *calls.lock().expect("state call lock"),
+            2,
+            "one refresh per distinct block, none for the replayed snapshot tip"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_state_worker_stops_when_every_slot_worker_is_gone() {
+        let (block_tx, block_rx) = watch::channel(vec![0x11; 32]);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let worker = tokio::spawn(refresh_on_new_blocks(
+            FakeStateSource::new(Vec::new()),
+            vec![9],
+            state::Tracker::new(Vec::new()),
+            vec![0x11; 32],
+            block_rx,
+            shutdown_rx,
+            |_payloads| async { Ok(()) },
+        ));
+
+        tokio::task::yield_now().await;
+        drop(block_tx);
+
+        timeout(Duration::from_secs(1), worker)
+            .await
+            .expect("state worker reacts to a closed channel")
+            .expect("join state worker")
+            .expect("clean state worker shutdown");
+    }
+
+    #[tokio::test]
+    async fn a_failed_state_refresh_is_fatal() {
+        let (block_tx, block_rx) = watch::channel(vec![0x11; 32]);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let worker = tokio::spawn(refresh_on_new_blocks(
+            // No scripted collection: the fake reports a failure.
+            FakeStateSource::new(Vec::new()),
+            vec![9],
+            state::Tracker::new(Vec::new()),
+            vec![0x11; 32],
+            block_rx,
+            shutdown_rx,
+            |_payloads| async { Ok(()) },
+        ));
+
+        block_tx.send(vec![0x22; 32]).expect("new block");
+
+        let error = timeout(Duration::from_secs(1), worker)
+            .await
+            .expect("state worker finishes")
+            .expect("join state worker")
+            .expect_err("a failed refresh must fail the worker");
+
+        assert!(format!("{error:#}").contains("refreshing enforcer state at block"));
     }
 
     #[tokio::test]

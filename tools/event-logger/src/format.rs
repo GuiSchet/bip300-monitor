@@ -169,6 +169,35 @@ fn summarize(payload: &events::enforcer_event::Event) -> Result<(&'static str, S
                 ),
             ))
         }
+        events::enforcer_event::Event::WithdrawalBundleProposals(snapshot) => {
+            validate_bundle_proposals(&snapshot.proposals)?;
+            // The vote count is read against the inclusion threshold and the
+            // proposal height against the maximum bundle age, both of which are
+            // in `chain_info`. The extremes are what a reader needs at a glance.
+            let max_vote_count = snapshot
+                .proposals
+                .iter()
+                .map(|proposal| proposal.vote_count)
+                .max()
+                .unwrap_or(0);
+            let oldest_proposal_height = snapshot
+                .proposals
+                .iter()
+                .map(|proposal| proposal.proposal_height)
+                .min()
+                .unwrap_or(0);
+            Ok((
+                "withdrawal_bundle_proposals",
+                format!(
+                    "sidechain={} proposal_count={} max_vote_count={} \
+                     oldest_proposal_height={}",
+                    snapshot.sidechain_number,
+                    snapshot.proposals.len(),
+                    max_vote_count,
+                    oldest_proposal_height
+                ),
+            ))
+        }
     }
 }
 
@@ -196,6 +225,17 @@ fn validate_declaration(declaration: Option<&events::SidechainDeclaration>) -> R
             .declaration
             .as_ref()
             .context("sidechain declaration is missing its concrete version")?;
+    }
+    Ok(())
+}
+
+fn validate_bundle_proposals(proposals: &[events::WithdrawalBundleProposal]) -> Result<()> {
+    // `m6id` is consensus-encoded rather than a display-order hash, so its
+    // length is not asserted here; an empty one would still be meaningless.
+    for proposal in proposals {
+        if proposal.m6id.is_empty() {
+            bail!("withdrawal_bundle_proposal.m6id must not be empty");
+        }
     }
     Ok(())
 }
@@ -360,6 +400,19 @@ mod tests {
                     sidechain_number: 9,
                 }),
                 "block_disconnected",
+            ),
+            (
+                events::enforcer_event::Event::WithdrawalBundleProposals(
+                    events::WithdrawalBundleProposalsSnapshot {
+                        sidechain_number: 9,
+                        proposals: vec![events::WithdrawalBundleProposal {
+                            m6id: vec![5; 32],
+                            vote_count: 3,
+                            proposal_height: 900,
+                        }],
+                    },
+                ),
+                "withdrawal_bundle_proposals",
             ),
         ];
 

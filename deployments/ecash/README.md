@@ -69,10 +69,13 @@ just monitor-up
 just verify
 ```
 
-The logger subscribes before the extractor starts. Verification requires one
-fresh event of each semantic snapshot type plus one CTIP event for every
-configured slot. It resets its log window if either monitor container restarts,
-and live block events cannot satisfy the snapshot check.
+The logger subscribes before the extractor starts. Verification requires a fresh
+event of each semantic snapshot type, plus a CTIP and a withdrawal-bundle
+proposals event for every configured slot. `chain_info` and `chain_tip` must
+appear exactly once because they are published only at startup; the remaining
+kinds are republished whenever a block changes them, so more than one is
+expected. Verification resets its log window if either monitor container
+restarts, and live block events cannot satisfy the snapshot check.
 
 Before accepting a VM, wait for a new network block and prove delivery for
 every configured sidechain slot:

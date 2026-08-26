@@ -9,6 +9,7 @@ mod event;
 pub mod proto;
 pub mod runtime;
 mod snapshot;
+mod state;
 
 pub use client::EnforcerClient;
 pub use config::Args;
