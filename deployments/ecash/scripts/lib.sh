@@ -450,10 +450,11 @@ node_history_is_ready() {
         chainstates="$(node_cli getchainstates 2>/dev/null)" || return 1
     fi
 
-    jq -e '
+    jq -e --argjson activation_height "${ECASH_ACTIVATION_HEIGHT}" '
         (.chainstates | type == "array")
         and (.chainstates | length == 1)
         and (.chainstates[0].validated == true)
+        and (.chainstates[0].blocks >= $activation_height)
     ' <<<"${chainstates}" >/dev/null 2>&1
 }
 
@@ -474,5 +475,5 @@ require_node_history_ready() {
     chainstate_count="$(jq -r '.chainstates | length' <<<"${chainstates}")"
     historical_blocks="$(jq -r '.chainstates[0].blocks // "unavailable"' <<<"${chainstates}")"
     active_blocks="$(jq -r '.chainstates[-1].blocks // "unavailable"' <<<"${chainstates}")"
-    die "ecash-node AssumeUTXO history is not fully validated (chainstates=${chainstate_count}, historical_blocks=${historical_blocks}, active_blocks=${active_blocks}); wait until 'getchainstates' reports one validated chainstate"
+    die "ecash-node history is not ready (chainstates=${chainstate_count}, historical_blocks=${historical_blocks}, active_blocks=${active_blocks}); wait until 'getchainstates' reports one validated chainstate at or above activation height ${ECASH_ACTIVATION_HEIGHT}"
 }
