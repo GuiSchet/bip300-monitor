@@ -59,6 +59,7 @@ for invalid_live_event_wait in 0 invalid; do
 done
 
 ready_chainstates='{"headers":996259,"chainstates":[{"blocks":996259,"validated":true}]}'
+pre_activation_chainstate='{"headers":996259,"chainstates":[{"blocks":564987,"validated":true}]}'
 syncing_chainstates='{"headers":996259,"chainstates":[{"blocks":763703,"validated":true},{"blocks":996259,"snapshot_blockhash":"snapshot","validated":false}]}'
 unvalidated_chainstate='{"headers":996259,"chainstates":[{"blocks":996259,"snapshot_blockhash":"snapshot","validated":false}]}'
 empty_chainstates='{"headers":996259,"chainstates":[]}'
@@ -66,6 +67,7 @@ empty_chainstates='{"headers":996259,"chainstates":[]}'
 node_history_is_ready "${ready_chainstates}" ||
     die "node history readiness rejected one validated chainstate"
 for incomplete_chainstates in \
+    "${pre_activation_chainstate}" \
     "${syncing_chainstates}" \
     "${unvalidated_chainstate}" \
     "${empty_chainstates}" \
@@ -74,6 +76,9 @@ for incomplete_chainstates in \
         die "node history readiness accepted incomplete or invalid chainstates"
     fi
 done
+grep -Fq "node_history_is_ready \"\${chainstates}\"" \
+    "${DEPLOYMENT_ROOT}/scripts/status.sh" ||
+    die "status.sh does not use the activation-gated node history readiness check"
 
 # The enforcer reads a cookie the node image creates, so the check has to accept
 # owner, group, and world readability and reject the root:root 0600 case.
@@ -89,14 +94,18 @@ cookie_is_readable() {
     local mode="$1"
     local uid="$2"
     local gid="$3"
+    local ECASH_DATA_ROOT="${cookie_root}"
+    local PGID="${gid}"
+    local PUID="${uid}"
 
     chmod "${mode}" "${cookie_path}"
-    (
-        ECASH_DATA_ROOT="${cookie_root}"
-        PUID="${uid}"
-        PGID="${gid}"
-        require_rpc_cookie_readable
-    ) >/dev/null 2>&1
+    (require_rpc_cookie_readable) >/dev/null 2>&1
+}
+
+missing_cookie_is_readable() {
+    local ECASH_DATA_ROOT="${cookie_root}"
+
+    (require_rpc_cookie_readable)
 }
 
 cookie_is_readable 600 "${cookie_uid}" "${cookie_gid}" ||
@@ -112,10 +121,7 @@ if cookie_is_readable 000 "${cookie_uid}" "${cookie_gid}"; then
     die "RPC cookie check accepted an unreadable cookie"
 fi
 rm -f -- "${cookie_path}"
-if (
-    ECASH_DATA_ROOT="${cookie_root}"
-    require_rpc_cookie_readable
-) >/dev/null 2>&1; then
+if missing_cookie_is_readable >/dev/null 2>&1; then
     die "RPC cookie check accepted a missing cookie"
 fi
 

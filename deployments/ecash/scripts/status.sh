@@ -31,11 +31,12 @@ chainstates="$(node_cli getchainstates)"
 jq '{headers, chainstates}' <<<"${chainstates}"
 
 info "AssumeUTXO history"
-jq '{
-    history_ready: (
-        (.chainstates | length) == 1
-        and .chainstates[0].validated == true
-    ),
+history_ready=false
+if node_history_is_ready "${chainstates}"; then
+    history_ready=true
+fi
+jq --argjson history_ready "${history_ready}" '{
+    history_ready: $history_ready,
     chainstate_count: (.chainstates | length),
     historical_blocks: (.chainstates[0].blocks // null),
     active_blocks: (.chainstates[-1].blocks // null),
