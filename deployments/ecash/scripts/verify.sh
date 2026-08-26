@@ -79,8 +79,19 @@ while :; do
     if [[ "${snapshot_complete}" == true ]]; then
         break
     fi
-    ((SECONDS < deadline)) ||
+    if ((SECONDS >= deadline)); then
+        # Only the extractor publishes a snapshot, and only when it starts. If
+        # the logger came up afterwards, that snapshot is outside this window
+        # and Core NATS has no JetStream to replay it from.
+        newest_monitor="$(
+            latest_timestamp "${extractor_started_before}" "${logger_started_before}"
+        )"
+        if [[ "${newest_monitor}" == "${logger_started_before}" &&
+            "${logger_started_before}" != "${extractor_started_before}" ]]; then
+            die "event-logger started after enforcer-extractor, so it never received the initial snapshot and Core NATS cannot replay it; restart the enforcer-extractor container to republish, then run 'just verify' again"
+        fi
         die "current monitor instances did not deliver one complete semantic snapshot after ${wait_seconds}s"
+    fi
     sleep 2
 done
 

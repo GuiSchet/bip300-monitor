@@ -201,7 +201,17 @@ if logs_contain_snapshot_completion \
     die "snapshot completion matcher accepted the wrong message"
 fi
 
-[[ "$(latest_timestamp '2026-08-25T10:00:00.000000000Z' '2026-08-25T10:00:01.000000000Z')" == '2026-08-25T10:00:01.000000000Z' ]] ||
+# Docker renders StartedAt with Go's RFC3339Nano, so the fraction has a
+# variable width and a plain lexical comparison mis-orders these pairs.
+[[ "$(latest_timestamp '2026-08-25T10:00:00.1Z' '2026-08-25T10:00:00.15Z')" == '2026-08-25T10:00:00.15Z' ]] ||
+    die "latest timestamp helper mis-ordered a shorter fraction"
+[[ "$(latest_timestamp '2026-08-25T10:00:00.15Z' '2026-08-25T10:00:00.1Z')" == '2026-08-25T10:00:00.15Z' ]] ||
+    die "latest timestamp helper mis-ordered a shorter fraction in reverse"
+[[ "$(latest_timestamp '2026-08-25T10:00:00.9Z' '2026-08-25T10:00:00.85Z')" == '2026-08-25T10:00:00.9Z' ]] ||
+    die "latest timestamp helper mis-ordered a longer fraction"
+[[ "$(latest_timestamp '2026-08-25T10:00:00Z' '2026-08-25T10:00:00.5Z')" == '2026-08-25T10:00:00.5Z' ]] ||
+    die "latest timestamp helper ignored a whole-second timestamp"
+[[ "$(latest_timestamp '2026-08-25T10:00:01.1Z' '2026-08-25T10:00:00.9Z')" == '2026-08-25T10:00:01.1Z' ]] ||
     die "latest timestamp helper selected a stale container instance"
 
 config_json="$(compose config --format json)"
