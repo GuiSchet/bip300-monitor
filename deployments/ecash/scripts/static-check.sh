@@ -57,6 +57,7 @@ for invalid_live_event_wait in 0 invalid; do
 done
 
 ready_chainstates='{"headers":996259,"chainstates":[{"blocks":996259,"validated":true}]}'
+pre_activation_chainstate='{"headers":996259,"chainstates":[{"blocks":564987,"validated":true}]}'
 syncing_chainstates='{"headers":996259,"chainstates":[{"blocks":763703,"validated":true},{"blocks":996259,"snapshot_blockhash":"snapshot","validated":false}]}'
 unvalidated_chainstate='{"headers":996259,"chainstates":[{"blocks":996259,"snapshot_blockhash":"snapshot","validated":false}]}'
 empty_chainstates='{"headers":996259,"chainstates":[]}'
@@ -64,6 +65,7 @@ empty_chainstates='{"headers":996259,"chainstates":[]}'
 node_history_is_ready "${ready_chainstates}" ||
     die "node history readiness rejected one validated chainstate"
 for incomplete_chainstates in \
+    "${pre_activation_chainstate}" \
     "${syncing_chainstates}" \
     "${unvalidated_chainstate}" \
     "${empty_chainstates}" \
