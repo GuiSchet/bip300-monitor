@@ -3,8 +3,8 @@
 These protobuf files are copied from:
 
 - Repository: <https://github.com/LayerTwo-Labs/bip300301_enforcer>
-- Commit: `86543d13b32865ae629dbc8a373824e2c5aabb51`
-- Copied: 2026-08-25
+- Commit: `b6601add8cd7361f064d38196ee0bd32c7bd5f4b`
+- Copied: 2026-08-26
 
 Only the read-only `ValidatorService` contract and its direct CUSF message
 dependencies are vendored. The monitor does not link to the enforcer
@@ -36,5 +36,7 @@ Before updating these files:
 2. replace all three files together;
 3. update the commit and checksums above;
 4. run `.github/scripts/check-proto-vendor.sh --online`;
-5. run the full workspace tests and the real-enforcer probe.
-
+5. run the CI-equivalent workspace tests and
+   `deployments/ecash/scripts/static-check.sh`;
+6. after deploying the reviewed commit, run `just verify` and
+   `just verify-live` from `deployments/ecash` against the real enforcer.
