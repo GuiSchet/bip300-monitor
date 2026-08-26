@@ -9,7 +9,7 @@ use shared::nats_subjects::Subject;
 use shared::protobuf::enforcer_extractor::{
     Bip300Constants, ChainInfo, EnforcerEvent, Network, enforcer_event,
 };
-use shared::protobuf::event::{Event, event::MonitorEvent};
+use shared::protobuf::event::{Event, ObservedBlock, event::MonitorEvent};
 use tokio::time::{sleep, timeout};
 
 struct TestNatsServer {
@@ -96,8 +96,11 @@ async fn publishes_and_decodes_the_monitor_envelope() {
             }),
         })),
     };
-    let expected =
-        Event::new(MonitorEvent::Enforcer(payload)).expect("system clock after Unix epoch");
+    let expected = Event::new(
+        MonitorEvent::Enforcer(payload),
+        Some(ObservedBlock::at_height(vec![0x11; 32], 996_259)),
+    )
+    .expect("system clock after Unix epoch");
 
     publisher
         .publish_and_flush(Subject::Enforcer, &expected)
@@ -137,12 +140,15 @@ async fn subscriber_reports_an_invalid_payload_and_continues() {
         .publish(Subject::Enforcer.to_string(), vec![0xff, 0x00].into())
         .await
         .expect("publish invalid payload");
-    let expected = Event::new(MonitorEvent::Enforcer(EnforcerEvent {
-        event: Some(enforcer_event::Event::ChainInfo(ChainInfo {
-            network: Network::Regtest as i32,
-            bip300_constants: Some(Bip300Constants::default()),
-        })),
-    }))
+    let expected = Event::new(
+        MonitorEvent::Enforcer(EnforcerEvent {
+            event: Some(enforcer_event::Event::ChainInfo(ChainInfo {
+                network: Network::Regtest as i32,
+                bip300_constants: Some(Bip300Constants::default()),
+            })),
+        }),
+        Some(ObservedBlock::at_height(vec![0x11; 32], 996_259)),
+    )
     .expect("system clock after Unix epoch");
     publisher
         .publish(
@@ -191,7 +197,11 @@ async fn detected_server_loss_makes_publish_and_flush_time_out() {
             bip300_constants: None,
         })),
     };
-    let event = Event::new(MonitorEvent::Enforcer(payload)).expect("system clock after Unix epoch");
+    let event = Event::new(
+        MonitorEvent::Enforcer(payload),
+        Some(ObservedBlock::at_height(vec![0x11; 32], 996_259)),
+    )
+    .expect("system clock after Unix epoch");
 
     server.stop();
     sleep(Duration::from_millis(250)).await;

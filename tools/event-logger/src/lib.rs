@@ -150,12 +150,14 @@ mod tests {
     fn invalid_event_does_not_prevent_the_next_event_from_rendering() {
         let invalid = Event {
             timestamp: 1,
+            observed_at_block: None,
             monitor_event: Some(MonitorEvent::Enforcer(events::EnforcerEvent {
                 event: None,
             })),
         };
         let valid = Event {
             timestamp: 2,
+            observed_at_block: None,
             monitor_event: Some(MonitorEvent::Enforcer(events::EnforcerEvent {
                 event: Some(events::enforcer_event::Event::Ctip(events::CtipSnapshot {
                     sidechain_number: 9,
@@ -177,6 +179,7 @@ mod tests {
     fn the_full_payload_is_built_only_when_full_events_is_set() {
         let event = Event {
             timestamp: 3,
+            observed_at_block: None,
             monitor_event: Some(MonitorEvent::Enforcer(events::EnforcerEvent {
                 event: Some(events::enforcer_event::Event::Ctip(events::CtipSnapshot {
                     sidechain_number: 9,

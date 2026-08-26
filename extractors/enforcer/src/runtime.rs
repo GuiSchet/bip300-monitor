@@ -9,8 +9,8 @@ use futures_util::{Stream, StreamExt};
 use shared::nats::EventPublisher;
 use shared::nats_subjects::Subject;
 use shared::protobuf::enforcer_extractor as events;
-use shared::protobuf::event::Event;
 use shared::protobuf::event::event::MonitorEvent;
+use shared::protobuf::event::{Event, ObservedBlock};
 use tokio::sync::watch;
 use tokio::task::JoinSet;
 use tonic::{Status, Streaming};
@@ -30,7 +30,7 @@ trait StartupSource: Clone + Send {
     type Stream: Send;
 
     fn subscribe_events(&mut self, sidechain: u8) -> SourceFuture<'_, Self::Stream>;
-    fn current_tip_hash(&mut self) -> SourceFuture<'_, Vec<u8>>;
+    fn current_tip(&mut self) -> SourceFuture<'_, ObservedBlock>;
     fn collect_snapshot<'a>(
         &'a mut self,
         sidechains: &'a [u8],
@@ -44,8 +44,8 @@ impl StartupSource for EnforcerClient {
         Box::pin(EnforcerClient::subscribe_events(self, sidechain))
     }
 
-    fn current_tip_hash(&mut self) -> SourceFuture<'_, Vec<u8>> {
-        Box::pin(snapshot::current_tip_hash(self))
+    fn current_tip(&mut self) -> SourceFuture<'_, ObservedBlock> {
+        Box::pin(snapshot::current_tip(self))
     }
 
     fn collect_snapshot<'a>(
@@ -58,17 +58,11 @@ impl StartupSource for EnforcerClient {
 
 /// Source of the enforcer state that has to be re-read as the tip advances.
 trait StateSource: Send {
-    fn collect_state<'a>(
-        &'a mut self,
-        sidechains: &'a [u8],
-    ) -> SourceFuture<'a, Vec<events::EnforcerEvent>>;
+    fn collect_state<'a>(&'a mut self, sidechains: &'a [u8]) -> SourceFuture<'a, state::Reading>;
 }
 
 impl StateSource for EnforcerClient {
-    fn collect_state<'a>(
-        &'a mut self,
-        sidechains: &'a [u8],
-    ) -> SourceFuture<'a, Vec<events::EnforcerEvent>> {
+    fn collect_state<'a>(&'a mut self, sidechains: &'a [u8]) -> SourceFuture<'a, state::Reading> {
         Box::pin(state::collect(self, sidechains))
     }
 }
@@ -116,12 +110,12 @@ pub async fn run(args: Args, mut shutdown_rx: watch::Receiver<bool>) -> Result<(
 
     if !snapshot_tips_are_consistent(
         &tip_before_snapshot,
-        &snapshot.tip_hash,
+        &snapshot.anchor.hash,
         &tip_after_snapshot,
     ) {
         tracing::warn!(
             tip_before = %hex::encode(&tip_before_snapshot),
-            snapshot_tip = %hex::encode(&snapshot.tip_hash),
+            snapshot_tip = %hex::encode(&snapshot.anchor.hash),
             tip_after = %hex::encode(&tip_after_snapshot),
             "mainchain tip changed while collecting the initial snapshot; \
              buffered live events may duplicate snapshot state"
@@ -145,8 +139,8 @@ pub async fn run(args: Args, mut shutdown_rx: watch::Receiver<bool>) -> Result<(
     // re-read the mutable enforcer state once per tip change instead of once per
     // slot. The original sender is dropped below: when the last slot worker
     // exits, the state worker's wait ends on its own.
-    let snapshot_block = snapshot.tip_hash.clone();
-    let (block_tx, block_rx) = watch::channel(snapshot.tip_hash);
+    let snapshot_block = snapshot.anchor.hash.clone();
+    let (block_tx, block_rx) = watch::channel(snapshot.anchor.hash.clone());
     let tracker = state::Tracker::new(snapshot.state);
 
     let mut workers = JoinSet::new();
@@ -227,17 +221,19 @@ where
         .context("opening all sidechain subscriptions")?;
 
     let tip_before_snapshot = client
-        .current_tip_hash()
+        .current_tip()
         .await
-        .context("reading the mainchain tip before collecting the snapshot")?;
+        .context("reading the mainchain tip before collecting the snapshot")?
+        .hash;
     let snapshot = client
         .collect_snapshot(sidechains)
         .await
         .context("collecting the initial enforcer snapshot")?;
     let tip_after_snapshot = client
-        .current_tip_hash()
+        .current_tip()
         .await
-        .context("reading the mainchain tip after collecting the snapshot")?;
+        .context("reading the mainchain tip after collecting the snapshot")?
+        .hash;
 
     Ok(PreparedObservation {
         streams,
@@ -285,18 +281,14 @@ async fn monitor_sidechain(
 /// refresh. A send failure only means the state worker already stopped, which
 /// its own supervision reports; it must not fail the slot worker.
 fn announce_block(block_tx: &watch::Sender<Vec<u8>>, sidechain: u8, event: &Event) {
-    let hash = match enforcer_payload(event).and_then(state::block_hash) {
-        Ok(hash) => hash.to_vec(),
-        Err(error) => {
-            tracing::warn!(
-                sidechain,
-                error = %format!("{error:#}"),
-                "could not read the block hash of a published live event"
-            );
-            return;
-        }
+    let Some(anchor) = event.observed_at_block.as_ref() else {
+        tracing::warn!(
+            sidechain,
+            "published a live event without an observation anchor"
+        );
+        return;
     };
-    let _ = block_tx.send(hash);
+    let _ = block_tx.send(anchor.hash.clone());
 }
 
 /// Re-read the mutable enforcer state on every tip change and publish what
@@ -319,14 +311,14 @@ async fn monitor_state(
         snapshot_block,
         block_rx,
         shutdown_rx,
-        move |payloads| {
+        move |anchor: ObservedBlock, payloads: Vec<events::EnforcerEvent>| {
             let publisher = publisher.clone();
             async move {
                 let published = payloads.len();
                 for payload in payloads {
                     log_state_event(&payload);
                     publisher
-                        .publish(Subject::Enforcer, &envelope(payload)?)
+                        .publish(Subject::Enforcer, &envelope(payload, anchor.clone())?)
                         .await
                         .context("publishing a refreshed enforcer state event")?;
                 }
@@ -356,7 +348,7 @@ async fn refresh_on_new_blocks<S, P, F>(
 ) -> Result<()>
 where
     S: StateSource,
-    P: FnMut(Vec<events::EnforcerEvent>) -> F,
+    P: FnMut(ObservedBlock, Vec<events::EnforcerEvent>) -> F,
     F: Future<Output = Result<()>>,
 {
     // The block the initial snapshot describes. It is taken as an argument
@@ -391,16 +383,16 @@ where
         // silently skipping it would leave a gap that looks like "nothing
         // changed". The deployment restarts the extractor, which republishes the
         // whole snapshot.
-        let current = source.collect_state(&sidechains).await.with_context(|| {
+        let reading = source.collect_state(&sidechains).await.with_context(|| {
             format!("refreshing enforcer state at block {}", hex::encode(&block))
         })?;
         refreshed_at = block;
 
-        let changed = tracker.take_changed(current)?;
+        let changed = tracker.take_changed(reading.payloads)?;
         if changed.is_empty() {
             continue;
         }
-        publish(changed)
+        publish(reading.anchor, changed)
             .await
             .context("publishing refreshed enforcer state")?;
     }
@@ -438,7 +430,9 @@ where
 
         let payload = convert::subscription_event(sidechain, response)
             .with_context(|| format!("converting a live event for sidechain {sidechain}"))?;
-        let event = envelope(payload)?;
+        let anchor = state::block_anchor(&payload)
+            .with_context(|| format!("anchoring a live event for sidechain {sidechain}"))?;
+        let event = envelope(payload, anchor)?;
         publish(event)
             .await
             .with_context(|| format!("forwarding a live event for sidechain {sidechain}"))?;
@@ -588,6 +582,7 @@ mod tests {
     use crate::proto::{common, mainchain};
     use crate::snapshot::InitialSnapshot;
     use crate::state;
+    use shared::protobuf::event::ObservedBlock;
 
     fn reverse_hex(byte: u8) -> Option<common::ReverseHex> {
         Some(common::ReverseHex {
@@ -683,7 +678,7 @@ mod tests {
             })
         }
 
-        fn current_tip_hash(&mut self) -> SourceFuture<'_, Vec<u8>> {
+        fn current_tip(&mut self) -> SourceFuture<'_, ObservedBlock> {
             let calls = Arc::clone(&self.calls);
             let tips = Arc::clone(&self.tips);
             Box::pin(async move {
@@ -691,11 +686,13 @@ mod tests {
                     .lock()
                     .expect("startup call lock")
                     .push("tip".to_owned());
-                Ok(tips
-                    .lock()
-                    .expect("startup tip lock")
-                    .pop_front()
-                    .expect("configured fake tip"))
+                Ok(ObservedBlock::at_height(
+                    tips.lock()
+                        .expect("startup tip lock")
+                        .pop_front()
+                        .expect("configured fake tip"),
+                    996_259,
+                ))
             })
         }
 
@@ -713,7 +710,7 @@ mod tests {
                 Ok(InitialSnapshot {
                     constants: Vec::new(),
                     state: Vec::new(),
-                    tip_hash: snapshot_tip,
+                    anchor: ObservedBlock::at_height(snapshot_tip, 996_259),
                 })
             })
         }
@@ -741,18 +738,27 @@ mod tests {
         fn collect_state<'a>(
             &'a mut self,
             _sidechains: &'a [u8],
-        ) -> SourceFuture<'a, Vec<events::EnforcerEvent>> {
+        ) -> SourceFuture<'a, state::Reading> {
             let collections = Arc::clone(&self.collections);
             let calls = Arc::clone(&self.calls);
             let collected = Arc::clone(&self.collected);
             Box::pin(async move {
-                *calls.lock().expect("state call lock") += 1;
+                let call = {
+                    let mut calls = calls.lock().expect("state call lock");
+                    *calls += 1;
+                    *calls
+                };
                 let collection = collections
                     .lock()
                     .expect("state collection lock")
                     .pop_front();
                 collected.notify_one();
-                collection.context("configured fake state collection")
+                Ok(state::Reading {
+                    // A distinct anchor per refresh, so a test can tell which
+                    // reading a published batch came from.
+                    anchor: ObservedBlock::at_height(vec![call as u8; 32], 996_259 + call as u32),
+                    payloads: collection.context("configured fake state collection")?,
+                })
             })
         }
     }
@@ -937,11 +943,14 @@ mod tests {
             snapshot_tip.clone(),
             block_rx,
             shutdown_rx,
-            move |payloads| {
+            move |anchor: ObservedBlock, payloads: Vec<events::EnforcerEvent>| {
                 let output = Arc::clone(&output);
                 let publish_shutdown = publish_shutdown.clone();
                 async move {
-                    output.lock().expect("published state lock").push(payloads);
+                    output
+                        .lock()
+                        .expect("published state lock")
+                        .push((anchor, payloads));
                     publish_shutdown.send(true).expect("send shutdown");
                     Ok(())
                 }
@@ -968,10 +977,13 @@ mod tests {
             .expect("clean state worker shutdown");
 
         let published = published.lock().expect("published state lock");
+        assert_eq!(published.len(), 1, "only the changed reading is published");
+        let (anchor, payloads) = &published[0];
+        assert_eq!(*payloads, vec![ctip_payload(9, 250)]);
         assert_eq!(
-            *published,
-            vec![vec![ctip_payload(9, 250)]],
-            "only the changed payload is published"
+            anchor.height,
+            Some(996_261),
+            "the batch carries the anchor of the reading it came from"
         );
         assert_eq!(
             *calls.lock().expect("state call lock"),
@@ -992,7 +1004,7 @@ mod tests {
             vec![0x11; 32],
             block_rx,
             shutdown_rx,
-            |_payloads| async { Ok(()) },
+            |_anchor, _payloads| async { Ok(()) },
         ));
 
         tokio::task::yield_now().await;
@@ -1018,7 +1030,7 @@ mod tests {
             vec![0x11; 32],
             block_rx,
             shutdown_rx,
-            |_payloads| async { Ok(()) },
+            |_anchor, _payloads| async { Ok(()) },
         ));
 
         block_tx.send(vec![0x22; 32]).expect("new block");

@@ -330,6 +330,7 @@ mod tests {
     fn envelope(payload: events::enforcer_event::Event) -> Event {
         Event {
             timestamp: 1_700_000_000_000,
+            observed_at_block: None,
             monitor_event: Some(MonitorEvent::Enforcer(events::EnforcerEvent {
                 event: Some(payload),
             })),
@@ -527,6 +528,7 @@ mod tests {
     fn rejects_empty_and_incomplete_envelopes() {
         let empty = Event {
             timestamp: 1,
+            observed_at_block: None,
             monitor_event: None,
         };
         assert!(
@@ -538,6 +540,7 @@ mod tests {
 
         let empty_enforcer = Event {
             timestamp: 1,
+            observed_at_block: None,
             monitor_event: Some(MonitorEvent::Enforcer(events::EnforcerEvent {
                 event: None,
             })),
@@ -583,7 +586,13 @@ mod tests {
 
     #[test]
     fn hexadecimal_field_list_covers_every_proto_bytes_field() {
-        let proto = include_str!("../../../proto/enforcer_extractor.proto");
+        // The envelope carries byte fields of its own, so scanning only the
+        // extractor contract would let one render as an array of numbers.
+        let proto = format!(
+            "{}\n{}",
+            include_str!("../../../proto/enforcer_extractor.proto"),
+            include_str!("../../../proto/event.proto")
+        );
         let proto_fields = proto
             .lines()
             .filter_map(|line| {

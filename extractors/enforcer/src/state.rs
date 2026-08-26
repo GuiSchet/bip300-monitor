@@ -8,6 +8,7 @@
 
 use anyhow::{Context, Result, bail};
 use shared::protobuf::enforcer_extractor as events;
+use shared::protobuf::event::ObservedBlock;
 
 use crate::EnforcerClient;
 use crate::convert;
@@ -17,11 +18,28 @@ const PAYLOADS_PER_SLOT: usize = 2;
 /// Number of mutable-state payloads that are not scoped to a slot.
 const GLOBAL_PAYLOADS: usize = 2;
 
+/// One reading of the mutable state, and the tip it is anchored to.
+pub(crate) struct Reading {
+    pub(crate) anchor: ObservedBlock,
+    pub(crate) payloads: Vec<events::EnforcerEvent>,
+}
+
+/// Read the enforcer tip and then the mutable state anchored to it.
+///
+/// The tip is read first so the anchor never claims a block newer than the
+/// state it labels.
+pub(crate) async fn collect(client: &mut EnforcerClient, sidechains: &[u8]) -> Result<Reading> {
+    let anchor = tip_anchor(&convert::chain_tip(client.get_chain_tip().await?)?)?;
+    let payloads = collect_payloads(client, sidechains).await?;
+
+    Ok(Reading { anchor, payloads })
+}
+
 /// Collect every mutable-state payload in a deterministic order.
 ///
 /// The order is stable for a fixed slot list, which is what lets [`Tracker`]
 /// diff two collections positionally.
-pub(crate) async fn collect(
+pub(crate) async fn collect_payloads(
     client: &mut EnforcerClient,
     sidechains: &[u8],
 ) -> Result<Vec<events::EnforcerEvent>> {
@@ -83,20 +101,40 @@ impl Tracker {
     }
 }
 
-/// Extract the mainchain block hash a live block event refers to.
-pub(crate) fn block_hash(payload: &events::EnforcerEvent) -> Result<&[u8]> {
+/// Read the anchor a chain-tip event describes.
+pub(crate) fn tip_anchor(payload: &events::EnforcerEvent) -> Result<ObservedBlock> {
+    let Some(events::enforcer_event::Event::ChainTip(chain_tip)) = payload.event.as_ref() else {
+        bail!("expected a chain-tip event while reading the enforcer tip");
+    };
+    let header = chain_tip
+        .header
+        .as_ref()
+        .context("chain-tip event is missing its block header")?;
+
+    Ok(ObservedBlock::at_height(header.hash.clone(), header.height))
+}
+
+/// Read the anchor a live block event describes.
+///
+/// A disconnect names only the block being disconnected, so its height is not
+/// available here and has to be recovered from the connect that preceded it.
+pub(crate) fn block_anchor(payload: &events::EnforcerEvent) -> Result<ObservedBlock> {
     match payload
         .event
         .as_ref()
         .context("live event is missing its concrete event")?
     {
-        events::enforcer_event::Event::BlockConnected(block) => Ok(&block
-            .header
-            .as_ref()
-            .context("connected block is missing its header")?
-            .hash),
-        events::enforcer_event::Event::BlockDisconnected(block) => Ok(&block.block_hash),
-        _ => bail!("a live event carried an unexpected payload for a block hash"),
+        events::enforcer_event::Event::BlockConnected(block) => {
+            let header = block
+                .header
+                .as_ref()
+                .context("connected block is missing its header")?;
+            Ok(ObservedBlock::at_height(header.hash.clone(), header.height))
+        }
+        events::enforcer_event::Event::BlockDisconnected(block) => {
+            Ok(ObservedBlock::without_height(block.block_hash.clone()))
+        }
+        _ => bail!("a live event carried an unexpected payload for a block anchor"),
     }
 }
 
@@ -104,7 +142,7 @@ pub(crate) fn block_hash(payload: &events::EnforcerEvent) -> Result<&[u8]> {
 mod tests {
     use shared::protobuf::enforcer_extractor as events;
 
-    use super::{Tracker, block_hash};
+    use super::{Tracker, block_anchor, tip_anchor};
 
     fn ctip(sidechain_number: u32, value_sats: u64) -> events::EnforcerEvent {
         events::EnforcerEvent {
@@ -120,17 +158,21 @@ mod tests {
         }
     }
 
-    fn connected(hash: u8) -> events::EnforcerEvent {
+    fn header(hash: u8, height: u32) -> events::BlockHeader {
+        events::BlockHeader {
+            hash: vec![hash; 32],
+            previous_hash: vec![hash.wrapping_sub(1); 32],
+            height,
+            chain_work: vec![0x44; 32],
+            timestamp: 1_750_000_000,
+        }
+    }
+
+    fn connected(hash: u8, height: u32) -> events::EnforcerEvent {
         events::EnforcerEvent {
             event: Some(events::enforcer_event::Event::BlockConnected(
                 events::BlockConnected {
-                    header: Some(events::BlockHeader {
-                        hash: vec![hash; 32],
-                        previous_hash: vec![hash.wrapping_sub(1); 32],
-                        height: 10,
-                        chain_work: vec![0x44; 32],
-                        timestamp: 1_750_000_000,
-                    }),
+                    header: Some(header(hash, height)),
                     sidechain_number: 9,
                     bmm_commitment: None,
                     events: Vec::new(),
@@ -195,8 +237,10 @@ mod tests {
     }
 
     #[test]
-    fn block_hashes_are_read_from_both_live_variants() {
-        assert_eq!(block_hash(&connected(0x88)).expect("hash"), [0x88; 32]);
+    fn anchors_carry_a_height_only_when_the_source_reports_one() {
+        let anchor = block_anchor(&connected(0x88, 501)).expect("connected anchor");
+        assert_eq!(anchor.hash, vec![0x88; 32]);
+        assert_eq!(anchor.height, Some(501));
 
         let disconnected = events::EnforcerEvent {
             event: Some(events::enforcer_event::Event::BlockDisconnected(
@@ -206,15 +250,35 @@ mod tests {
                 },
             )),
         };
-        assert_eq!(block_hash(&disconnected).expect("hash"), [0x77; 32]);
+        let anchor = block_anchor(&disconnected).expect("disconnected anchor");
+        assert_eq!(anchor.hash, vec![0x77; 32]);
+        assert_eq!(
+            anchor.height, None,
+            "a disconnect must not invent a height of zero"
+        );
 
-        let unexpected = events::EnforcerEvent {
-            event: Some(events::enforcer_event::Event::Ctip(events::CtipSnapshot {
-                sidechain_number: 9,
-                ctip: None,
+        let chain_tip = events::EnforcerEvent {
+            event: Some(events::enforcer_event::Event::ChainTip(events::ChainTip {
+                header: Some(header(0x99, 996_259)),
             })),
         };
-        assert!(block_hash(&unexpected).is_err());
-        assert!(block_hash(&events::EnforcerEvent { event: None }).is_err());
+        let anchor = tip_anchor(&chain_tip).expect("tip anchor");
+        assert_eq!(anchor.hash, vec![0x99; 32]);
+        assert_eq!(anchor.height, Some(996_259));
+    }
+
+    #[test]
+    fn anchors_reject_payloads_they_cannot_describe() {
+        assert!(block_anchor(&ctip(9, 100)).is_err());
+        assert!(block_anchor(&events::EnforcerEvent { event: None }).is_err());
+        assert!(tip_anchor(&connected(0x88, 501)).is_err());
+        assert!(
+            tip_anchor(&events::EnforcerEvent {
+                event: Some(events::enforcer_event::Event::ChainTip(events::ChainTip {
+                    header: None,
+                })),
+            })
+            .is_err()
+        );
     }
 }

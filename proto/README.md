@@ -18,6 +18,16 @@ variant in the first pilot.
 
 - `Event.timestamp` is the observation time in Unix milliseconds. It is not a
   Bitcoin block timestamp.
+- `Event.observed_at_block` is the mainchain block the observation is anchored
+  to, and it is what makes an event joinable to a height. For a block event it
+  is the block the event is about. For a state snapshot it is the enforcer's
+  tip when the state was read — an anchor, **not** a claim that the state is
+  exactly as of that height, because reading state is a poll and the enforcer
+  can advance between one field and the next.
+- `ObservedBlock.height` is absent when the source did not report one. A
+  disconnect names only the block being disconnected, so its height has to be
+  recovered from the connect that preceded it. An absent height is never
+  published as zero.
 - Hashes and transaction IDs are decoded from the enforcer's `ReverseHex`
   values and stored as 32 bytes in conventional display order.
 - Fields documented as consensus-encoded preserve the byte order and any
