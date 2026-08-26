@@ -38,6 +38,8 @@ jobs:
       deployment: ${{ steps.changes.outputs.deployment }}
       # This workflow or its helper scripts changed, so all checks should run.
       workflow: ${{ steps.changes.outputs.workflow }}
+      # Vendored proto files or their provenance metadata changed.
+      proto_vendor: ${{ steps.changes.outputs.proto_vendor }}
 
     steps:
       - name: Check out repository
@@ -62,6 +64,7 @@ jobs:
               echo "image_inputs=true"
               echo "deployment=true"
               echo "workflow=true"
+              echo "proto_vendor=true"
             } >> "${GITHUB_OUTPUT}"
           # For a PR, compare the complete branch with its target branch.
           elif [[ "${GITHUB_EVENT_NAME}" == "pull_request" ]]; then
@@ -264,8 +267,8 @@ jobs:
           sbom: false
 
   # The vendored enforcer API must track the enforcer commit the deployment
-  # pins. Editing proto/ and bumping ENFORCER_COMMIT classify differently, so
-  # this gate needs its own job to catch both.
+  # pins. Proto metadata is not a Rust or image input, but this gate still has
+  # to validate it independently from deployment changes.
   proto-vendor:
     name: Vendored proto check
     needs: changes
@@ -273,6 +276,7 @@ jobs:
       needs.changes.outputs.rust == 'true'
       || needs.changes.outputs.deployment == 'true'
       || needs.changes.outputs.workflow == 'true'
+      || needs.changes.outputs.proto_vendor == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 5
 
