@@ -101,6 +101,25 @@ impl Tracker {
     }
 }
 
+/// Slots the enforcer currently reports as active.
+///
+/// Returns `None` when the payload is not an active-sidechains snapshot, so a
+/// caller can scan a mixed collection without matching on the variant itself.
+pub(crate) fn active_slots(payload: &events::EnforcerEvent) -> Option<Vec<u8>> {
+    let events::enforcer_event::Event::ActiveSidechains(snapshot) = payload.event.as_ref()? else {
+        return None;
+    };
+    Some(
+        snapshot
+            .sidechains
+            .iter()
+            // A slot is one byte on the wire. One that does not fit is not a
+            // slot this monitor could ever subscribe to.
+            .filter_map(|sidechain| u8::try_from(sidechain.sidechain_number).ok())
+            .collect(),
+    )
+}
+
 /// Read the anchor a chain-tip event describes.
 pub(crate) fn tip_anchor(payload: &events::EnforcerEvent) -> Result<ObservedBlock> {
     let Some(events::enforcer_event::Event::ChainTip(chain_tip)) = payload.event.as_ref() else {
@@ -265,6 +284,38 @@ mod tests {
         let anchor = tip_anchor(&chain_tip).expect("tip anchor");
         assert_eq!(anchor.hash, vec![0x99; 32]);
         assert_eq!(anchor.height, Some(996_259));
+    }
+
+    #[test]
+    fn active_slots_are_read_only_from_an_active_sidechains_snapshot() {
+        let snapshot = events::EnforcerEvent {
+            event: Some(events::enforcer_event::Event::ActiveSidechains(
+                events::ActiveSidechainsSnapshot {
+                    sidechains: vec![
+                        events::ActiveSidechain {
+                            sidechain_number: 9,
+                            ..Default::default()
+                        },
+                        events::ActiveSidechain {
+                            sidechain_number: 98,
+                            ..Default::default()
+                        },
+                        // Wider than a slot can be, so not a slot to subscribe to.
+                        events::ActiveSidechain {
+                            sidechain_number: 300,
+                            ..Default::default()
+                        },
+                    ],
+                },
+            )),
+        };
+
+        assert_eq!(super::active_slots(&snapshot), Some(vec![9, 98]));
+        assert_eq!(super::active_slots(&ctip(9, 100)), None);
+        assert_eq!(
+            super::active_slots(&events::EnforcerEvent { event: None }),
+            None
+        );
     }
 
     #[test]

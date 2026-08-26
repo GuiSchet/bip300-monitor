@@ -73,6 +73,8 @@ impl StateSource for EnforcerClient {
 struct PreparedStartup {
     recorder: Recorder,
     client: EnforcerClient,
+    /// Resolved slots, which may have been discovered rather than configured.
+    sidechains: Vec<u8>,
     streams: Vec<(u8, EventStream)>,
     snapshot: InitialSnapshot,
     tip_before_snapshot: Vec<u8>,
@@ -105,6 +107,7 @@ pub async fn run(args: Args, mut shutdown_rx: watch::Receiver<bool>) -> Result<(
     let PreparedStartup {
         recorder,
         client,
+        sidechains,
         streams,
         snapshot,
         tip_before_snapshot,
@@ -129,7 +132,7 @@ pub async fn run(args: Args, mut shutdown_rx: watch::Receiver<bool>) -> Result<(
         .await
         .context("recording the initial enforcer snapshot")?;
     tracing::info!(
-        sidechain_count = args.sidechains.len(),
+        sidechain_count = sidechains.len(),
         "published initial enforcer snapshot"
     );
 
@@ -143,7 +146,7 @@ pub async fn run(args: Args, mut shutdown_rx: watch::Receiver<bool>) -> Result<(
     // only competes with buffered events, and the identity of an observation
     // makes an overlap idempotent rather than duplicated.
     let mut backfill_client = client.clone();
-    for sidechain in &args.sidechains {
+    for sidechain in &sidechains {
         backfill::run(
             &mut backfill_client,
             &recorder,
@@ -182,7 +185,7 @@ pub async fn run(args: Args, mut shutdown_rx: watch::Receiver<bool>) -> Result<(
     workers.spawn(monitor_state(
         client,
         recorder,
-        args.sidechains.clone(),
+        sidechains.clone(),
         tracker,
         snapshot_block,
         block_rx,
@@ -192,6 +195,36 @@ pub async fn run(args: Args, mut shutdown_rx: watch::Receiver<bool>) -> Result<(
     supervise_workers(workers).await?;
     tracing::info!("enforcer extractor stopped");
     Ok(())
+}
+
+/// Slots to observe: the configured list, or the enforcer's active sidechains
+/// when none was configured.
+async fn resolve_sidechains(client: &mut EnforcerClient, configured: &[u8]) -> Result<Vec<u8>> {
+    if !configured.is_empty() {
+        return Ok(configured.to_vec());
+    }
+
+    let payload = convert::active_sidechains(client.get_sidechains().await?)?;
+    let mut discovered = state::active_slots(&payload)
+        .context("expected an active-sidechains snapshot while discovering slots")?;
+    discovered.sort_unstable();
+    discovered.dedup();
+
+    if discovered.is_empty() {
+        // Not an error: a network before any activation genuinely has none. It
+        // is still worth saying plainly, because the alternative reading is
+        // that the monitor is broken.
+        tracing::warn!(
+            "no sidechain is active and no slot was configured; \
+             recording chain state only"
+        );
+    } else {
+        tracing::info!(
+            sidechains = ?discovered,
+            "discovered the active sidechain slots"
+        );
+    }
+    Ok(discovered)
 }
 
 async fn prepare_startup(args: &Args) -> Result<PreparedStartup> {
@@ -209,7 +242,11 @@ async fn prepare_startup(args: &Args) -> Result<PreparedStartup> {
         .await
         .context("connecting the enforcer client")?;
 
-    let observation = prepare_observation(&mut client, &args.sidechains)
+    let sidechains = resolve_sidechains(&mut client, &args.sidechains)
+        .await
+        .context("resolving the sidechain slots to observe")?;
+
+    let observation = prepare_observation(&mut client, &sidechains)
         .await
         .context("preparing enforcer subscriptions and initial snapshot")?;
     let PreparedObservation {
@@ -222,6 +259,7 @@ async fn prepare_startup(args: &Args) -> Result<PreparedStartup> {
     Ok(PreparedStartup {
         recorder,
         client,
+        sidechains,
         streams,
         snapshot,
         tip_before_snapshot,
@@ -420,6 +458,7 @@ where
         refreshed_at = block;
 
         let changed = tracker.take_changed(reading.payloads)?;
+        report_unobserved_slots(&sidechains, &changed);
         if changed.is_empty() {
             continue;
         }
@@ -507,6 +546,30 @@ fn enforcer_payload(event: &Event) -> Result<&events::EnforcerEvent> {
     match event.monitor_event.as_ref() {
         Some(MonitorEvent::Enforcer(payload)) => Ok(payload),
         None => bail!("event envelope does not contain a monitor event"),
+    }
+}
+
+/// Warn about a sidechain that activated into a slot nobody is subscribed to.
+///
+/// Subscriptions are opened once, at startup, so a slot that activates later is
+/// invisible until a restart. Spawning a worker for it mid-flight would be the
+/// obvious fix, but activation takes tens of thousands of blocks of miner ACKs,
+/// and a slot set that flapped through a reorg would turn dynamic
+/// re-subscription into a restart loop. Saying so loudly is the honest trade:
+/// the gap becomes visible instead of silent.
+fn report_unobserved_slots(observed: &[u8], changed: &[events::EnforcerEvent]) {
+    let Some(active) = changed.iter().find_map(state::active_slots) else {
+        return;
+    };
+
+    for slot in active {
+        if !observed.contains(&slot) {
+            tracing::warn!(
+                sidechain = slot,
+                "a sidechain is active in a slot this extractor is not subscribed to; \
+                 restart it to observe that slot"
+            );
+        }
     }
 }
 
@@ -608,7 +671,8 @@ mod tests {
 
     use super::{
         SourceFuture, StartupSource, StateSource, forward_stream, prepare_observation,
-        refresh_on_new_blocks, snapshot_tips_are_consistent, supervise_workers,
+        refresh_on_new_blocks, report_unobserved_slots, snapshot_tips_are_consistent,
+        supervise_workers,
     };
     use crate::proto::{common, mainchain};
     use crate::snapshot::InitialSnapshot;
@@ -1021,6 +1085,33 @@ mod tests {
             2,
             "one refresh per distinct block, none for the replayed snapshot tip"
         );
+    }
+
+    fn active_sidechains(slots: &[u32]) -> events::EnforcerEvent {
+        events::EnforcerEvent {
+            event: Some(events::enforcer_event::Event::ActiveSidechains(
+                events::ActiveSidechainsSnapshot {
+                    sidechains: slots
+                        .iter()
+                        .map(|slot| events::ActiveSidechain {
+                            sidechain_number: *slot,
+                            ..Default::default()
+                        })
+                        .collect(),
+                },
+            )),
+        }
+    }
+
+    #[test]
+    fn an_activation_into_an_unobserved_slot_is_reported() {
+        // A pure-function check would be better, but the report is a log line;
+        // this at least pins that the scan reaches the right payload and does
+        // not panic on collections that hold no snapshot.
+        report_unobserved_slots(&[9, 98], &[active_sidechains(&[9, 98])]);
+        report_unobserved_slots(&[9, 98], &[active_sidechains(&[9, 98, 5])]);
+        report_unobserved_slots(&[9], &[ctip_payload(9, 100)]);
+        report_unobserved_slots(&[], &[]);
     }
 
     #[tokio::test]

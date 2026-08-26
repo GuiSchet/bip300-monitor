@@ -39,13 +39,17 @@ pub struct Args {
     pub enforcer_endpoint: String,
 
     /// Sidechain slots to monitor. May be repeated or comma-separated.
+    ///
+    /// Left unset, the slots are discovered from the enforcer's active
+    /// sidechains at startup. A deployment that pins what it expects to observe
+    /// should still set this: then a slot going missing is a failure rather
+    /// than a silently smaller set.
     #[arg(
         long = "sidechain",
         env = "BIP300_MONITOR_SIDECHAINS",
         value_name = "SLOT",
         value_delimiter = ',',
-        num_args = 1..,
-        required = true
+        num_args = 1..
     )]
     pub sidechains: Vec<u8>,
 
@@ -197,12 +201,15 @@ mod tests {
     }
 
     #[test]
-    fn rejects_missing_and_duplicate_sidechains() {
-        assert!(
-            Args::try_parse_from(["enforcer-extractor"]).is_err(),
-            "at least one sidechain is required"
-        );
+    fn omitting_sidechains_defers_to_discovery() {
+        let args = Args::try_parse_from(["enforcer-extractor"])
+            .expect("sidechains may be discovered instead of configured");
+        assert!(args.sidechains.is_empty());
+        args.validate().expect("an empty slot list is valid");
+    }
 
+    #[test]
+    fn rejects_duplicate_sidechains() {
         let args =
             Args::try_parse_from(["enforcer-extractor", "--sidechain", "9", "--sidechain", "9"])
                 .expect("syntactically valid arguments");

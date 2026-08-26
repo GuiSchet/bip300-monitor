@@ -49,8 +49,12 @@ events until it receives
 `SIGINT` or `SIGTERM`. Whenever a block moves the mainchain tip it also re-reads
 the state that the tip changes — sidechain proposals, active sidechains, the
 CTIP of each slot, and the withdrawal bundles still being voted on — and
-republishes only what actually changed. Sidechain slots must be configured
-explicitly:
+republishes only what actually changed.
+
+Sidechain slots can be configured explicitly, or discovered from the enforcer's
+active sidechains when `--sidechain` is omitted. A deployment that pins what it
+expects to observe should still set them: then a slot going missing is a failure
+rather than a silently smaller set.
 
 ```bash
 cargo run -p enforcer-extractor -- \
@@ -176,9 +180,12 @@ deliberately out of scope.
 
 Planned work, in order:
 
-1. **Slot discovery.** Deriving the monitored slots from `GetSidechains`
-   instead of requiring `--sidechain`, so a newly activated sidechain is not
-   invisible until the next restart.
+1. **Re-subscribing without a restart.** Slots are resolved once, at startup, so
+   a sidechain that activates later is reported loudly but stays unobserved
+   until the extractor is restarted. Activation takes tens of thousands of
+   blocks of miner ACKs, so this is rare enough that spawning workers mid-flight
+   was not worth the restart loop a slot set flapping through a reorg would
+   cause — but it is still a gap.
 2. **An independent oracle.** The enforcer parses the BIP300 coinbase messages
    but only publishes aggregates: per-block M2, M4 and M7 votes never leave it,
    and BMM bid amounts appear in no API at all. Deriving that state from the raw
