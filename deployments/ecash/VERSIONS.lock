@@ -5,6 +5,10 @@ LOCKED_AT=2026-08-25
 
 NETWORK_ID=alphanet
 ECASH_NODE_CHAIN=main
+# Descriptive only: no RPC exposes the wire magic, so nothing here can assert
+# it. Network identity is proven by require_activation_block (exact block hash
+# at the fork height) plus require_node_peer, which only succeeds when the
+# node's compiled-in magic matches its peers.
 ECASH_NETWORK_MAGIC=eca5a104
 ECASH_NODE_P2P_PORT=8533
 ECASH_NODE_RPC_PORT=8532
@@ -14,16 +18,21 @@ ECASH_TIP_HEIGHT_URL=https://esplora.alpha.ecash.ninja/blocks/tip/height
 ECASH_EXPECTED_DATA_BYTES=1200000000000
 ECASH_MIN_FREE_PERCENT=20
 
+# Third-party images are pinned to the multi-architecture index digest, which
+# is what `docker pull <tag>` reports. The monitor images below have no index:
+# this repository's CI builds linux/amd64 only, so their tag resolves straight
+# to a single manifest. preflight.sh checks that every pin resolves to
+# linux/amd64 rather than to another platform's child.
 ECASH_NODE_REPO=https://github.com/ecash-com/bitcoin.git
 ECASH_NODE_BRANCH=alphanet
 ECASH_NODE_COMMIT=e9267a1f88f1856789348a61f04718529e1bd063
-ECASH_NODE_IMAGE=ghcr.io/ecash-com/bitcoin:alphanet@sha256:ee602372f061e479aaba274d87b2810db077b5ad36844a880e16d087d279dcef
+ECASH_NODE_IMAGE=ghcr.io/ecash-com/bitcoin:alphanet@sha256:22698f3306b4b6658a64beb33c506442b2385aae8b7fb786986ac1c5e8843304
 ECASH_NODE_EXPECTED_VERSION=31
 
 ENFORCER_REPO=https://github.com/LayerTwo-Labs/bip300301_enforcer.git
 ENFORCER_BRANCH=master
 ENFORCER_COMMIT=86543d13b32865ae629dbc8a373824e2c5aabb51
-ENFORCER_IMAGE=ghcr.io/layertwo-labs/bip300301_enforcer:sha-86543d1@sha256:c5b9925dc8d8751b7eecf72f7a1eda0964e27dad9342609c76490b1ebc33601c
+ENFORCER_IMAGE=ghcr.io/layertwo-labs/bip300301_enforcer:sha-86543d1@sha256:0a0ca57096f9a59bf0fb8db47b0a455b3b985899964277102e71b51c51c4f2d7
 ENFORCER_NETWORK_PRESET=alphanet
 ENFORCER_API_NETWORK=NETWORK_MAINNET
 

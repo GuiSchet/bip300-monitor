@@ -10,7 +10,9 @@ load_deployment_env
 require_command docker
 require_command jq
 
-info "locked deployment"
+# The magic is recorded for provenance, not verified: no RPC exposes it. The
+# activation block below is what actually proves which network this node is on.
+info "locked deployment (magic is descriptive)"
 jq -n \
     --arg network "${NETWORK_ID}" \
     --arg magic "${ECASH_NETWORK_MAGIC}" \

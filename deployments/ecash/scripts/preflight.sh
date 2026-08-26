@@ -131,8 +131,26 @@ for image in \
     "${NATS_IMAGE}" \
     "${ENFORCER_EXTRACTOR_IMAGE}" \
     "${EVENT_LOGGER_IMAGE}"; do
-    docker buildx imagetools inspect "${image}" >/dev/null ||
-        die "could not resolve pinned image: ${image}"
+    # The enforcer index publishes an arm64 child as well, and pinning that one
+    # by mistake would only surface as a runtime exec format error. Third-party
+    # pins are multi-architecture indexes; the monitor images have no index
+    # because this repository's CI builds linux/amd64 only.
+    image_manifest="$(
+        docker buildx imagetools inspect "${image}" --raw 2>/dev/null
+    )" || die "could not resolve pinned image: ${image}"
+    if jq -e 'has("manifests")' <<<"${image_manifest}" >/dev/null; then
+        jq -e '[.manifests[]
+            | select(.platform.os == "linux" and .platform.architecture == "amd64")]
+            | length == 1' <<<"${image_manifest}" >/dev/null ||
+            die "pinned index publishes no linux/amd64 image: ${image}"
+    else
+        image_platform="$(
+            docker buildx imagetools inspect "${image}" \
+                --format '{{.Image.Platform}}' 2>/dev/null
+        )"
+        [[ "${image_platform}" == *"amd64 linux"* ]] ||
+            die "pinned image does not resolve to linux/amd64: ${image} (${image_platform:-unknown})"
+    fi
 done
 
 info "${NETWORK_ID} deployment preflight passed"

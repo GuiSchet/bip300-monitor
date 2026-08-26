@@ -217,8 +217,10 @@ jobs:
             VERSION=${{ steps.meta.outputs.version }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha,scope=${{ matrix.target }}
-          cache-to: type=gha,mode=max,scope=${{ matrix.target }}
+          # Both targets share the `builder` stage, which compiles both binaries.
+          # A per-target scope would keep two copies of identical layers.
+          cache-from: type=gha,scope=workspace-builder
+          cache-to: type=gha,mode=max,scope=workspace-builder
           load: true
           push: false
           provenance: false
@@ -255,7 +257,7 @@ jobs:
             VERSION=${{ steps.meta.outputs.version }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha,scope=${{ matrix.target }}
+          cache-from: type=gha,scope=workspace-builder
           push: true
           # Keep a single image manifest until Docker Hub indexes attached attestations.
           provenance: false
