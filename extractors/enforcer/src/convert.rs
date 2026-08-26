@@ -328,7 +328,18 @@ fn enforcer_event(event: events::enforcer_event::Event) -> events::EnforcerEvent
 }
 
 fn network(value: i32) -> events::Network {
-    match mainchain::Network::try_from(value).unwrap_or(mainchain::Network::Unknown) {
+    // The vendored API can lag the deployed enforcer, so an unrecognized value
+    // is expected to be survivable. Record the raw number before collapsing it,
+    // or the evidence that a wider enum exists is lost entirely.
+    let Ok(network) = mainchain::Network::try_from(value) else {
+        tracing::warn!(
+            network = value,
+            "enforcer reported a network the vendored API does not define; publishing it as unknown"
+        );
+        return events::Network::Unknown;
+    };
+
+    match network {
         mainchain::Network::Unspecified => events::Network::Unspecified,
         mainchain::Network::Unknown => events::Network::Unknown,
         mainchain::Network::Mainnet => events::Network::Mainnet,
@@ -375,4 +386,34 @@ fn require_32_bytes(value: Vec<u8>, field: &str) -> Result<Vec<u8>> {
 
 fn required<T>(value: Option<T>, field: &str) -> Result<T> {
     value.with_context(|| format!("missing required field `{field}`"))
+}
+
+#[cfg(test)]
+mod tests {
+    use shared::protobuf::enforcer_extractor as events;
+
+    use super::network;
+    use crate::proto::mainchain;
+
+    #[test]
+    fn known_networks_map_and_undefined_values_collapse_to_unknown() {
+        for (upstream, expected) in [
+            (
+                mainchain::Network::Unspecified,
+                events::Network::Unspecified,
+            ),
+            (mainchain::Network::Unknown, events::Network::Unknown),
+            (mainchain::Network::Mainnet, events::Network::Mainnet),
+            (mainchain::Network::Regtest, events::Network::Regtest),
+            (mainchain::Network::Signet, events::Network::Signet),
+            (mainchain::Network::Testnet, events::Network::Testnet),
+        ] {
+            assert_eq!(network(upstream as i32), expected);
+        }
+
+        // A wider upstream enum must neither panic nor be mistaken for a
+        // defined network. The warning is what preserves the raw value.
+        assert_eq!(network(9_999), events::Network::Unknown);
+        assert_eq!(network(-1), events::Network::Unknown);
+    }
 }

@@ -106,6 +106,27 @@ jobs:
       - name: Install Rust toolchain
         run: rustup show active-toolchain
 
+      - name: Verify the pinned toolchain matches the build image
+        run: |
+          set -euo pipefail
+
+          channel="$(grep -oE '^channel = "[0-9]+\.[0-9]+\.[0-9]+"' \
+            rust-toolchain.toml | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || true)"
+          image="$(grep -oE '^ARG RUST_IMAGE=rust:[0-9]+\.[0-9]+\.[0-9]+' \
+            Dockerfile | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || true)"
+
+          if [[ -z "${channel}" ]] || [[ -z "${image}" ]]; then
+            echo "::error::could not read the toolchain channel or the RUST_IMAGE tag"
+            exit 1
+          fi
+
+          if [[ "${channel}" != "${image}" ]]; then
+            echo "::error::rust-toolchain.toml pins ${channel} but the Dockerfile builds with rust:${image}"
+            exit 1
+          fi
+
+          echo "Toolchain ${channel} matches the Dockerfile build image."
+
       - name: Check formatting
         run: cargo fmt --all -- --check
 
@@ -196,8 +217,10 @@ jobs:
             VERSION=${{ steps.meta.outputs.version }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha,scope=${{ matrix.target }}
-          cache-to: type=gha,mode=max,scope=${{ matrix.target }}
+          # Both targets share the `builder` stage, which compiles both binaries.
+          # A per-target scope would keep two copies of identical layers.
+          cache-from: type=gha,scope=workspace-builder
+          cache-to: type=gha,mode=max,scope=workspace-builder
           load: true
           push: false
           provenance: false
@@ -234,11 +257,33 @@ jobs:
             VERSION=${{ steps.meta.outputs.version }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha,scope=${{ matrix.target }}
+          cache-from: type=gha,scope=workspace-builder
           push: true
           # Keep a single image manifest until Docker Hub indexes attached attestations.
           provenance: false
           sbom: false
+
+  # The vendored enforcer API must track the enforcer commit the deployment
+  # pins. Editing proto/ and bumping ENFORCER_COMMIT classify differently, so
+  # this gate needs its own job to catch both.
+  proto-vendor:
+    name: Vendored proto check
+    needs: changes
+    if: >-
+      needs.changes.outputs.rust == 'true'
+      || needs.changes.outputs.deployment == 'true'
+      || needs.changes.outputs.workflow == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Verify the vendored enforcer API
+        run: ./.github/scripts/check-proto-vendor.sh --online
 
   # Deployment checks live under deployments/ecash. Keeping the
   # job separate means infrastructure PRs remain fast and cannot publish code.
@@ -298,6 +343,7 @@ jobs:
       - changes
       - quality
       - images
+      - proto-vendor
       - deployment
     runs-on: ubuntu-24.04
     timeout-minutes: 5
@@ -308,6 +354,7 @@ jobs:
           CHANGES_RESULT: ${{ needs.changes.result }}
           QUALITY_RESULT: ${{ needs.quality.result }}
           IMAGES_RESULT: ${{ needs.images.result }}
+          PROTO_VENDOR_RESULT: ${{ needs.proto-vendor.result }}
           DEPLOYMENT_RESULT: ${{ needs.deployment.result }}
         run: |
           set -euo pipefail
@@ -320,6 +367,7 @@ jobs:
           for result in \
             "${QUALITY_RESULT}" \
             "${IMAGES_RESULT}" \
+            "${PROTO_VENDOR_RESULT}" \
             "${DEPLOYMENT_RESULT}"; do
             if [[ "${result}" != "success" && "${result}" != "skipped" ]]; then
               echo "::error::a required CI job finished with ${result}"

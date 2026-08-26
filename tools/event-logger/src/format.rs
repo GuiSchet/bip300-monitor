@@ -30,11 +30,15 @@ pub struct RenderedEvent {
     /// Compact human-readable description.
     pub summary: String,
     /// Complete one-line JSON representation with byte fields in hexadecimal.
-    pub full_json: String,
+    /// Built only when the caller asked for it.
+    pub full_json: Option<String>,
 }
 
 /// Validate and render one monitor event.
-pub fn render(event: &Event) -> Result<RenderedEvent> {
+///
+/// The full JSON form costs a complete value tree plus a recursive walk that
+/// re-encodes every byte field, so it is built only when `full_events` is set.
+pub fn render(event: &Event, full_events: bool) -> Result<RenderedEvent> {
     let payload = match event.monitor_event.as_ref() {
         Some(MonitorEvent::Enforcer(payload)) => payload,
         None => bail!("event envelope does not contain a monitor event"),
@@ -45,9 +49,13 @@ pub fn render(event: &Event) -> Result<RenderedEvent> {
         .context("enforcer event does not contain a concrete event")?;
     let (kind, summary) = summarize(payload)?;
 
-    let mut full = serde_json::to_value(event).context("serializing the event as JSON")?;
-    encode_byte_fields(&mut full)?;
-    let full_json = serde_json::to_string(&full).context("encoding the event JSON")?;
+    let full_json = if full_events {
+        let mut full = serde_json::to_value(event).context("serializing the event as JSON")?;
+        encode_byte_fields(&mut full)?;
+        Some(serde_json::to_string(&full).context("encoding the event JSON")?)
+    } else {
+        None
+    };
 
     Ok(RenderedEvent {
         kind,
@@ -356,10 +364,10 @@ mod tests {
         ];
 
         for (payload, expected_kind) in variants {
-            let rendered = render(&envelope(payload)).expect("valid event");
+            let rendered = render(&envelope(payload), true).expect("valid event");
             assert_eq!(rendered.kind, expected_kind);
             assert!(!rendered.summary.is_empty());
-            assert!(!rendered.full_json.is_empty());
+            assert!(!rendered.full_json.expect("full form requested").is_empty());
         }
     }
 
@@ -384,14 +392,14 @@ mod tests {
             },
         ));
 
-        let rendered = render(&event).expect("valid connected block");
-        let json: serde_json::Value =
-            serde_json::from_str(&rendered.full_json).expect("valid JSON");
+        let rendered = render(&event, true).expect("valid connected block");
+        let full_json = rendered.full_json.expect("full form requested");
+        let json: serde_json::Value = serde_json::from_str(&full_json).expect("valid JSON");
         assert_eq!(json["timestamp"], 1_700_000_000_000_u64);
-        assert!(rendered.full_json.contains(&"ab".repeat(32)));
-        assert!(rendered.full_json.contains("\"bmm_commitment\":\"cdef\""));
-        assert!(rendered.full_json.contains(&"11".repeat(32)));
-        assert!(rendered.full_json.contains("\"address\":\"2233\""));
+        assert!(full_json.contains(&"ab".repeat(32)));
+        assert!(full_json.contains("\"bmm_commitment\":\"cdef\""));
+        assert!(full_json.contains(&"11".repeat(32)));
+        assert!(full_json.contains("\"address\":\"2233\""));
     }
 
     #[test]
@@ -418,9 +426,10 @@ mod tests {
                 }],
             },
         ));
-        let proposal = render(&proposal)
+        let proposal = render(&proposal, true)
             .expect("valid proposal snapshot")
-            .full_json;
+            .full_json
+            .expect("full form requested");
         assert!(proposal.contains("\"raw_description\":\"0102\""));
         assert!(proposal.contains(&"03".repeat(32)));
         assert!(proposal.contains("\"hash_id_1\":\"07\""));
@@ -451,11 +460,12 @@ mod tests {
                 },
             ));
 
-            let rendered = render(&event).expect("valid withdrawal event");
+            let rendered = render(&event, true).expect("valid withdrawal event");
             assert!(rendered.summary.contains("withdrawal_bundles=1"));
-            assert!(rendered.full_json.contains("\"m6id\":\"ccdd\""));
-            if rendered.full_json.contains("Succeeded") {
-                assert!(rendered.full_json.contains("\"transaction\":\"aabb\""));
+            let full_json = rendered.full_json.expect("full form requested");
+            assert!(full_json.contains("\"m6id\":\"ccdd\""));
+            if full_json.contains("Succeeded") {
+                assert!(full_json.contains("\"transaction\":\"aabb\""));
             }
         }
     }
@@ -467,7 +477,7 @@ mod tests {
             monitor_event: None,
         };
         assert!(
-            render(&empty)
+            render(&empty, false)
                 .expect_err("empty envelope")
                 .to_string()
                 .contains("envelope")
@@ -480,7 +490,7 @@ mod tests {
             })),
         };
         assert!(
-            render(&empty_enforcer)
+            render(&empty_enforcer, false)
                 .expect_err("empty enforcer event")
                 .to_string()
                 .contains("concrete event")
@@ -496,7 +506,7 @@ mod tests {
             },
         ));
         assert!(
-            render(&bad_hash)
+            render(&bad_hash, false)
                 .expect_err("31-byte hash")
                 .to_string()
                 .contains("32 bytes")
@@ -511,7 +521,7 @@ mod tests {
             },
         ));
         assert!(
-            render(&missing_nested)
+            render(&missing_nested, false)
                 .expect_err("missing sidechain event")
                 .to_string()
                 .contains("concrete event")

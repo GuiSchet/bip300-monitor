@@ -9,10 +9,12 @@ load_versions
 load_deployment_env
 require_command docker
 require_command jq
+require_command stat
 
 compose config --quiet
 require_node_ready
 require_node_history_ready
+require_rpc_cookie_readable
 
 info "pulling the pinned enforcer image"
 compose pull enforcer

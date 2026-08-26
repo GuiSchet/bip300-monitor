@@ -76,19 +76,32 @@ else
     info "warning: public ${NETWORK_ID} tip endpoint is unavailable; continuing because it is advisory"
 fi
 
+# The node only needs one reachable peer to bootstrap, and it also has
+# dnsseed=1. A single seed operator rebooting must not block the deployment.
+locked_peers=0
+reachable_peers=0
 while IFS= read -r peer; do
     peer_host="${peer%:*}"
     peer_port="${peer##*:}"
+    locked_peers="$((locked_peers + 1))"
     # Positional parameters are intentionally expanded by the inner Bash.
     # shellcheck disable=SC2016
-    timeout 5 bash -c 'exec 3<>"/dev/tcp/$1/$2"' _ \
-        "${peer_host}" "${peer_port}" ||
-        die "could not connect to ${peer}"
-    info "peer endpoint reachable: ${peer}"
+    if timeout 5 bash -c 'exec 3<>"/dev/tcp/$1/$2"' _ \
+        "${peer_host}" "${peer_port}" 2>/dev/null; then
+        reachable_peers="$((reachable_peers + 1))"
+        info "peer endpoint reachable: ${peer}"
+    else
+        info "warning: locked peer is unreachable: ${peer}"
+    fi
 done < <(network_peers)
+((reachable_peers > 0)) ||
+    die "none of the ${locked_peers} locked ${NETWORK_ID} peers are reachable"
+info "locked peers reachable: ${reachable_peers}/${locked_peers}"
 
+# --location matches how snapshot.sh downloads this same URL, so a redirect
+# cannot fail preflight on a snapshot that would fetch correctly.
 snapshot_headers="$(
-    curl --fail --silent --show-error --head --max-time 30 \
+    curl --fail --silent --show-error --head --location --max-time 30 \
         "${ECASH_SNAPSHOT_URL}"
 )" ||
     die "could not reach the pinned ${NETWORK_ID} snapshot"
@@ -118,8 +131,26 @@ for image in \
     "${NATS_IMAGE}" \
     "${ENFORCER_EXTRACTOR_IMAGE}" \
     "${EVENT_LOGGER_IMAGE}"; do
-    docker buildx imagetools inspect "${image}" >/dev/null ||
-        die "could not resolve pinned image: ${image}"
+    # The enforcer index publishes an arm64 child as well, and pinning that one
+    # by mistake would only surface as a runtime exec format error. Third-party
+    # pins are multi-architecture indexes; the monitor images have no index
+    # because this repository's CI builds linux/amd64 only.
+    image_manifest="$(
+        docker buildx imagetools inspect "${image}" --raw 2>/dev/null
+    )" || die "could not resolve pinned image: ${image}"
+    if jq -e 'has("manifests")' <<<"${image_manifest}" >/dev/null; then
+        jq -e '[.manifests[]
+            | select(.platform.os == "linux" and .platform.architecture == "amd64")]
+            | length == 1' <<<"${image_manifest}" >/dev/null ||
+            die "pinned index publishes no linux/amd64 image: ${image}"
+    else
+        image_platform="$(
+            docker buildx imagetools inspect "${image}" \
+                --format '{{.Image.Platform}}' 2>/dev/null
+        )"
+        [[ "${image_platform}" == *"amd64 linux"* ]] ||
+            die "pinned image does not resolve to linux/amd64: ${image} (${image_platform:-unknown})"
+    fi
 done
 
 info "${NETWORK_ID} deployment preflight passed"

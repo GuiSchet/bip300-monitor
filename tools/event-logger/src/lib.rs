@@ -57,7 +57,8 @@ pub async fn run(args: Args, mut shutdown_rx: watch::Receiver<bool>) -> Result<(
                 continue;
             }
         };
-        let Some(rendered) = render_event(&event, &mut invalid_event_count) else {
+        let Some(rendered) = render_event(&event, args.full_events, &mut invalid_event_count)
+        else {
             continue;
         };
         tracing::info!(
@@ -67,12 +68,12 @@ pub async fn run(args: Args, mut shutdown_rx: watch::Receiver<bool>) -> Result<(
             summary = %rendered.summary,
             "received enforcer event"
         );
-        if args.full_events {
+        if let Some(payload) = rendered.full_json.as_deref() {
             tracing::info!(
                 subject = %Subject::Enforcer,
                 timestamp_ms = event.timestamp,
                 event = rendered.kind,
-                payload = %rendered.full_json,
+                payload = %payload,
                 "received full enforcer event payload"
             );
         }
@@ -86,8 +87,12 @@ pub async fn run(args: Args, mut shutdown_rx: watch::Receiver<bool>) -> Result<(
     Ok(())
 }
 
-fn render_event(event: &Event, invalid_event_count: &mut u64) -> Option<format::RenderedEvent> {
-    match format::render(event) {
+fn render_event(
+    event: &Event,
+    full_events: bool,
+    invalid_event_count: &mut u64,
+) -> Option<format::RenderedEvent> {
+    match format::render(event, full_events) {
         Ok(rendered) => Some(rendered),
         Err(error) => {
             *invalid_event_count = invalid_event_count.saturating_add(1);
@@ -160,11 +165,37 @@ mod tests {
         };
         let mut invalid_event_count = 0;
 
-        assert!(render_event(&invalid, &mut invalid_event_count).is_none());
+        assert!(render_event(&invalid, false, &mut invalid_event_count).is_none());
         assert_eq!(invalid_event_count, 1);
-        let rendered = render_event(&valid, &mut invalid_event_count)
+        let rendered = render_event(&valid, false, &mut invalid_event_count)
             .expect("valid event after invalid event");
         assert_eq!(rendered.kind, "ctip");
         assert_eq!(invalid_event_count, 1);
+    }
+
+    #[test]
+    fn the_full_payload_is_built_only_when_full_events_is_set() {
+        let event = Event {
+            timestamp: 3,
+            monitor_event: Some(MonitorEvent::Enforcer(events::EnforcerEvent {
+                event: Some(events::enforcer_event::Event::Ctip(events::CtipSnapshot {
+                    sidechain_number: 9,
+                    ctip: None,
+                })),
+            })),
+        };
+        let mut invalid_event_count = 0;
+
+        let lean = render_event(&event, false, &mut invalid_event_count).expect("rendered");
+        assert_eq!(lean.kind, "ctip");
+        assert!(!lean.summary.is_empty());
+        assert!(
+            lean.full_json.is_none(),
+            "the logger never reads this field unless full events are enabled"
+        );
+
+        let full = render_event(&event, true, &mut invalid_event_count).expect("rendered");
+        assert!(full.full_json.is_some());
+        assert_eq!(invalid_event_count, 0);
     }
 }

@@ -134,8 +134,10 @@ cargo run --example get_chain_info -- \
 ## Next
 
 Planned work includes VM acceptance, operational metrics, gRPC resubscription,
-and gap backfill. Pending withdrawal vote counts require a future extension to
-the enforcer's public API.
+and gap backfill. Pending withdrawal vote counts are now available upstream:
+`ValidatorService.GetWithdrawalBundleProposals` returns `m6id`, `vote_count`,
+and `proposal_height`, and is part of the vendored API, so exposing them is
+extractor work rather than a blocked dependency.
 
 ## License
 

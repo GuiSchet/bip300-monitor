@@ -7,7 +7,7 @@ source "$(dirname -- "${BASH_SOURCE[0]}")/lib.sh"
 
 load_versions
 load_deployment_env
-for command_name in docker jq; do
+for command_name in docker jq stat; do
     require_command "${command_name}"
 done
 
@@ -21,6 +21,7 @@ config_json="$(compose config --format json)"
 jq -e '[.services[]?.ports[]?] | length == 0' <<<"${config_json}" >/dev/null ||
     die "the deployment unexpectedly publishes a host port"
 
+require_rpc_cookie_readable
 require_service_running enforcer
 chain_info="$(enforcer_rpc GetChainInfo)" || die "enforcer RPC is not ready"
 jq -e --arg network "${ENFORCER_API_NETWORK}" '.network == $network' \

@@ -113,8 +113,15 @@ render_node_config() {
             printf 'addnode=%s\n' "${peer}"
         done < <(network_peers)
     } >>"${temporary_config}"
-    chmod 0644 "${temporary_config}"
-    mv -- "${temporary_config}" "${destination}"
+    # The node bind-mounts this exact file, so the destination inode has to
+    # survive. A replacing rename would leave the running container reading the
+    # previous file while the host shows the new one.
+    if ! cat -- "${temporary_config}" >"${destination}"; then
+        rm -f -- "${temporary_config}"
+        die "could not write the node configuration: ${destination}"
+    fi
+    rm -f -- "${temporary_config}"
+    chmod 0644 "${destination}"
 }
 
 normalize_assignment_key() {
@@ -386,10 +393,30 @@ count_snapshot_events() {
     printf '%s\n' "${count}"
 }
 
+normalize_timestamp() {
+    local timestamp="$1"
+    local fraction
+    local prefix
+
+    # Docker renders StartedAt with Go's RFC3339Nano, which strips trailing
+    # zeros. Pad the fraction back to a fixed width so two instants can be
+    # compared as plain strings.
+    if [[ "${timestamp}" =~ ^([0-9-]+T[0-9:]+)(\.([0-9]+))?Z$ ]]; then
+        prefix="${BASH_REMATCH[1]}"
+        fraction="${BASH_REMATCH[3]}"
+        while ((${#fraction} < 9)); do
+            fraction="${fraction}0"
+        done
+        printf '%s.%sZ\n' "${prefix}" "${fraction}"
+        return 0
+    fi
+    printf '%s\n' "${timestamp}"
+}
+
 latest_timestamp() {
     local first="$1"
     local second="$2"
-    if [[ "${first}" > "${second}" ]]; then
+    if [[ "$(normalize_timestamp "${first}")" > "$(normalize_timestamp "${second}")" ]]; then
         printf '%s\n' "${first}"
     else
         printf '%s\n' "${second}"
@@ -413,6 +440,35 @@ require_activation_block() {
         die "${NETWORK_ID} activation block is unavailable"
     [[ "${activation_hash}" == "${ECASH_ACTIVATION_BLOCK_HASH}" ]] ||
         die "unexpected block at height ${ECASH_ACTIVATION_HEIGHT}: ${activation_hash}"
+}
+
+require_rpc_cookie_readable() {
+    local cookie
+    local cookie_gid
+    local cookie_mode
+    local cookie_uid
+    local mode
+
+    cookie="$(data_root)/rpc-cookie/.cookie"
+    [[ -f "${cookie}" ]] ||
+        die "the node RPC cookie does not exist yet: ${cookie}; wait for ecash-node to finish starting"
+
+    read -r cookie_uid cookie_gid cookie_mode < <(
+        stat --format='%u %g %a' "${cookie}"
+    )
+    mode="$((8#${cookie_mode}))"
+
+    if [[ "${cookie_uid}" == "${PUID}" ]] && ((mode & 0400)); then
+        return 0
+    fi
+    if [[ "${cookie_gid}" == "${PGID}" ]] && ((mode & 0040)); then
+        return 0
+    fi
+    if ((mode & 0004)); then
+        return 0
+    fi
+
+    die "the node RPC cookie ${cookie} is owned by ${cookie_uid}:${cookie_gid} with mode ${cookie_mode}, but the enforcer runs as ${PUID}:${PGID} and cannot read it; the node image did not honour UID/GID"
 }
 
 require_node_peer() {
