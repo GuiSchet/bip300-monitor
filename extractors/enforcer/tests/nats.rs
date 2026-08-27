@@ -9,8 +9,8 @@ use shared::nats_subjects::Subject;
 use shared::protobuf::enforcer_extractor::{
     Bip300Constants, ChainInfo, EnforcerEvent, Network, enforcer_event,
 };
-use shared::protobuf::event::{Event, event::MonitorEvent};
-use tokio::time::{sleep, timeout};
+use shared::protobuf::event::{Event, ObservedBlock, event::MonitorEvent};
+use tokio::time::{Instant, sleep, timeout};
 
 struct TestNatsServer {
     child: Option<Child>,
@@ -96,8 +96,11 @@ async fn publishes_and_decodes_the_monitor_envelope() {
             }),
         })),
     };
-    let expected =
-        Event::new(MonitorEvent::Enforcer(payload)).expect("system clock after Unix epoch");
+    let expected = Event::new(
+        MonitorEvent::Enforcer(payload),
+        Some(ObservedBlock::at_height(vec![0x11; 32], 996_259)),
+    )
+    .expect("system clock after Unix epoch");
 
     publisher
         .publish_and_flush(Subject::Enforcer, &expected)
@@ -137,12 +140,15 @@ async fn subscriber_reports_an_invalid_payload_and_continues() {
         .publish(Subject::Enforcer.to_string(), vec![0xff, 0x00].into())
         .await
         .expect("publish invalid payload");
-    let expected = Event::new(MonitorEvent::Enforcer(EnforcerEvent {
-        event: Some(enforcer_event::Event::ChainInfo(ChainInfo {
-            network: Network::Regtest as i32,
-            bip300_constants: Some(Bip300Constants::default()),
-        })),
-    }))
+    let expected = Event::new(
+        MonitorEvent::Enforcer(EnforcerEvent {
+            event: Some(enforcer_event::Event::ChainInfo(ChainInfo {
+                network: Network::Regtest as i32,
+                bip300_constants: Some(Bip300Constants::default()),
+            })),
+        }),
+        Some(ObservedBlock::at_height(vec![0x11; 32], 996_259)),
+    )
     .expect("system clock after Unix epoch");
     publisher
         .publish(
@@ -191,17 +197,36 @@ async fn detected_server_loss_makes_publish_and_flush_time_out() {
             bip300_constants: None,
         })),
     };
-    let event = Event::new(MonitorEvent::Enforcer(payload)).expect("system clock after Unix epoch");
+    let event = Event::new(
+        MonitorEvent::Enforcer(payload),
+        Some(ObservedBlock::at_height(vec![0x11; 32], 996_259)),
+    )
+    .expect("system clock after Unix epoch");
 
     server.stop();
-    sleep(Duration::from_millis(250)).await;
-    let error = timeout(
-        Duration::from_secs(2),
-        publisher.publish_and_flush(Subject::Enforcer, &event),
-    )
-    .await
-    .expect("publish and flush is bounded")
-    .expect_err("server loss must make the flush fail");
+
+    // Retried rather than slept on: what this waits for is async-nats noticing
+    // the socket is gone, and until it does, a publish lands in the reconnect
+    // buffer and the flush can still succeed. A fixed delay short enough to keep
+    // the test fast is not long enough on a loaded runner, so the loop waits for
+    // the transition itself and the deadline is what fails a real regression.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let error = loop {
+        let attempt = timeout(
+            Duration::from_secs(2),
+            publisher.publish_and_flush(Subject::Enforcer, &event),
+        )
+        .await
+        .expect("publish and flush is bounded");
+        match attempt {
+            Err(error) => break error,
+            Ok(()) => assert!(
+                Instant::now() < deadline,
+                "server loss never made the flush fail"
+            ),
+        }
+        sleep(Duration::from_millis(50)).await;
+    };
 
     assert!(
         format!("{error:#}").contains("flushing the Core NATS connection"),

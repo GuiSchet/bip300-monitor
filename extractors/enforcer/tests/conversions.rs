@@ -225,6 +225,60 @@ fn converts_present_and_absent_ctip() {
 }
 
 #[test]
+fn converts_pending_withdrawal_bundle_proposals() {
+    let converted = convert::withdrawal_bundle_proposals(
+        9,
+        mainchain::GetWithdrawalBundleProposalsResponse {
+            proposals: vec![
+                mainchain::get_withdrawal_bundle_proposals_response::ResponseItem {
+                    m6id: consensus_hex(&[0x99; 32]),
+                    vote_count: Some(5),
+                    proposal_height: Some(1_000),
+                },
+                mainchain::get_withdrawal_bundle_proposals_response::ResponseItem {
+                    m6id: consensus_hex(&[0xaa; 32]),
+                    vote_count: Some(0),
+                    proposal_height: Some(1_010),
+                },
+            ],
+        },
+    )
+    .expect("valid withdrawal bundle proposals");
+
+    let events::enforcer_event::Event::WithdrawalBundleProposals(snapshot) = event(converted)
+    else {
+        panic!("expected withdrawal bundle proposals");
+    };
+    assert_eq!(snapshot.sidechain_number, 9);
+    assert_eq!(
+        snapshot.proposals,
+        vec![
+            events::WithdrawalBundleProposal {
+                m6id: vec![0x99; 32],
+                vote_count: 5,
+                proposal_height: 1_000,
+            },
+            events::WithdrawalBundleProposal {
+                m6id: vec![0xaa; 32],
+                vote_count: 0,
+                proposal_height: 1_010,
+            },
+        ]
+    );
+
+    let empty = convert::withdrawal_bundle_proposals(
+        98,
+        mainchain::GetWithdrawalBundleProposalsResponse { proposals: vec![] },
+    )
+    .expect("having no pending bundle is valid");
+    let events::enforcer_event::Event::WithdrawalBundleProposals(snapshot) = event(empty) else {
+        panic!("expected withdrawal bundle proposals");
+    };
+    assert_eq!(snapshot.sidechain_number, 98);
+    assert!(snapshot.proposals.is_empty());
+}
+
+#[test]
 fn converts_block_connections_backfill_and_disconnections() {
     let upstream_header = header(0x77, 500);
     let upstream_info = block_info();
@@ -316,6 +370,61 @@ fn converts_block_connections_backfill_and_disconnections() {
 }
 
 #[test]
+fn a_block_holding_nothing_for_the_slot_still_converts_to_one_event() {
+    // The blocks a backfill exists to recover: a mainchain block with no BMM
+    // commitment, no deposit and no bundle for this slot. `GetBlockInfo` reports
+    // them and `SubscribeEvents` reports them, so the record must hold one
+    // `block_connected` for each, or the gap the backfill closed is still a gap.
+    let empty = mainchain::BlockInfo {
+        bmm_commitment: None,
+        events: Vec::new(),
+    };
+    let upstream_header = header(0x77, 500);
+
+    let recovered = convert::block_info(
+        9,
+        mainchain::GetBlockInfoResponse {
+            infos: vec![mainchain::get_block_info_response::Info {
+                header_info: Some(upstream_header.clone()),
+                block_info: Some(empty.clone()),
+            }],
+        },
+    )
+    .expect("an empty block converts");
+    assert_eq!(recovered.len(), 1);
+
+    let live = convert::subscription_event(
+        9,
+        mainchain::SubscribeEventsResponse {
+            event: Some(mainchain::subscribe_events_response::Event {
+                event: Some(
+                    mainchain::subscribe_events_response::event::Event::ConnectBlock(
+                        mainchain::subscribe_events_response::event::ConnectBlock {
+                            header_info: Some(upstream_header),
+                            block_info: Some(empty),
+                        },
+                    ),
+                ),
+            }),
+        },
+    )
+    .expect("an empty live block converts");
+    assert_eq!(recovered, vec![live.clone()]);
+
+    let events::enforcer_event::Event::BlockConnected(connected) = event(live) else {
+        panic!("expected connected block");
+    };
+    assert_eq!(connected.sidechain_number, 9);
+    assert_eq!(connected.bmm_commitment, None);
+    assert!(connected.events.is_empty());
+    assert_eq!(
+        connected.header.expect("header").height,
+        500,
+        "the block is still anchored, which is what makes it a checkpoint"
+    );
+}
+
+#[test]
 fn rejects_missing_and_malformed_required_fields() {
     let missing = convert::chain_tip(mainchain::GetChainTipResponse {
         block_header_info: None,
@@ -355,5 +464,25 @@ fn rejects_missing_and_malformed_required_fields() {
         wrong_length
             .to_string()
             .contains("must contain exactly 32 bytes")
+    );
+
+    // A vote count of zero is meaningful, so an absent one must never be
+    // published as one.
+    let missing_vote_count = convert::withdrawal_bundle_proposals(
+        9,
+        mainchain::GetWithdrawalBundleProposalsResponse {
+            proposals: vec![
+                mainchain::get_withdrawal_bundle_proposals_response::ResponseItem {
+                    m6id: consensus_hex(&[0x99; 32]),
+                    vote_count: None,
+                    proposal_height: Some(1_000),
+                },
+            ],
+        },
+    )
+    .expect_err("a missing vote count must fail");
+    assert!(
+        format!("{missing_vote_count:#}")
+            .contains("missing required field `withdrawal_bundle_proposal.vote_count`")
     );
 }

@@ -125,6 +125,29 @@ if missing_cookie_is_readable >/dev/null 2>&1; then
     die "RPC cookie check accepted a missing cookie"
 fi
 
+# psql does not interpolate `:'variable'` inside a `--command` string, so a
+# record helper that used one would either fail outright or, worse, invite
+# someone to splice shell values into the SQL instead.
+if grep -nE 'psql[^|]*--command' "${DEPLOYMENT_ROOT}/scripts/lib.sh"; then
+    die "record helpers must pass SQL on stdin so psql interpolates its variables"
+fi
+grep -Fq 'record_event_count_at' "${DEPLOYMENT_ROOT}/scripts/verify.sh" ||
+    die "verify.sh does not assert the record; log lines only show live fan-out"
+# An `observed_at` window would read a republished snapshot -- which inserts
+# nothing, by design -- as a missing one.
+if grep -nE '^[^#]*observed_at' "${DEPLOYMENT_ROOT}/scripts/lib.sh"; then
+    die "record assertions must be scoped by block, not by an observed_at window"
+fi
+grep -Fq 'record_has_block' "${DEPLOYMENT_ROOT}/scripts/verify-live.sh" ||
+    die "verify-live.sh does not assert that the live block reached the record"
+# Both fail the deployment before `up`. Dropped, each one comes back as a
+# container that dies or never goes healthy, with the real cause nowhere in the
+# error.
+for preflight_check in require_postgres_secret_readable require_pinned_images_current; do
+    grep -Fq "${preflight_check}" "${DEPLOYMENT_ROOT}/scripts/preflight.sh" ||
+        die "preflight.sh no longer calls ${preflight_check}"
+done
+
 live_hash='0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef'
 extractor_slot_9="INFO enforcer_extractor: published live enforcer event event=\"block_connected\" sidechain=9 height=123 block_hash=${live_hash}"
 extractor_slot_98="INFO enforcer_extractor: published live enforcer event event=\"block_connected\" sidechain=98 height=123 block_hash=${live_hash}"
@@ -177,6 +200,8 @@ snapshot_logs="$(printf '%s\n' \
     'INFO received enforcer event event="active_sidechains" summary=sidechain_count=0' \
     'INFO received enforcer event event="ctip" summary=sidechain=9 present=false' \
     'INFO received enforcer event event="ctip" summary=sidechain=98 present=false' \
+    'INFO received enforcer event event="withdrawal_bundle_proposals" summary=sidechain=9 proposal_count=1 max_vote_count=3 oldest_proposal_height=996100' \
+    'INFO received enforcer event event="withdrawal_bundle_proposals" summary=sidechain=98 proposal_count=0 max_vote_count=0 oldest_proposal_height=0' \
     'INFO received enforcer event event="block_connected" summary=sidechain=9 height=996260')"
 for snapshot_kind in chain_info chain_tip sidechain_proposals active_sidechains; do
     [[ "$(count_snapshot_events "${snapshot_logs}" "${snapshot_kind}")" == 1 ]] ||
@@ -190,10 +215,27 @@ done
     die "semantic snapshot matcher accepted the wrong CTIP slot"
 [[ "$(count_snapshot_events "${snapshot_logs}" block_connected 9)" == 1 ]] ||
     die "semantic snapshot matcher did not isolate a live event kind"
+for bundle_slot in 9 98; do
+    has_snapshot_event \
+        "${snapshot_logs}" withdrawal_bundle_proposals "${bundle_slot}" ||
+        die "semantic snapshot matcher rejected bundle proposals slot ${bundle_slot}"
+done
+if has_snapshot_event "${snapshot_logs}" withdrawal_bundle_proposals 8; then
+    die "semantic snapshot matcher accepted the wrong bundle proposals slot"
+fi
 
 duplicate_chain_info="${snapshot_logs}"$'\nINFO received enforcer event event=chain_info summary=duplicate'
 [[ "$(count_snapshot_events "${duplicate_chain_info}" chain_info)" == 2 ]] ||
     die "semantic snapshot matcher did not expose duplicate snapshot events"
+
+# A refreshed snapshot kind may appear more than once in a verification window,
+# so the presence check must accept repeats while still rejecting absence.
+refreshed_ctip="${snapshot_logs}"$'\nINFO received enforcer event event="ctip" summary=sidechain=9 present=true'
+has_snapshot_event "${refreshed_ctip}" ctip 9 ||
+    die "snapshot presence check rejected a refreshed snapshot kind"
+if has_snapshot_event "${snapshot_logs}" ctip 8; then
+    die "snapshot presence check accepted a missing snapshot kind"
+fi
 
 logs_contain_snapshot_completion \
     'INFO sidechain_count=2 published initial enforcer snapshot' 2 ||
@@ -221,7 +263,7 @@ fi
     die "latest timestamp helper selected a stale container instance"
 
 config_json="$(compose config --format json)"
-jq -e '.services | keys == ["ecash-node", "enforcer", "enforcer-extractor", "event-logger", "nats"]' \
+jq -e '.services | keys == ["ecash-node", "enforcer", "enforcer-extractor", "event-logger", "nats", "postgres"]' \
     <<<"${config_json}" >/dev/null
 jq -e --arg image "${ECASH_NODE_IMAGE}" \
     '.services["ecash-node"].image == $image' <<<"${config_json}" >/dev/null
@@ -229,6 +271,8 @@ jq -e --arg image "${ENFORCER_IMAGE}" \
     '.services.enforcer.image == $image' <<<"${config_json}" >/dev/null
 jq -e --arg image "${NATS_IMAGE}" \
     '.services.nats.image == $image' <<<"${config_json}" >/dev/null
+jq -e --arg image "${POSTGRES_IMAGE}" \
+    '.services.postgres.image == $image' <<<"${config_json}" >/dev/null
 jq -e --arg image "${ENFORCER_EXTRACTOR_IMAGE}" \
     '.services["enforcer-extractor"].image == $image' \
     <<<"${config_json}" >/dev/null
@@ -274,12 +318,44 @@ jq -e '.services.nats.command
 jq -e '.services.nats.healthcheck.test | any(contains("/healthz"))' \
     <<<"${config_json}" >/dev/null
 
+# The extractor reads the generated Postgres secret, so it takes PGID as its
+# group while keeping a UID of its own. The logger touches no secret.
+jq -e --arg gid "${PGID}" \
+    '.services["enforcer-extractor"].user == "10001:" + $gid' \
+    <<<"${config_json}" >/dev/null
+jq -e '.services["event-logger"].user == "10001:10001"' \
+    <<<"${config_json}" >/dev/null
 for monitor_service in enforcer-extractor event-logger; do
     jq -e --arg service "${monitor_service}" \
-        '.services[$service].user == "10001:10001"
-         and .services[$service].read_only == true' \
+        '.services[$service].read_only == true' \
         <<<"${config_json}" >/dev/null
 done
+
+# Postgres is the authoritative record: it must be reachable only from the
+# internal network, carry no inline password, and read the generated secret.
+jq -e --arg uid "${PUID}" --arg gid "${PGID}" \
+    '.services.postgres.user == $uid + ":" + $gid' <<<"${config_json}" >/dev/null
+jq -e '.services.postgres.environment
+    | has("POSTGRES_PASSWORD") | not' <<<"${config_json}" >/dev/null
+jq -e '.services.postgres.environment.POSTGRES_PASSWORD_FILE
+    == "/run/secrets/postgres-password"' <<<"${config_json}" >/dev/null
+jq -e '.services.postgres.security_opt
+    | index("no-new-privileges:true") != null' <<<"${config_json}" >/dev/null
+jq -e '.services.postgres.healthcheck.test | any(contains("pg_isready"))' \
+    <<<"${config_json}" >/dev/null
+jq -e --arg source "${ECASH_DATA_ROOT}/secrets/postgres-password" \
+    '[.services.postgres.volumes[]
+      | select(.source == $source and .read_only == true)] | length == 1' \
+    <<<"${config_json}" >/dev/null
+jq -e --arg source "${ECASH_DATA_ROOT}/secrets/postgres-password" \
+    '[.services["enforcer-extractor"].volumes[]
+      | select(.source == $source and .read_only == true)] | length == 1' \
+    <<<"${config_json}" >/dev/null
+jq -e '.services["enforcer-extractor"].environment
+    | has("BIP300_MONITOR_POSTGRES_PASSWORD") | not' \
+    <<<"${config_json}" >/dev/null
+jq -e '.services["enforcer-extractor"].depends_on.postgres.condition
+    == "service_healthy"' <<<"${config_json}" >/dev/null
 
 jq -e '.services["event-logger"].depends_on.nats.condition == "service_healthy"' \
     <<<"${config_json}" >/dev/null
@@ -294,6 +370,31 @@ jq -e '.services["enforcer-extractor"].environment.BIP300_MONITOR_NATS_URL == "n
     and .services["enforcer-extractor"].environment.BIP300_MONITOR_ENFORCER_ENDPOINT == "http://enforcer:50051"
     and .services["enforcer-extractor"].environment.BIP300_MONITOR_SIDECHAINS == "9,98"' \
     <<<"${config_json}" >/dev/null
+# The bound on how much history one restart recovers. Left unpinned it would
+# only ever be the compiled-in default, and an operator closing a long outage
+# has to be able to raise it.
+jq -e '.services["enforcer-extractor"].environment.BIP300_MONITOR_BACKFILL_MAX_BLOCKS == "2000"' \
+    <<<"${config_json}" >/dev/null
+
+# Neither monitor service exposes a port, so each one proves it is alive by
+# refreshing a file that only successful work touches. Without the healthcheck
+# `restart: unless-stopped` covers a process that exits and nothing else.
+for monitor_service in enforcer-extractor event-logger; do
+    jq -e --arg service "${monitor_service}" \
+        '.services[$service].environment.BIP300_MONITOR_LIVENESS_FILE == "/tmp/liveness"' \
+        <<<"${config_json}" >/dev/null ||
+        die "${monitor_service} does not write the liveness file its healthcheck reads"
+    jq -e --arg service "${monitor_service}" \
+        '.services[$service].healthcheck.test | any(contains("/tmp/liveness"))' \
+        <<<"${config_json}" >/dev/null ||
+        die "${monitor_service} has no healthcheck reading the liveness file"
+    # The file lives on the tmpfs, so a read-only root filesystem still allows
+    # the write.
+    jq -e --arg service "${monitor_service}" \
+        '.services[$service].tmpfs | any(startswith("/tmp"))' \
+        <<<"${config_json}" >/dev/null ||
+        die "${monitor_service} has no writable /tmp for the liveness file"
+done
 
 for expected_arg in \
     "--network-preset=${ENFORCER_NETWORK_PRESET}" \
@@ -349,6 +450,7 @@ actual_peer_count="$(grep -c '^addnode=' "${rendered_node_config}")"
 [[ "${ENFORCER_IMAGE}" == *":sha-${ENFORCER_COMMIT:0:7}@sha256:"* ]]
 [[ "${ENFORCER_EXTRACTOR_IMAGE}" == *":sha-${MONITOR_IMAGE_COMMIT:0:12}@sha256:"* ]]
 [[ "${EVENT_LOGGER_IMAGE}" == *":sha-${MONITOR_IMAGE_COMMIT:0:12}@sha256:"* ]]
+[[ "${POSTGRES_IMAGE}" == *"@sha256:"* ]]
 
 legacy_prefix=DRYNET
 if grep -R -n --exclude-dir=data "${legacy_prefix}_" "${DEPLOYMENT_ROOT}"; then

@@ -1,4 +1,8 @@
 //! Read-only client for the enforcer's validator service.
+//!
+//! `ValidatorService` also exposes `GetCoinbasePSBT`, which builds a miner's
+//! voting intent, and `Stop`, which shuts the enforcer down. Neither belongs in
+//! an observer: this client must never gain a wrapper for them.
 
 use std::future::Future;
 use std::time::Duration;
@@ -62,7 +66,15 @@ impl EnforcerClient {
             .map(tonic::Response::into_inner)
     }
 
-    /// Fetch block information filtered for one sidechain slot.
+    /// Fetch a block and up to `max_ancestors` of its ancestors, newest-first,
+    /// with each block's contents narrowed to one sidechain slot.
+    ///
+    /// Every walked block is reported, including the ones that hold nothing for
+    /// the slot, which is what makes this the call a backfill can trust.
+    /// `GetTwoWayPegData` looks like the better fit and is not: it omits those
+    /// blocks entirely. The walk stops early, without an error, at the first
+    /// ancestor whose block info the enforcer does not hold, so a caller that
+    /// needs a specific range has to check what came back.
     pub async fn get_block_info(
         &mut self,
         block_hash: impl Into<String>,
@@ -113,6 +125,30 @@ impl EnforcerClient {
             .await
             .with_context(|| {
                 format!("calling ValidatorService.GetCtip for sidechain {sidechain_number}")
+            })
+            .map(tonic::Response::into_inner)
+    }
+
+    /// Fetch the withdrawal bundles of one sidechain slot that are still being
+    /// voted on.
+    ///
+    /// The terminal outcome of a bundle arrives as a block event; this is the
+    /// only way to observe the vote count while the bundle is still pending.
+    pub async fn get_withdrawal_bundle_proposals(
+        &mut self,
+        sidechain_number: u8,
+    ) -> Result<mainchain::GetWithdrawalBundleProposalsResponse> {
+        let request = mainchain::GetWithdrawalBundleProposalsRequest {
+            sidechain_id: Some(u32::from(sidechain_number)),
+        };
+        self.inner
+            .get_withdrawal_bundle_proposals(self.unary_request(request))
+            .await
+            .with_context(|| {
+                format!(
+                    "calling ValidatorService.GetWithdrawalBundleProposals for sidechain \
+                     {sidechain_number}"
+                )
             })
             .map(tonic::Response::into_inner)
     }

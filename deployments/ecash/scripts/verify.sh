@@ -13,10 +13,11 @@ require_command jq
 compose config --quiet
 "${DEPLOYMENT_ROOT}/scripts/verify-core.sh"
 
-for service in nats event-logger enforcer-extractor; do
+for service in postgres nats event-logger enforcer-extractor; do
     require_service_running "${service}"
 done
 
+wait_for_postgres_health
 wait_for_nats_health
 wait_for_event_logger_subscription
 wait_for_nats_client bip300-monitor-enforcer-extractor
@@ -61,15 +62,49 @@ while :; do
         "${extractor_logs}" "${#sidechains[@]}"; then
         snapshot_complete=false
     fi
-    for event_kind in chain_info chain_tip sidechain_proposals active_sidechains; do
-        if [[ "$(count_snapshot_events "${logger_logs}" "${event_kind}")" != 1 ]]; then
+
+    # The record is the authoritative check, asked about the block the snapshot
+    # is anchored to rather than about a time window. Recording is idempotent, so
+    # a restart at an unchanged tip inserts nothing, and a window would read that
+    # healthy state as a missing snapshot. The block is the stricter scope
+    # anyway, because a previous run's rows are at a previous block. Which
+    # instance published is a separate question, already answered above by the
+    # log window.
+    snapshot_anchor=''
+    if [[ "${snapshot_complete}" == true ]]; then
+        snapshot_anchor="$(record_snapshot_anchor)" || snapshot_anchor=''
+        if [[ ! "${snapshot_anchor}" =~ ^[[:xdigit:]]{64}$ ]]; then
             snapshot_complete=false
-            break
         fi
-    done
+    fi
+    # Exactly one, not at least one: a second row at the same block would mean
+    # the identity constraint stopped collapsing a republished snapshot, which is
+    # the shape of unbounded growth rather than of a missing event.
+    if [[ "${snapshot_complete}" == true ]]; then
+        for event_kind in chain_info chain_tip sidechain_proposals active_sidechains; do
+            if [[ "$(record_event_count_at "${event_kind}" "${snapshot_anchor}")" != 1 ]]; then
+                snapshot_complete=false
+                break
+            fi
+        done
+    fi
     if [[ "${snapshot_complete}" == true ]]; then
         for sidechain in "${sidechains[@]}"; do
-            if [[ "$(count_snapshot_events "${logger_logs}" ctip "${sidechain}")" != 1 ]]; then
+            if [[ "$(record_event_count_at ctip "${snapshot_anchor}" "${sidechain}")" != 1 ]] ||
+                [[ "$(record_event_count_at withdrawal_bundle_proposals \
+                    "${snapshot_anchor}" "${sidechain}")" != 1 ]]; then
+                snapshot_complete=false
+                break
+            fi
+        done
+    fi
+
+    # Independently, the logger proves that live fan-out reached a consumer.
+    # It is a separate path from the record, so it gets a separate assertion
+    # rather than being folded into the one above.
+    if [[ "${snapshot_complete}" == true ]]; then
+        for event_kind in chain_info active_sidechains; do
+            if ! has_snapshot_event "${logger_logs}" "${event_kind}"; then
                 snapshot_complete=false
                 break
             fi
@@ -90,9 +125,9 @@ while :; do
             "${logger_started_before}" != "${extractor_started_before}" ]]; then
             die "event-logger started after enforcer-extractor, so it never received the initial snapshot and Core NATS cannot replay it; restart the enforcer-extractor container to republish, then run 'just verify' again"
         fi
-        die "current monitor instances did not deliver one complete semantic snapshot after ${wait_seconds}s"
+        die "current monitor instances did not record one complete semantic snapshot after ${wait_seconds}s"
     fi
     sleep 2
 done
 
-info "${NETWORK_ID} observation pipeline verification passed (fresh semantic snapshot, slots=${configured_sidechains})"
+info "${NETWORK_ID} observation pipeline verification passed (fresh semantic snapshot recorded and fanned out, slots=${configured_sidechains})"

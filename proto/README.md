@@ -18,11 +18,49 @@ variant in the first pilot.
 
 - `Event.timestamp` is the observation time in Unix milliseconds. It is not a
   Bitcoin block timestamp.
+- `Event.observed_at_block` is the mainchain block the observation is anchored
+  to, and it is what makes an event joinable to a height. For a block event it
+  is the block the event is about. For a state snapshot it is the enforcer's
+  tip when the state was read — an anchor, **not** a claim that the state is
+  exactly as of that height, because reading state is a poll and the enforcer
+  can advance between one field and the next.
+- `ObservedBlock.height` is absent when the source did not report one. A
+  disconnect names only the block being disconnected, so its height has to be
+  recovered from the connect that preceded it. An absent height is never
+  published as zero.
 - Hashes and transaction IDs are decoded from the enforcer's `ReverseHex`
   values and stored as 32 bytes in conventional display order.
 - Fields documented as consensus-encoded preserve the byte order and any
   length prefix supplied by the enforcer's `ConsensusHex` value.
-- Proposal, active-sidechain, and CTIP messages are snapshots, not deltas.
+- Proposal, active-sidechain, CTIP, and withdrawal-bundle-proposal messages are
+  snapshots, not deltas. They are published once at startup and then again
+  whenever a connected or disconnected block changed their value, so a consumer
+  sees the latest state without diffing. An unchanged snapshot is not
+  republished, and `ChainInfo` and `ChainTip` are published only at startup.
+- Because a refresh is a poll rather than a per-block query, a snapshot
+  describes the state at the moment it was read. Under fast blocks two heights
+  can coalesce into one refresh, so consecutive snapshots are consecutive
+  observations, not consecutive blocks. This is a property of the enforcer API,
+  not of the monitor: `GetCtip`, `GetSidechains`, `GetSidechainProposals` and
+  `GetWithdrawalBundleProposals` only answer for the current tip, and no RPC
+  answers "the state at block X", so a value that changed and reverted inside one
+  coalesced window leaves no observation behind.
+- A snapshot's `observed_at_block` is the tip it was read against, which under a
+  moving chain can be a later block than the one whose arrival triggered the
+  read — and can therefore be a block with no `BlockConnected` of its own yet.
+- Reorgs are recorded, not repaired. `BlockDisconnected` says a block left the
+  chain; the `BlockConnected` that preceded it stays in the record, unmarked,
+  because the envelope is a log of observations rather than a view of the current
+  chain. Reconstructing the surviving chain is the consumer's job. Two
+  consequences follow: a block that is disconnected and then connected again
+  produces no second `BlockConnected`, since it is the same observation of the
+  same block; and the backfill checkpoint, being the highest recorded height,
+  can name an orphan until a later block outgrows it.
+- `WithdrawalBundleProposalsSnapshot` carries the bundles still being voted on.
+  Its `vote_count` is read against
+  `Bip300Constants.withdrawal_bundle_inclusion_threshold` and its
+  `proposal_height` against `withdrawal_bundle_max_age`. The terminal outcome of
+  a bundle stays where it was, in `BlockConnected.events`.
 - Block events are scoped to the explicitly configured sidechain slot because
   the upstream subscription is also per slot.
 - Block event order is preserved within a sidechain slot. A reorganization is

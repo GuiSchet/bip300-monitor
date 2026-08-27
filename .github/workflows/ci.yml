@@ -80,17 +80,37 @@ jobs:
             git ls-files | .github/scripts/classify-changes.sh
           fi
 
-  # Run the expensive Rust suite only when code, image inputs, or CI behavior
-  # changed. A deployment-only PR skips this job.
+  # Run the expensive Rust suite when code, image inputs, or CI behavior
+  # changed -- and also on a deployment-only change, because the deployment
+  # checks assert things about the binaries: `static-check.sh` pins the
+  # extractor's environment variables and `verify-live.sh` matches its log
+  # lines. Skipping the Rust suite there let a rename break the deployment with
+  # both CI paths green.
   quality:
     name: Rust quality checks
     needs: changes
     if: >-
       needs.changes.outputs.rust == 'true'
       || needs.changes.outputs.image_inputs == 'true'
+      || needs.changes.outputs.deployment == 'true'
       || needs.changes.outputs.workflow == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 20
+
+    # The record integration tests need a real server; pinned by digest like
+    # every other image the project runs.
+    services:
+      postgres:
+        image: postgres:18.2-alpine@sha256:035b9ab53cfa147d7202b61f5f7782b939ae815b7d6bc81c96b7b42ff1fca950
+        env:
+          POSTGRES_PASSWORD: test
+        ports:
+          - 55432:5432
+        options: >-
+          --health-cmd "pg_isready --username=postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
 
     steps:
       - name: Check out repository
@@ -140,6 +160,9 @@ jobs:
         run: cargo clippy --workspace --all-targets --all-features --jobs 2 --locked -- -D warnings
 
       - name: Test workspace
+        env:
+          BIP300_MONITOR_TEST_POSTGRES_URL: >-
+            host=127.0.0.1 port=55432 user=postgres password=test dbname=postgres
         run: cargo test --workspace --all-features --jobs 2 --locked
 
   # Build both final images and smoke-test their contents. Pull requests never

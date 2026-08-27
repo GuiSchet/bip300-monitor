@@ -4,10 +4,29 @@ package event;
 
 import "enforcer_extractor.proto";
 
+// The mainchain block an observation is anchored to.
+//
+// For a block event this is the block the event is about. For a state snapshot
+// it is the enforcer's tip when the state was read, which is what makes the
+// snapshot joinable to a height. It is an anchor, not a proof that the state is
+// exactly as of that height: reading state is a poll, and the enforcer can
+// advance between the read of one field and the next.
+message ObservedBlock {
+  // 32-byte block hash in conventional display order.
+  bytes hash = 1;
+  // Absent when the source did not report one. A disconnect event names only
+  // the block being disconnected, so its height has to be recovered from the
+  // connect event that preceded it.
+  optional uint32 height = 2;
+}
+
 // Stable envelope shared by monitor extractors and consumers.
 message Event {
   // Milliseconds since the Unix epoch when the monitor constructed the event.
   uint64 timestamp = 10;
+
+  // Absent only for an event that no block anchors.
+  optional ObservedBlock observed_at_block = 11;
 
   oneof monitor_event {
     enforcer_extractor.EnforcerEvent enforcer = 1;

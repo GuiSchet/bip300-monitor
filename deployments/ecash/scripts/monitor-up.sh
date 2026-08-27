@@ -12,8 +12,12 @@ require_command jq
 
 "${DEPLOYMENT_ROOT}/scripts/verify-core.sh"
 
-info "pulling the pinned NATS and monitor images"
-compose pull nats event-logger enforcer-extractor
+info "pulling the pinned Postgres, NATS and monitor images"
+compose pull postgres nats event-logger enforcer-extractor
+
+info "starting the Postgres record"
+compose up --detach postgres
+wait_for_postgres_health
 
 info "starting Core NATS"
 compose up --detach nats

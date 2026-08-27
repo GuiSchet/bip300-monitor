@@ -33,6 +33,8 @@ for directory in \
     "${resolved_data_root}/config" \
     "${resolved_data_root}/snapshots" \
     "${resolved_data_root}/rpc-cookie" \
+    "${resolved_data_root}/secrets" \
+    "${resolved_data_root}/postgres" \
     "${resolved_data_root}/enforcer"; do
     if ! mkdir -p -- "${directory}" 2>/dev/null; then
         require_command sudo
@@ -43,6 +45,31 @@ for directory in \
 done
 
 chmod 0750 "${resolved_data_root}/rpc-cookie"
+chmod 0750 "${resolved_data_root}/secrets"
+
+# Generated once and never tracked. The monitor containers run under their own
+# UID but share PGID, so the secret is group-readable rather than world
+# readable; Postgres publishes no port, so this only guards it from other
+# containers on the internal network.
+postgres_password_file="${resolved_data_root}/secrets/postgres-password"
+if [[ ! -s "${postgres_password_file}" ]]; then
+    (
+        umask 0137
+        od -An -tx1 -N32 /dev/urandom | tr -d ' \n' >"${postgres_password_file}"
+    )
+    info "generated a Postgres password at ${postgres_password_file}"
+fi
+[[ -s "${postgres_password_file}" ]] ||
+    die "the Postgres password file is empty: ${postgres_password_file}"
+# The mode is only half of it. The file inherits the primary group of whoever
+# ran this, and the extractor reads it as 10001:${PGID} -- a group it was never
+# given unless it is set here. The directories above already do this; the secret
+# was the one that got missed.
+if ! chgrp "${PGID}" "${postgres_password_file}" 2>/dev/null; then
+    require_command sudo
+    sudo chgrp "${PGID}" "${postgres_password_file}"
+fi
+chmod 0640 "${postgres_password_file}"
 
 # bitcoind reads its configuration once, at startup. Rendering a changed file
 # under a running node would leave the container on the previous settings while

@@ -2,8 +2,8 @@
 
 Single-VM infrastructure for exercising `bip300-monitor` against a pinned
 eCash/Drivechain network. The active lock targets **Alphanet** and deploys its
-L1 node, validator enforcer, Core NATS transport, enforcer extractor, and event
-logger. Network-specific values live in `VERSIONS.lock` and
+L1 node, validator enforcer, Postgres record, Core NATS transport, enforcer
+extractor, and event logger. Network-specific values live in `VERSIONS.lock` and
 the node configuration is generated from those values plus
 `config/ecash.conf.template`. The scripts and Compose topology are shared so a
 future Beta or Mainnet transition does not require another deployment copy.
@@ -69,10 +69,22 @@ just monitor-up
 just verify
 ```
 
-The logger subscribes before the extractor starts. Verification requires one
-fresh event of each semantic snapshot type plus one CTIP event for every
-configured slot. It resets its log window if either monitor container restarts,
-and live block events cannot satisfy the snapshot check.
+Verification asks the record, not the logs. It reads the block the newest
+recorded snapshot is anchored to, then requires **exactly one** row at that block
+for each snapshot kind, plus one CTIP and one withdrawal-bundle proposals row per
+configured slot. Exactly one, not at least one: a second row at the same block
+would mean the identity constraint stopped collapsing a republished snapshot,
+which is the shape of a table that grows on every restart.
+
+Rows outlive a container, and the block is what scopes them — a previous run's
+rows are anchored at a previous block. Scoping by time instead would be wrong in
+the other direction: republishing is idempotent, so a restart at an unchanged tip
+inserts nothing, and a time window would read that healthy state as a missing
+snapshot. Which instance published is a separate question, answered by the log
+window before the record is asked. Separately, a log assertion proves the live
+fan-out still reaches the logger, which is a different path from the record and
+so gets its own check. Verification resets its log window if either monitor container
+restarts.
 
 Before accepting a VM, wait for a new network block and prove delivery for
 every configured sidechain slot:
@@ -105,14 +117,66 @@ from `NETWORK_ID`. Never point a new network at an existing chainstate.
 
 ## Network exposure
 
-Compose publishes no host ports. Node RPC, REST, ZMQ, enforcer gRPC, NATS, and
-NATS monitoring remain reachable only on the internal Docker network. The node
-accepts no inbound peers. The enforcer authenticates with a shared RPC cookie;
-no RPC password is stored in the repository or container arguments.
+Compose publishes no host ports. Node RPC, REST, ZMQ, enforcer gRPC, Postgres,
+NATS, and NATS monitoring remain reachable only on the internal Docker network.
+The node accepts no inbound peers. The enforcer authenticates with a shared RPC
+cookie, and Postgres with a password `just init` generates into
+`${ECASH_DATA_ROOT}/secrets/postgres-password`. Neither is stored in the
+repository or in container arguments.
 
-This pilot uses anonymous Core NATS without JetStream. Messages exist only in
-flight, so a server or consumer outage can require restarting the extractor to
-republish its snapshot.
+That secret is group-readable so the extractor can read it while keeping a UID
+of its own: it runs as `10001:${PGID}`, and Postgres as `${PUID}:${PGID}`.
+
+## Where the data lives
+
+Postgres is the authoritative record. NATS stays as best-effort live fan-out to
+the event logger, so a message lost there costs nothing once the row is
+committed: the extractor writes to Postgres first and publishes afterwards. A
+failed write is fatal; a failed publication is a warning.
+
+That holds at startup too. Only Postgres has to be reachable for the extractor
+to start: the publisher reconnects in the background, so an outage of NATS
+degrades the fan-out rather than stopping the record. A malformed NATS
+configuration is still fatal, because that is a mistake rather than an outage.
+
+Two different gaps follow from that, and only one of them is about transport:
+
+- **The extractor was down.** `SubscribeEvents` does not replay history, so a
+  restart leaves a real hole that only a backfill can close. How much of it can
+  be closed is bounded by `BIP300_MONITOR_BACKFILL_MAX_BLOCKS`; past that the
+  extractor records a window ending at the tip and **warns** that the rest was
+  skipped, so a long outage is a decision to raise the bound rather than silent
+  data loss.
+- **A live consumer missed a message.** Cosmetic, because the record already
+  has it.
+
+## Deploying a new monitor build
+
+The Compose file and `VERSIONS.lock` describe one system and move together: an
+image older than the Compose file that runs it ignores the Postgres settings
+entirely and never refreshes its liveness file, so the containers come up and
+stay unhealthy with nothing naming the real cause.
+
+Merge to `main`, let CI publish the `sha-<commit>` images, promote their digests
+and `MONITOR_IMAGE_COMMIT` in `VERSIONS.lock`, and deploy after that.
+`just preflight` refuses to start when the monitor sources have moved since the
+pinned commit, so the order is checked rather than remembered. Details in
+[`docs/container-images.md`](../../docs/container-images.md).
+
+## Knowing the monitor is alive
+
+Neither monitor service exposes a port, so `restart: unless-stopped` on its own
+only covers a process that exits — not one that is running and no longer doing
+its work. Each refreshes `/tmp/liveness` from something that only succeeds when
+it is healthy, and its healthcheck fails once that file is older than three
+intervals:
+
+- The **extractor** refreshes it on every successful tip read, which proves both
+  that it is scheduling and that the enforcer is answering. A quiet chain still
+  counts: nothing to observe is not the same as unable to observe.
+- The **event logger** refreshes it on every event and, on a timer, after a
+  round-trip to the NATS server. A quiet chain and a dead subscription both
+  deliver no messages, and the round-trip is what separates them.
 
 ## Persistent layout
 
@@ -122,7 +186,9 @@ ${ECASH_DATA_ROOT}/
 ├── config/
 ├── enforcer/
 ├── node/
+├── postgres/
 ├── rpc-cookie/
+├── secrets/
 └── snapshots/
 ```
 

@@ -18,7 +18,6 @@ tracing = { workspace = true }
 
 [features]
 strict = ["shared/strict"]
-nats_integration_tests = []
 
 [lints]
 workspace = true

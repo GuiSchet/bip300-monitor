@@ -129,6 +129,7 @@ for image in \
     "${ECASH_NODE_IMAGE}" \
     "${ENFORCER_IMAGE}" \
     "${NATS_IMAGE}" \
+    "${POSTGRES_IMAGE}" \
     "${ENFORCER_EXTRACTOR_IMAGE}" \
     "${EVENT_LOGGER_IMAGE}"; do
     # The enforcer index publishes an arm64 child as well, and pinning that one
@@ -152,5 +153,11 @@ for image in \
             die "pinned image does not resolve to linux/amd64: ${image} (${image_platform:-unknown})"
     fi
 done
+
+# Both of these fail the deployment before `up` rather than after: an unreadable
+# secret and a stale image pin each surface downstream as a container that dies
+# or never goes healthy, with nothing in the error naming the real cause.
+require_postgres_secret_readable
+require_pinned_images_current
 
 info "${NETWORK_ID} deployment preflight passed"

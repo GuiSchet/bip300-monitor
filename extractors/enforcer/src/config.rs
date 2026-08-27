@@ -7,14 +7,19 @@ use anyhow::{Result, bail};
 use clap::Parser;
 use shared::logging::LogLevel;
 use shared::nats::NatsArgs;
+use shared::store::PostgresArgs;
 
 /// Runtime configuration for the enforcer extractor.
 #[derive(Clone, Parser)]
 #[command(version, about, long_about = None)]
 pub struct Args {
-    /// Core NATS connection settings.
+    /// Core NATS connection settings, used for best-effort live fan-out.
     #[command(flatten)]
     pub nats: NatsArgs,
+
+    /// Postgres connection settings for the authoritative record.
+    #[command(flatten)]
+    pub postgres: PostgresArgs,
 
     /// Default log level when RUST_LOG does not provide a filter.
     #[arg(
@@ -34,15 +39,56 @@ pub struct Args {
     pub enforcer_endpoint: String,
 
     /// Sidechain slots to monitor. May be repeated or comma-separated.
+    ///
+    /// Left unset, the slots are discovered from the enforcer's active
+    /// sidechains at startup. A deployment that pins what it expects to observe
+    /// should still set this: then a slot going missing is a failure rather
+    /// than a silently smaller set.
     #[arg(
         long = "sidechain",
         env = "BIP300_MONITOR_SIDECHAINS",
         value_name = "SLOT",
         value_delimiter = ',',
-        num_args = 1..,
-        required = true
+        num_args = 1..
     )]
     pub sidechains: Vec<u8>,
+
+    /// Maximum number of blocks a single startup backfill may recover.
+    ///
+    /// A range walk returns every block in one message, so an unbounded gap
+    /// would be one enormous response. Past this bound the extractor records a
+    /// window ending at the tip and warns that the rest was skipped.
+    #[arg(
+        long,
+        env = "BIP300_MONITOR_BACKFILL_MAX_BLOCKS",
+        default_value_t = 2_000,
+        value_parser = clap::value_parser!(u32).range(1..)
+    )]
+    pub backfill_max_blocks: u32,
+
+    /// How often the mainchain tip is re-read, in seconds.
+    ///
+    /// The live streams already report every block, so this is not the usual
+    /// path. It exists because the state worker has to be woken by something
+    /// that does not depend on a slot being observed: with no slot resolved
+    /// there is no stream at all, and a stream that wedges without closing
+    /// would otherwise stop the refresh silently.
+    #[arg(
+        long,
+        env = "BIP300_MONITOR_TIP_POLL_INTERVAL_SECONDS",
+        default_value_t = 30,
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
+    pub tip_poll_interval_seconds: u64,
+
+    /// File whose modification time is refreshed on every successful tip read.
+    ///
+    /// The extractor exposes no port, so a container healthcheck has nothing to
+    /// ask. This gives it something: the time is refreshed by work that only
+    /// succeeds when the enforcer is answering, so a wedged process stops
+    /// refreshing it. Unset means no file is written.
+    #[arg(long, env = "BIP300_MONITOR_LIVENESS_FILE")]
+    pub liveness_file: Option<std::path::PathBuf>,
 
     /// Timeout in seconds for connections, unary requests, and stream setup.
     #[arg(
@@ -86,6 +132,11 @@ impl Args {
     /// Return the configured request timeout.
     pub const fn request_timeout(&self) -> Duration {
         Duration::from_secs(self.request_timeout_seconds)
+    }
+
+    /// Return the configured interval between tip polls.
+    pub const fn tip_poll_interval(&self) -> Duration {
+        Duration::from_secs(self.tip_poll_interval_seconds)
     }
 
     /// Return the configured graceful-shutdown timeout.
@@ -179,12 +230,15 @@ mod tests {
     }
 
     #[test]
-    fn rejects_missing_and_duplicate_sidechains() {
-        assert!(
-            Args::try_parse_from(["enforcer-extractor"]).is_err(),
-            "at least one sidechain is required"
-        );
+    fn omitting_sidechains_defers_to_discovery() {
+        let args = Args::try_parse_from(["enforcer-extractor"])
+            .expect("sidechains may be discovered instead of configured");
+        assert!(args.sidechains.is_empty());
+        args.validate().expect("an empty slot list is valid");
+    }
 
+    #[test]
+    fn rejects_duplicate_sidechains() {
         let args =
             Args::try_parse_from(["enforcer-extractor", "--sidechain", "9", "--sidechain", "9"])
                 .expect("syntactically valid arguments");

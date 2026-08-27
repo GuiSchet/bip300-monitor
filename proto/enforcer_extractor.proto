@@ -12,6 +12,7 @@ message EnforcerEvent {
     CtipSnapshot ctip = 5;
     BlockConnected block_connected = 6;
     BlockDisconnected block_disconnected = 7;
+    WithdrawalBundleProposalsSnapshot withdrawal_bundle_proposals = 8;
   }
 }
 
@@ -156,6 +157,24 @@ message SidechainEvent {
     Deposit deposit = 1;
     WithdrawalBundleEvent withdrawal_bundle = 2;
   }
+}
+
+// A withdrawal bundle that has been proposed and is still being voted on.
+message WithdrawalBundleProposal {
+  // Consensus-encoded M6 identifier bytes as returned by the enforcer.
+  bytes m6id = 1;
+  // Accumulated M4 upvotes, to be read against
+  // `Bip300Constants.withdrawal_bundle_inclusion_threshold`.
+  uint32 vote_count = 2;
+  // Mainchain height of the M3 that proposed the bundle. Its distance to the
+  // current tip is the bundle age, bounded by
+  // `Bip300Constants.withdrawal_bundle_max_age`.
+  uint32 proposal_height = 3;
+}
+
+message WithdrawalBundleProposalsSnapshot {
+  uint32 sidechain_number = 1;
+  repeated WithdrawalBundleProposal proposals = 2;
 }
 
 message BlockConnected {

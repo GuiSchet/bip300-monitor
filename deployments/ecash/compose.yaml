@@ -148,6 +148,49 @@ services:
         max-file: "5"
         max-size: 20m
 
+  postgres:
+    image: ${POSTGRES_IMAGE:?POSTGRES_IMAGE must be set by VERSIONS.lock}
+    init: true
+    restart: unless-stopped
+    stop_grace_period: 1m
+    user: ${PUID:-1000}:${PGID:-1000}
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:?POSTGRES_DB must be set by VERSIONS.lock}
+      POSTGRES_USER: ${POSTGRES_USER:?POSTGRES_USER must be set by VERSIONS.lock}
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres-password
+      # Set explicitly so the cluster lives inside the bind mount regardless of
+      # where the image would otherwise place it.
+      PGDATA: /var/lib/postgresql/data/pgdata
+    volumes:
+      - type: bind
+        source: ${ECASH_DATA_ROOT:?ECASH_DATA_ROOT must be derived from NETWORK_ID}/postgres
+        target: /var/lib/postgresql/data
+      - type: bind
+        source: ${ECASH_DATA_ROOT:?ECASH_DATA_ROOT must be derived from NETWORK_ID}/secrets/postgres-password
+        target: /run/secrets/postgres-password
+        read_only: true
+    networks:
+      ecash-internal:
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          pg_isready --host=127.0.0.1
+          --username=${POSTGRES_USER} --dbname=${POSTGRES_DB}
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    logging:
+      driver: json-file
+      options:
+        max-file: "5"
+        max-size: 20m
+
   event-logger:
     image: ${EVENT_LOGGER_IMAGE:?EVENT_LOGGER_IMAGE must be set by VERSIONS.lock}
     init: true
@@ -160,9 +203,24 @@ services:
       BIP300_MONITOR_FULL_EVENTS: ${BIP300_MONITOR_FULL_EVENTS:-true}
       BIP300_MONITOR_NATS_FLUSH_TIMEOUT_SECONDS: "10"
       BIP300_MONITOR_SHUTDOWN_TIMEOUT_SECONDS: "15"
+      BIP300_MONITOR_LIVENESS_FILE: /tmp/liveness
+      BIP300_MONITOR_LIVENESS_INTERVAL_SECONDS: "30"
     depends_on:
       nats:
         condition: service_healthy
+    # A quiet chain delivers nothing, so there is no message to wait for: the
+    # logger round-trips NATS on its own interval and refreshes the file only
+    # when that succeeds. The staleness bound is three intervals, so one slow
+    # round-trip is not an outage.
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          [ $$(( $$(date +%s) - $$(stat -c %Y /tmp/liveness) )) -lt 90 ]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
     networks:
       ecash-internal:
     read_only: true
@@ -183,15 +241,32 @@ services:
     init: true
     restart: unless-stopped
     stop_grace_period: 20s
-    user: 10001:10001
+    # Its own UID, but PGID as the group so it can read the group-readable
+    # Postgres password without sharing an identity with any other service.
+    user: 10001:${PGID:-1000}
+    volumes:
+      - type: bind
+        source: ${ECASH_DATA_ROOT:?ECASH_DATA_ROOT must be derived from NETWORK_ID}/secrets/postgres-password
+        target: /run/secrets/postgres-password
+        read_only: true
     environment:
       BIP300_MONITOR_NATS_URL: nats://nats:4222
+      BIP300_MONITOR_POSTGRES_HOST: postgres
+      BIP300_MONITOR_POSTGRES_DB: ${POSTGRES_DB:?POSTGRES_DB must be set by VERSIONS.lock}
+      BIP300_MONITOR_POSTGRES_USER: ${POSTGRES_USER:?POSTGRES_USER must be set by VERSIONS.lock}
+      BIP300_MONITOR_POSTGRES_PASSWORD_FILE: /run/secrets/postgres-password
       BIP300_MONITOR_ENFORCER_ENDPOINT: http://enforcer:50051
       BIP300_MONITOR_SIDECHAINS: ${BIP300_MONITOR_SIDECHAINS:-9,98}
       BIP300_MONITOR_LOG_LEVEL: ${BIP300_MONITOR_LOG_LEVEL:-info}
       BIP300_MONITOR_REQUEST_TIMEOUT_SECONDS: "10"
       BIP300_MONITOR_NATS_FLUSH_TIMEOUT_SECONDS: "10"
       BIP300_MONITOR_SHUTDOWN_TIMEOUT_SECONDS: "15"
+      # How much history one restart may recover. Past this the extractor
+      # records a window ending at the tip and warns that the rest was skipped,
+      # so raising it is how a long outage is closed rather than dropped.
+      BIP300_MONITOR_BACKFILL_MAX_BLOCKS: ${BIP300_MONITOR_BACKFILL_MAX_BLOCKS:-2000}
+      BIP300_MONITOR_TIP_POLL_INTERVAL_SECONDS: "30"
+      BIP300_MONITOR_LIVENESS_FILE: /tmp/liveness
     depends_on:
       enforcer:
         condition: service_healthy
@@ -201,6 +276,23 @@ services:
         condition: service_started
       nats:
         condition: service_healthy
+      postgres:
+        condition: service_healthy
+    # The extractor exposes no port, so the tip poll is what proves it is alive:
+    # it refreshes this file only after the enforcer answers. `restart:
+    # unless-stopped` alone would leave a running-but-wedged extractor in place.
+    # The staleness bound is three poll intervals, so one slow answer is not an
+    # outage.
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          [ $$(( $$(date +%s) - $$(stat -c %Y /tmp/liveness) )) -lt 90 ]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      # The snapshot and the backfill both run before the first tip poll.
+      start_period: 180s
     networks:
       ecash-internal:
     read_only: true

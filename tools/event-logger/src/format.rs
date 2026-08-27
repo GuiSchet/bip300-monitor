@@ -1,26 +1,10 @@
 //! Human-readable and complete event rendering.
 
 use anyhow::{Context, Result, bail};
-use serde_json::Value;
+use shared::json;
 use shared::protobuf::enforcer_extractor as events;
 use shared::protobuf::event::Event;
 use shared::protobuf::event::event::MonitorEvent;
-
-const BYTE_FIELDS: &[&str] = &[
-    "address",
-    "block_hash",
-    "bmm_commitment",
-    "chain_work",
-    "description_hash",
-    "hash",
-    "hash_id_1",
-    "hash_id_2",
-    "m6id",
-    "previous_hash",
-    "raw_description",
-    "transaction",
-    "txid",
-];
 
 /// Rendered forms of one validated event.
 #[derive(Debug)]
@@ -47,12 +31,13 @@ pub fn render(event: &Event, full_events: bool) -> Result<RenderedEvent> {
         .event
         .as_ref()
         .context("enforcer event does not contain a concrete event")?;
-    let (kind, summary) = summarize(payload)?;
+    // The kind comes from the contract itself, so the logger, the record and
+    // the deployment queries can never drift apart on a name.
+    let kind = payload.kind();
+    let summary = summarize(payload)?;
 
     let full_json = if full_events {
-        let mut full = serde_json::to_value(event).context("serializing the event as JSON")?;
-        encode_byte_fields(&mut full)?;
-        Some(serde_json::to_string(&full).context("encoding the event JSON")?)
+        Some(json::render_line(event)?)
     } else {
         None
     };
@@ -64,7 +49,7 @@ pub fn render(event: &Event, full_events: bool) -> Result<RenderedEvent> {
     })
 }
 
-fn summarize(payload: &events::enforcer_event::Event) -> Result<(&'static str, String)> {
+fn summarize(payload: &events::enforcer_event::Event) -> Result<String> {
     match payload {
         events::enforcer_event::Event::ChainInfo(chain_info) => {
             let network = events::Network::try_from(chain_info.network)
@@ -73,14 +58,11 @@ fn summarize(payload: &events::enforcer_event::Event) -> Result<(&'static str, S
                 .bip300_constants
                 .as_ref()
                 .context("chain info is missing BIP300 constants")?;
-            Ok((
-                "chain_info",
-                format!(
-                    "network={} activation_height={} withdrawal_bundle_max_age={}",
-                    network.as_str_name().to_ascii_lowercase(),
-                    constants.activation_height,
-                    constants.withdrawal_bundle_max_age
-                ),
+            Ok(format!(
+                "network={} activation_height={} withdrawal_bundle_max_age={}",
+                network.as_str_name().to_ascii_lowercase(),
+                constants.activation_height,
+                constants.withdrawal_bundle_max_age
             ))
         }
         events::enforcer_event::Event::ChainTip(chain_tip) => {
@@ -89,51 +71,39 @@ fn summarize(payload: &events::enforcer_event::Event) -> Result<(&'static str, S
                 .as_ref()
                 .context("chain tip is missing its block header")?;
             validate_header(header)?;
-            Ok((
-                "chain_tip",
-                format!(
-                    "height={} block_hash={}",
-                    header.height,
-                    hex::encode(&header.hash)
-                ),
+            Ok(format!(
+                "height={} block_hash={}",
+                header.height,
+                hex::encode(&header.hash)
             ))
         }
         events::enforcer_event::Event::SidechainProposals(snapshot) => {
             for proposal in &snapshot.proposals {
                 validate_proposal(proposal)?;
             }
-            Ok((
-                "sidechain_proposals",
-                format!("proposal_count={}", snapshot.proposals.len()),
-            ))
+            Ok(format!("proposal_count={}", snapshot.proposals.len()))
         }
         events::enforcer_event::Event::ActiveSidechains(snapshot) => {
             for sidechain in &snapshot.sidechains {
                 validate_active_sidechain(sidechain)?;
             }
-            Ok((
-                "active_sidechains",
-                format!("sidechain_count={}", snapshot.sidechains.len()),
-            ))
+            Ok(format!("sidechain_count={}", snapshot.sidechains.len()))
         }
         events::enforcer_event::Event::Ctip(snapshot) => {
             if let Some(ctip) = snapshot.ctip.as_ref() {
                 require_32_bytes(&ctip.txid, "ctip.txid")?;
-                Ok((
-                    "ctip",
-                    format!(
-                        "sidechain={} present=true txid={} vout={} value_sats={} sequence_number={}",
-                        snapshot.sidechain_number,
-                        hex::encode(&ctip.txid),
-                        ctip.vout,
-                        ctip.value_sats,
-                        ctip.sequence_number
-                    ),
+                Ok(format!(
+                    "sidechain={} present=true txid={} vout={} value_sats={} sequence_number={}",
+                    snapshot.sidechain_number,
+                    hex::encode(&ctip.txid),
+                    ctip.vout,
+                    ctip.value_sats,
+                    ctip.sequence_number
                 ))
             } else {
-                Ok((
-                    "ctip",
-                    format!("sidechain={} present=false", snapshot.sidechain_number),
+                Ok(format!(
+                    "sidechain={} present=false",
+                    snapshot.sidechain_number
                 ))
             }
         }
@@ -144,29 +114,49 @@ fn summarize(payload: &events::enforcer_event::Event) -> Result<(&'static str, S
                 .context("connected block is missing its block header")?;
             validate_header(header)?;
             let (deposits, withdrawal_bundles) = validate_sidechain_events(&block.events)?;
-            Ok((
-                "block_connected",
-                format!(
-                    "sidechain={} height={} block_hash={} deposits={} withdrawal_bundles={} \
+            Ok(format!(
+                "sidechain={} height={} block_hash={} deposits={} withdrawal_bundles={} \
                      bmm_commitment={}",
-                    block.sidechain_number,
-                    header.height,
-                    hex::encode(&header.hash),
-                    deposits,
-                    withdrawal_bundles,
-                    block.bmm_commitment.is_some()
-                ),
+                block.sidechain_number,
+                header.height,
+                hex::encode(&header.hash),
+                deposits,
+                withdrawal_bundles,
+                block.bmm_commitment.is_some()
             ))
         }
         events::enforcer_event::Event::BlockDisconnected(block) => {
             require_32_bytes(&block.block_hash, "block_disconnected.block_hash")?;
-            Ok((
-                "block_disconnected",
-                format!(
-                    "sidechain={} block_hash={}",
-                    block.sidechain_number,
-                    hex::encode(&block.block_hash)
-                ),
+            Ok(format!(
+                "sidechain={} block_hash={}",
+                block.sidechain_number,
+                hex::encode(&block.block_hash)
+            ))
+        }
+        events::enforcer_event::Event::WithdrawalBundleProposals(snapshot) => {
+            validate_bundle_proposals(&snapshot.proposals)?;
+            // The vote count is read against the inclusion threshold and the
+            // proposal height against the maximum bundle age, both of which are
+            // in `chain_info`. The extremes are what a reader needs at a glance.
+            let max_vote_count = snapshot
+                .proposals
+                .iter()
+                .map(|proposal| proposal.vote_count)
+                .max()
+                .unwrap_or(0);
+            let oldest_proposal_height = snapshot
+                .proposals
+                .iter()
+                .map(|proposal| proposal.proposal_height)
+                .min()
+                .unwrap_or(0);
+            Ok(format!(
+                "sidechain={} proposal_count={} max_vote_count={} \
+                     oldest_proposal_height={}",
+                snapshot.sidechain_number,
+                snapshot.proposals.len(),
+                max_vote_count,
+                oldest_proposal_height
             ))
         }
     }
@@ -196,6 +186,17 @@ fn validate_declaration(declaration: Option<&events::SidechainDeclaration>) -> R
             .declaration
             .as_ref()
             .context("sidechain declaration is missing its concrete version")?;
+    }
+    Ok(())
+}
+
+fn validate_bundle_proposals(proposals: &[events::WithdrawalBundleProposal]) -> Result<()> {
+    // `m6id` is consensus-encoded rather than a display-order hash, so its
+    // length is not asserted here; an empty one would still be meaningless.
+    for proposal in proposals {
+        if proposal.m6id.is_empty() {
+            bail!("withdrawal_bundle_proposal.m6id must not be empty");
+        }
     }
     Ok(())
 }
@@ -240,56 +241,18 @@ fn require_32_bytes(value: &[u8], field: &str) -> Result<()> {
     Ok(())
 }
 
-fn encode_byte_fields(value: &mut Value) -> Result<()> {
-    match value {
-        Value::Array(values) => {
-            for value in values {
-                encode_byte_fields(value)?;
-            }
-        }
-        Value::Object(fields) => {
-            for (name, value) in fields {
-                if BYTE_FIELDS.contains(&name.as_str()) {
-                    if value.is_null() {
-                        continue;
-                    }
-                    let bytes = value
-                        .as_array()
-                        .with_context(|| format!("serialized byte field `{name}` is not an array"))?
-                        .iter()
-                        .map(|byte| {
-                            let byte = byte.as_u64().with_context(|| {
-                                format!("serialized byte field `{name}` contains a non-integer")
-                            })?;
-                            u8::try_from(byte).with_context(|| {
-                                format!("serialized byte field `{name}` contains {byte}")
-                            })
-                        })
-                        .collect::<Result<Vec<_>>>()?;
-                    *value = Value::String(hex::encode(bytes));
-                } else {
-                    encode_byte_fields(value)?;
-                }
-            }
-        }
-        _ => {}
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
-
     use shared::protobuf::enforcer_extractor as events;
     use shared::protobuf::event::Event;
     use shared::protobuf::event::event::MonitorEvent;
 
-    use super::{BYTE_FIELDS, render};
+    use super::render;
 
     fn envelope(payload: events::enforcer_event::Event) -> Event {
         Event {
             timestamp: 1_700_000_000_000,
+            observed_at_block: None,
             monitor_event: Some(MonitorEvent::Enforcer(events::EnforcerEvent {
                 event: Some(payload),
             })),
@@ -360,6 +323,19 @@ mod tests {
                     sidechain_number: 9,
                 }),
                 "block_disconnected",
+            ),
+            (
+                events::enforcer_event::Event::WithdrawalBundleProposals(
+                    events::WithdrawalBundleProposalsSnapshot {
+                        sidechain_number: 9,
+                        proposals: vec![events::WithdrawalBundleProposal {
+                            m6id: vec![5; 32],
+                            vote_count: 3,
+                            proposal_height: 900,
+                        }],
+                    },
+                ),
+                "withdrawal_bundle_proposals",
             ),
         ];
 
@@ -474,6 +450,7 @@ mod tests {
     fn rejects_empty_and_incomplete_envelopes() {
         let empty = Event {
             timestamp: 1,
+            observed_at_block: None,
             monitor_event: None,
         };
         assert!(
@@ -485,6 +462,7 @@ mod tests {
 
         let empty_enforcer = Event {
             timestamp: 1,
+            observed_at_block: None,
             monitor_event: Some(MonitorEvent::Enforcer(events::EnforcerEvent {
                 event: None,
             })),
@@ -526,29 +504,5 @@ mod tests {
                 .to_string()
                 .contains("concrete event")
         );
-    }
-
-    #[test]
-    fn hexadecimal_field_list_covers_every_proto_bytes_field() {
-        let proto = include_str!("../../../proto/enforcer_extractor.proto");
-        let proto_fields = proto
-            .lines()
-            .filter_map(|line| {
-                if line.trim_start().starts_with("//") {
-                    return None;
-                }
-                let tokens = line.split_whitespace().collect::<Vec<_>>();
-                let bytes_index = tokens.iter().position(|token| *token == "bytes")?;
-                tokens
-                    .get(bytes_index + 1)
-                    .map(|field| field.trim_end_matches(';').to_owned())
-            })
-            .collect::<BTreeSet<_>>();
-        let rendered_fields = BYTE_FIELDS
-            .iter()
-            .map(|field| (*field).to_owned())
-            .collect::<BTreeSet<_>>();
-
-        assert_eq!(rendered_fields, proto_fields);
     }
 }
