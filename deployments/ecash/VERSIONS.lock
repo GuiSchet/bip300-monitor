@@ -1,7 +1,7 @@
 # shellcheck shell=bash
 # Reproducible eCash network, image, tool, and snapshot lock.
 LOCK_FORMAT=2
-LOCKED_AT=2026-08-26
+LOCKED_AT=2026-08-27
 
 NETWORK_ID=alphanet
 ECASH_NODE_CHAIN=main
@@ -44,9 +44,9 @@ POSTGRES_IMAGE=docker.io/library/postgres:18.2-alpine@sha256:035b9ab53cfa147d720
 POSTGRES_DB=bip300_monitor
 POSTGRES_USER=bip300_monitor
 
-MONITOR_IMAGE_COMMIT=29406f6ceb2805491b497e615e5262e69a3e3ac0
-ENFORCER_EXTRACTOR_IMAGE=docker.io/guischet/bip300-enforcer-extractor:sha-29406f6ceb28@sha256:944f140828e8d8fe01a761f6335fddb5f8e9055385728073fe3bb2c9b88d4d7c
-EVENT_LOGGER_IMAGE=docker.io/guischet/bip300-event-logger:sha-29406f6ceb28@sha256:0bbfcd975dbbbe8e1b339c4f95ab6cf11e9c6073c3651148a5d2cb700c8fbc36
+MONITOR_IMAGE_COMMIT=5d85b5b4d0d3d1ae8509a290430b920f2506f018
+ENFORCER_EXTRACTOR_IMAGE=docker.io/guischet/bip300-enforcer-extractor:sha-5d85b5b4d0d3@sha256:ace3d2a57e8f742c440c0565fbcc8e5d1a07f3c659aba0a9e83f2dd62fb71a3d
+EVENT_LOGGER_IMAGE=docker.io/guischet/bip300-event-logger:sha-5d85b5b4d0d3@sha256:543605f376f1ce1222fe07ac6820843848a38877215b3efc066c3b7d81ae79b2
 
 JUST_VERSION=1.57.0
 JUST_TARGET=x86_64-unknown-linux-musl
