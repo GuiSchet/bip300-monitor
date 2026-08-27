@@ -61,6 +61,14 @@ if [[ ! -s "${postgres_password_file}" ]]; then
 fi
 [[ -s "${postgres_password_file}" ]] ||
     die "the Postgres password file is empty: ${postgres_password_file}"
+# The mode is only half of it. The file inherits the primary group of whoever
+# ran this, and the extractor reads it as 10001:${PGID} -- a group it was never
+# given unless it is set here. The directories above already do this; the secret
+# was the one that got missed.
+if ! chgrp "${PGID}" "${postgres_password_file}" 2>/dev/null; then
+    require_command sudo
+    sudo chgrp "${PGID}" "${postgres_password_file}"
+fi
 chmod 0640 "${postgres_password_file}"
 
 # bitcoind reads its configuration once, at startup. Rendering a changed file

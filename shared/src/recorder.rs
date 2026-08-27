@@ -30,7 +30,9 @@ impl Recorder {
     /// Connect to the record and to the live transport.
     ///
     /// The record is connected first: without somewhere to store observations
-    /// there is no point holding a publisher open.
+    /// there is no point holding a publisher open. Only the record has to be
+    /// reachable — the publisher reconnects in the background — so a NATS
+    /// outage degrades the live fan-out instead of stopping the extractor.
     pub async fn connect(
         postgres: &PostgresArgs,
         nats: &NatsArgs,
@@ -87,21 +89,26 @@ impl Recorder {
         &self.store
     }
 
+    /// Hand a recorded batch to live consumers, without letting the transport
+    /// hold up the record.
+    ///
+    /// Bounded inside [`EventPublisher::publish_batch`], because publishing into
+    /// a disconnected NATS client blocks once its queue fills. The result is
+    /// only reported: by the time this runs the rows are committed, so nothing
+    /// here can fail the caller.
     async fn fan_out(&self, events: &[Event]) {
-        for event in events {
-            if let Err(error) = self.publisher.publish(self.subject, event).await {
-                tracing::warn!(
-                    error = %format!("{error:#}"),
-                    "live fan-out dropped an event; the record already holds it"
-                );
-                return;
-            }
-        }
-        if let Err(error) = self.publisher.flush().await {
-            tracing::warn!(
-                error = %format!("{error:#}"),
-                "live fan-out could not be flushed; the record already holds the events"
-            );
-        }
+        let outcome = self.publisher.publish_batch(self.subject, events).await;
+        let Some(failure) = outcome.failure.as_deref() else {
+            return;
+        };
+
+        // One warning per batch, not per event: a broken transport should be
+        // legible, not a wall of identical lines.
+        tracing::warn!(
+            observed = outcome.observed,
+            dropped = outcome.dropped(),
+            error = %failure,
+            "live fan-out dropped events; the record already holds them"
+        );
     }
 }

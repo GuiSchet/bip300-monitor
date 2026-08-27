@@ -131,10 +131,22 @@ fi
 if grep -nE 'psql[^|]*--command' "${DEPLOYMENT_ROOT}/scripts/lib.sh"; then
     die "record helpers must pass SQL on stdin so psql interpolates its variables"
 fi
-grep -Fq 'record_event_count' "${DEPLOYMENT_ROOT}/scripts/verify.sh" ||
+grep -Fq 'record_event_count_at' "${DEPLOYMENT_ROOT}/scripts/verify.sh" ||
     die "verify.sh does not assert the record; log lines only show live fan-out"
+# An `observed_at` window would read a republished snapshot -- which inserts
+# nothing, by design -- as a missing one.
+if grep -nE '^[^#]*observed_at' "${DEPLOYMENT_ROOT}/scripts/lib.sh"; then
+    die "record assertions must be scoped by block, not by an observed_at window"
+fi
 grep -Fq 'record_has_block' "${DEPLOYMENT_ROOT}/scripts/verify-live.sh" ||
     die "verify-live.sh does not assert that the live block reached the record"
+# Both fail the deployment before `up`. Dropped, each one comes back as a
+# container that dies or never goes healthy, with the real cause nowhere in the
+# error.
+for preflight_check in require_postgres_secret_readable require_pinned_images_current; do
+    grep -Fq "${preflight_check}" "${DEPLOYMENT_ROOT}/scripts/preflight.sh" ||
+        die "preflight.sh no longer calls ${preflight_check}"
+done
 
 live_hash='0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef'
 extractor_slot_9="INFO enforcer_extractor: published live enforcer event event=\"block_connected\" sidechain=9 height=123 block_hash=${live_hash}"
@@ -358,6 +370,31 @@ jq -e '.services["enforcer-extractor"].environment.BIP300_MONITOR_NATS_URL == "n
     and .services["enforcer-extractor"].environment.BIP300_MONITOR_ENFORCER_ENDPOINT == "http://enforcer:50051"
     and .services["enforcer-extractor"].environment.BIP300_MONITOR_SIDECHAINS == "9,98"' \
     <<<"${config_json}" >/dev/null
+# The bound on how much history one restart recovers. Left unpinned it would
+# only ever be the compiled-in default, and an operator closing a long outage
+# has to be able to raise it.
+jq -e '.services["enforcer-extractor"].environment.BIP300_MONITOR_BACKFILL_MAX_BLOCKS == "2000"' \
+    <<<"${config_json}" >/dev/null
+
+# Neither monitor service exposes a port, so each one proves it is alive by
+# refreshing a file that only successful work touches. Without the healthcheck
+# `restart: unless-stopped` covers a process that exits and nothing else.
+for monitor_service in enforcer-extractor event-logger; do
+    jq -e --arg service "${monitor_service}" \
+        '.services[$service].environment.BIP300_MONITOR_LIVENESS_FILE == "/tmp/liveness"' \
+        <<<"${config_json}" >/dev/null ||
+        die "${monitor_service} does not write the liveness file its healthcheck reads"
+    jq -e --arg service "${monitor_service}" \
+        '.services[$service].healthcheck.test | any(contains("/tmp/liveness"))' \
+        <<<"${config_json}" >/dev/null ||
+        die "${monitor_service} has no healthcheck reading the liveness file"
+    # The file lives on the tmpfs, so a read-only root filesystem still allows
+    # the write.
+    jq -e --arg service "${monitor_service}" \
+        '.services[$service].tmpfs | any(startswith("/tmp"))' \
+        <<<"${config_json}" >/dev/null ||
+        die "${monitor_service} has no writable /tmp for the liveness file"
+done
 
 for expected_arg in \
     "--network-preset=${ENFORCER_NETWORK_PRESET}" \

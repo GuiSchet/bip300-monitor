@@ -154,4 +154,10 @@ for image in \
     fi
 done
 
+# Both of these fail the deployment before `up` rather than after: an unreadable
+# secret and a stale image pin each surface downstream as a container that dies
+# or never goes healthy, with nothing in the error naming the real cause.
+require_postgres_secret_readable
+require_pinned_images_current
+
 info "${NETWORK_ID} deployment preflight passed"

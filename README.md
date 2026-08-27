@@ -46,15 +46,30 @@ hashes before an event can be published.
 
 The executable records an initial state snapshot and then follows live block
 events until it receives
-`SIGINT` or `SIGTERM`. Whenever a block moves the mainchain tip it also re-reads
-the state that the tip changes — sidechain proposals, active sidechains, the
-CTIP of each slot, and the withdrawal bundles still being voted on — and
-republishes only what actually changed.
+`SIGINT` or `SIGTERM`. A moving tip also makes it re-read the state that the tip
+changes — sidechain proposals, active sidechains, the CTIP of each slot, and the
+withdrawal bundles still being voted on — and republish only what actually
+changed.
+
+That re-read is a poll, not a per-block query: these RPCs only answer "what is
+true right now", so a reading describes the tip it was read against. Under fast
+blocks two heights coalesce into one reading, which is why consecutive snapshots
+are consecutive observations rather than consecutive blocks. The full semantics
+are in [`proto/README.md`](proto/README.md).
+
+The tip is also polled directly, every `--tip-poll-interval-seconds`. The live
+streams already report every block, so that poll usually only confirms what a
+slot worker just said. It exists for the two cases the streams cannot cover: no
+slot resolved, so there is no stream at all, and a stream that stops delivering
+without closing.
 
 Sidechain slots can be configured explicitly, or discovered from the enforcer's
 active sidechains when `--sidechain` is omitted. A deployment that pins what it
 expects to observe should still set them: then a slot going missing is a failure
-rather than a silently smaller set.
+rather than a silently smaller set. Discovering none is not an error — a network
+before any activation genuinely has none — and the extractor keeps recording
+chain state, warning once a sidechain activates into a slot it is not subscribed
+to.
 
 ```bash
 cargo run -p enforcer-extractor -- \
@@ -79,10 +94,6 @@ conversion, or record error stops all slot workers. `SIGINT` and `SIGTERM`
 trigger graceful shutdown; a second signal or the configured timeout forces
 termination.
 
-Every restart republishes the snapshot. That is idempotent in the record — one
-observation of one kind, for one slot, at one block is a single row — and it
-re-establishes current state for live consumers, which Core NATS cannot replay.
-
 A restart also backfills. `SubscribeEvents` delivers from the moment of
 subscription and its request carries no cursor, so the blocks that passed while
 the extractor was down are a real hole. The record says where to resume: the
@@ -91,14 +102,25 @@ row is committed before anything is published it can never name a block that was
 not stored. Three cases are handled explicitly, because each has a way of going
 wrong quietly:
 
-- **Within the bound.** `GetTwoWayPegData` walks from the checkpoint, which is
-  exclusive, up to the tip.
-- **Nothing recorded yet.** Omitting the start makes the enforcer walk back to
-  genesis, so a first sight takes a bounded window instead.
-- **A gap past `--backfill-max-blocks`, or a checkpoint that is no longer an
-  ancestor of the tip** — the shape a reorg past it leaves. Both fall back to a
-  bounded window and **warn**, because skipped history that is only logged at
-  debug reads later as "nothing happened".
+- **Within the bound.** `GetBlockInfo` walks back from the tip far enough to
+  reach the block after the checkpoint, and the recovered chain is checked
+  against the checkpoint before anything is recorded: the right number of
+  blocks, each following the one before it, ending at the checkpoint. A short or
+  unrelated answer is a failure, not a hole.
+- **Nothing recorded yet.** There is no checkpoint to walk from, so a first
+  sight takes a bounded window ending at the tip.
+- **A gap past `--backfill-max-blocks`, a checkpoint that is no longer an
+  ancestor of the tip, or a walk that did not come back whole.** All three fall
+  back to a bounded window and **warn**, because skipped history that is only
+  logged at debug reads later as "nothing happened".
+
+`GetTwoWayPegData` is the call this reads like it should use, and it is the wrong
+one: the enforcer omits every block whose contents are empty for the requested
+slot, which on a quiet slot is nearly all of them, while `SubscribeEvents`
+reports every block. Walking a range with it records a subset of the gap and
+leaves the checkpoint short of the tip, so the same gap is re-walked on every
+restart until it outgrows the bound and is dropped — reported, throughout, as a
+successful backfill.
 
 Detailed event semantics are documented in
 [`proto/README.md`](proto/README.md).
@@ -162,7 +184,10 @@ NATS_SERVER_BINARY=/path/to/nats-server \
 Network gate: confirm that an idle enforcer remains subscribed beyond
 `--request-timeout-seconds 5`; that normal `SIGTERM` exits with code 0 before
 the 15-second shutdown timeout; that stopping NATS leaves the extractor
-recording and only warns; and that stopping Postgres terminates it.
+recording and only warns; that **starting** with NATS already down also leaves it
+recording and only warns; that stopping Postgres terminates it; and that a run
+with no slot configured against an enforcer with no active sidechain keeps
+recording chain state instead of exiting.
 
 To verify API compatibility against a running enforcer:
 

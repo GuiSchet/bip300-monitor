@@ -2,10 +2,12 @@
 
 use std::future::Future;
 use std::pin::Pin;
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use futures_util::future::try_join_all;
 use futures_util::{Stream, StreamExt};
+use shared::liveness::Heartbeat;
 use shared::nats_subjects::Subject;
 use shared::protobuf::enforcer_extractor as events;
 use shared::protobuf::event::event::MonitorEvent;
@@ -56,6 +58,17 @@ impl StartupSource for EnforcerClient {
         sidechains: &'a [u8],
     ) -> SourceFuture<'a, InitialSnapshot> {
         Box::pin(snapshot::collect_snapshot(self, sidechains))
+    }
+}
+
+/// Source of the mainchain tip, polled independently of any slot.
+trait TipSource: Send {
+    fn read_tip(&mut self) -> SourceFuture<'_, ObservedBlock>;
+}
+
+impl TipSource for EnforcerClient {
+    fn read_tip(&mut self) -> SourceFuture<'_, ObservedBlock> {
+        Box::pin(snapshot::current_tip(self))
     }
 }
 
@@ -165,8 +178,10 @@ pub async fn run(args: Args, mut shutdown_rx: watch::Receiver<bool>) -> Result<(
 
     // Every slot worker reports the blocks it sees here, so one state worker can
     // re-read the mutable enforcer state once per tip change instead of once per
-    // slot. The original sender is dropped below: when the last slot worker
-    // exits, the state worker's wait ends on its own.
+    // slot. A tip worker reports there too, and it is what keeps the channel
+    // open: with no slot resolved there is no slot worker, and a state worker
+    // whose senders are all gone stops on its own — which used to end the whole
+    // process with a success code and no work done.
     let snapshot_block = snapshot.anchor.hash.clone();
     let (block_tx, block_rx) = watch::channel(snapshot.anchor.hash.clone());
     let tracker = state::Tracker::new(snapshot.state);
@@ -181,7 +196,13 @@ pub async fn run(args: Args, mut shutdown_rx: watch::Receiver<bool>) -> Result<(
             shutdown_rx.clone(),
         ));
     }
-    drop(block_tx);
+    workers.spawn(monitor_tip(
+        client.clone(),
+        args.tip_poll_interval(),
+        Heartbeat::new(args.liveness_file.clone()),
+        block_tx,
+        shutdown_rx.clone(),
+    ));
     workers.spawn(monitor_state(
         client,
         recorder,
@@ -330,8 +351,10 @@ async fn monitor_sidechain(
         let block_tx = block_tx.clone();
         async move {
             log_published_event(sidechain, &event);
-            // The block is announced only after the record holds the event, so
-            // a state refresh can never describe a block the record is missing.
+            // Announced only after the record holds the event, so the block that
+            // triggers a refresh is always one the record already has. The
+            // refresh then anchors itself to the tip it reads, which under fast
+            // blocks can be a later one -- see `state::collect`.
             recorder
                 .record(event.clone())
                 .await
@@ -358,6 +381,84 @@ fn announce_block(block_tx: &watch::Sender<Vec<u8>>, sidechain: u8, event: &Even
         return;
     };
     let _ = block_tx.send(anchor.hash.clone());
+}
+
+/// Report every change of the mainchain tip, independently of any slot.
+///
+/// The live streams already report every block a slot sees, so on the usual path
+/// this only confirms what a slot worker just said and the state worker's own
+/// deduplication drops it. It earns its place in the two cases the streams
+/// cannot cover: no slot is resolved, so there is no stream to report anything;
+/// and a stream that stops delivering without closing, which would otherwise
+/// freeze the refresh with nothing in the log to say so.
+///
+/// A failed read is not fatal. The record is untouched by a poll, and the state
+/// worker still has the slot workers: killing the extractor because one unary
+/// call timed out would be a worse trade than waiting for the next tick.
+async fn monitor_tip(
+    client: EnforcerClient,
+    interval: Duration,
+    heartbeat: Heartbeat,
+    block_tx: watch::Sender<Vec<u8>>,
+    shutdown_rx: watch::Receiver<bool>,
+) -> Result<()> {
+    tracing::info!(
+        interval_seconds = interval.as_secs(),
+        liveness_file = ?heartbeat.path(),
+        "started mainchain tip worker"
+    );
+
+    announce_tip_changes(client, interval, heartbeat, block_tx, shutdown_rx).await?;
+
+    tracing::info!("stopped mainchain tip worker");
+    Ok(())
+}
+
+async fn announce_tip_changes<S>(
+    mut source: S,
+    interval: Duration,
+    heartbeat: Heartbeat,
+    block_tx: watch::Sender<Vec<u8>>,
+    mut shutdown_rx: watch::Receiver<bool>,
+) -> Result<()>
+where
+    S: TipSource,
+{
+    loop {
+        tokio::select! {
+            biased;
+            () = wait_for_shutdown(&mut shutdown_rx) => return Ok(()),
+            () = tokio::time::sleep(interval) => {}
+        }
+
+        match source.read_tip().await {
+            Ok(tip) => {
+                // A read that succeeded is the proof the healthcheck wants: the
+                // process is scheduling and the enforcer is answering. A tip
+                // that has not moved still counts, because a quiet chain is not
+                // an unhealthy extractor.
+                heartbeat.beat();
+
+                // Only a move is reported. Re-announcing the same hash would
+                // still mark the channel changed, and the state worker would
+                // wake once per tick for nothing.
+                if *block_tx.borrow() != tip.hash {
+                    tracing::debug!(
+                        block_hash = %hex::encode(&tip.hash),
+                        height = ?tip.height,
+                        "the mainchain tip moved"
+                    );
+                    // A send failure only means the state worker already
+                    // stopped, which its own supervision reports.
+                    let _ = block_tx.send(tip.hash);
+                }
+            }
+            Err(error) => tracing::warn!(
+                error = %format!("{error:#}"),
+                "could not read the mainchain tip; retrying on the next tick"
+            ),
+        }
+    }
 }
 
 /// Re-read the mutable enforcer state on every tip change and publish what
@@ -434,8 +535,10 @@ where
             () = wait_for_shutdown(&mut shutdown_rx) => return Ok(()),
             result = block_rx.changed() => {
                 if result.is_err() {
-                    // Every slot worker dropped its sender, so no further tip
-                    // change can arrive.
+                    // Nothing holds a sender any more, so no further tip change
+                    // can arrive. In the running extractor the tip worker keeps
+                    // one open for as long as the process lives, so this is
+                    // reached only once every reporter is already gone.
                     return Ok(());
                 }
             }
@@ -670,9 +773,9 @@ mod tests {
     use tokio::time::timeout;
 
     use super::{
-        SourceFuture, StartupSource, StateSource, forward_stream, prepare_observation,
-        refresh_on_new_blocks, report_unobserved_slots, snapshot_tips_are_consistent,
-        supervise_workers,
+        Heartbeat, SourceFuture, StartupSource, StateSource, TipSource, announce_tip_changes,
+        forward_stream, prepare_observation, refresh_on_new_blocks, report_unobserved_slots,
+        snapshot_tips_are_consistent, supervise_workers,
     };
     use crate::proto::{common, mainchain};
     use crate::snapshot::InitialSnapshot;
@@ -1018,6 +1121,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn two_blocks_arriving_before_a_refresh_coalesce_into_one() {
+        // Pins the documented contract rather than avoiding it: the announcement
+        // channel keeps only the newest hash, so a refresh is a poll of "what is
+        // true now", not one reading per block. There is no way to do better
+        // with this API -- GetCtip and friends answer for the current tip, and no
+        // RPC answers "the state at block X" -- so the guarantee is one reading
+        // per observation, and consecutive readings are not consecutive blocks.
+        let snapshot_tip = vec![0x11; 32];
+        let (block_tx, block_rx) = watch::channel(snapshot_tip.clone());
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let source = FakeStateSource::new(vec![vec![ctip_payload(9, 250)]]);
+        let calls = Arc::clone(&source.calls);
+        let collected = Arc::clone(&source.collected);
+
+        let worker = tokio::spawn(refresh_on_new_blocks(
+            source,
+            vec![9],
+            state::Tracker::new(vec![ctip_payload(9, 100)]),
+            snapshot_tip,
+            block_rx,
+            shutdown_rx,
+            |_anchor, _payloads| async { Ok(()) },
+        ));
+
+        // Both sends happen with no await between them, so the worker cannot be
+        // polled in the middle: it is guaranteed to see only the second block.
+        block_tx.send(vec![0x22; 32]).expect("first new block");
+        block_tx.send(vec![0x33; 32]).expect("second new block");
+
+        collected.notified().await;
+        assert_eq!(
+            *calls.lock().expect("state call lock"),
+            1,
+            "two announcements before a refresh are one reading"
+        );
+
+        // And no second reading follows, because 0x22 was never observed.
+        timeout(TEST_QUIET_WINDOW, collected.notified())
+            .await
+            .expect_err("the skipped block must not produce its own reading");
+        assert_eq!(*calls.lock().expect("state call lock"), 1);
+
+        shutdown_tx.send(true).expect("send shutdown");
+        timeout(Duration::from_secs(1), worker)
+            .await
+            .expect("state worker finishes")
+            .expect("join state worker")
+            .expect("clean state worker shutdown");
+    }
+
+    #[tokio::test]
     async fn state_refreshes_once_per_block_and_publishes_only_changes() {
         let snapshot_tip = vec![0x11; 32];
         let (block_tx, block_rx) = watch::channel(snapshot_tip.clone());
@@ -1199,5 +1353,167 @@ mod tests {
 
         assert!(error.to_string().contains("worker failed"));
         assert!(dropped.load(Ordering::SeqCst), "sibling future was dropped");
+    }
+
+    /// Answers a configured sequence of tips, repeating the last one forever.
+    struct FakeTipSource {
+        tips: Arc<Mutex<VecDeque<Vec<u8>>>>,
+        last: Arc<Mutex<Vec<u8>>>,
+        reads: Arc<Mutex<usize>>,
+    }
+
+    impl FakeTipSource {
+        fn new(tips: Vec<Vec<u8>>) -> Self {
+            Self {
+                tips: Arc::new(Mutex::new(VecDeque::from(tips))),
+                last: Arc::new(Mutex::new(Vec::new())),
+                reads: Arc::new(Mutex::new(0)),
+            }
+        }
+    }
+
+    impl TipSource for FakeTipSource {
+        fn read_tip(&mut self) -> SourceFuture<'_, ObservedBlock> {
+            let tips = Arc::clone(&self.tips);
+            let last = Arc::clone(&self.last);
+            let reads = Arc::clone(&self.reads);
+            Box::pin(async move {
+                *reads.lock().expect("tip read lock") += 1;
+                let mut last = last.lock().expect("tip memo lock");
+                if let Some(tip) = tips.lock().expect("tip queue lock").pop_front() {
+                    *last = tip;
+                }
+                Ok(ObservedBlock::at_height(last.clone(), 996_259))
+            })
+        }
+    }
+
+    /// Short enough that a test can see several ticks, long enough that a busy
+    /// machine still gets through one.
+    const TEST_TIP_INTERVAL: Duration = Duration::from_millis(5);
+    /// Covers many ticks, so "nothing was announced" is a real observation
+    /// rather than a race the test won.
+    const TEST_QUIET_WINDOW: Duration = Duration::from_millis(150);
+
+    fn temporary_liveness_path(test: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("bip300-tip-liveness-{}-{test}", std::process::id()))
+    }
+
+    #[tokio::test]
+    async fn the_tip_worker_reports_only_a_moved_tip() {
+        let source = FakeTipSource::new(vec![
+            vec![0x11; 32], // the tip the channel already holds
+            vec![0x22; 32], // a move
+        ]);
+        let (block_tx, mut block_rx) = watch::channel(vec![0x11; 32]);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let liveness = temporary_liveness_path("moved-tip");
+        let worker = tokio::spawn(announce_tip_changes(
+            source,
+            TEST_TIP_INTERVAL,
+            Heartbeat::new(Some(liveness.clone())),
+            block_tx,
+            shutdown_rx,
+        ));
+
+        timeout(Duration::from_secs(5), block_rx.changed())
+            .await
+            .expect("the moved tip is announced")
+            .expect("the channel stays open");
+        assert_eq!(*block_rx.borrow_and_update(), vec![0x22; 32]);
+
+        // The fake keeps answering 0x22 from here on. Every following tick must
+        // be dropped, or the state worker would re-read the enforcer once per
+        // tick for a tip that never moved.
+        timeout(TEST_QUIET_WINDOW, block_rx.changed())
+            .await
+            .expect_err("an unchanged tip must not wake the state worker");
+
+        assert!(
+            liveness.exists(),
+            "a successful tip read is what the healthcheck reads"
+        );
+        std::fs::remove_file(&liveness).expect("clean up the liveness file");
+
+        shutdown_tx.send(true).expect("send shutdown");
+        timeout(Duration::from_secs(1), worker)
+            .await
+            .expect("the tip worker reacts to shutdown")
+            .expect("join tip worker")
+            .expect("clean tip worker shutdown");
+    }
+
+    #[tokio::test]
+    async fn a_failed_tip_read_is_not_fatal() {
+        struct FailingTipSource;
+
+        impl TipSource for FailingTipSource {
+            fn read_tip(&mut self) -> SourceFuture<'_, ObservedBlock> {
+                Box::pin(async { Err(anyhow!("the enforcer is not answering")) })
+            }
+        }
+
+        let (block_tx, _block_rx) = watch::channel(vec![0x11; 32]);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let liveness = temporary_liveness_path("failed-tip");
+        let mut worker = tokio::spawn(announce_tip_changes(
+            FailingTipSource,
+            TEST_TIP_INTERVAL,
+            Heartbeat::new(Some(liveness.clone())),
+            block_tx,
+            shutdown_rx,
+        ));
+
+        // A poll is not a record write, so a failure waits for the next tick
+        // instead of taking the extractor down with it.
+        timeout(TEST_QUIET_WINDOW, &mut worker)
+            .await
+            .expect_err("a failed tip read must not stop the worker");
+        assert!(
+            !liveness.exists(),
+            "an extractor that cannot read the tip must not report itself healthy"
+        );
+
+        shutdown_tx.send(true).expect("send shutdown");
+        timeout(Duration::from_secs(1), worker)
+            .await
+            .expect("the tip worker reacts to shutdown")
+            .expect("join tip worker")
+            .expect("clean tip worker shutdown");
+    }
+
+    #[tokio::test]
+    async fn the_state_worker_waits_for_shutdown_when_no_slot_is_observed() {
+        // Discovery on a network with no activation resolves zero slots, so no
+        // slot worker exists to report a block. The state worker must still be
+        // waiting on the tip worker's sender rather than deciding it is done:
+        // returning here used to end the process with a success code.
+        let (block_tx, block_rx) = watch::channel(vec![0x11; 32]);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let worker = tokio::spawn(refresh_on_new_blocks(
+            FakeStateSource::new(Vec::new()),
+            Vec::new(),
+            state::Tracker::new(Vec::new()),
+            vec![0x11; 32],
+            block_rx,
+            shutdown_rx,
+            |_anchor, _payloads| async { Ok(()) },
+        ));
+
+        tokio::task::yield_now().await;
+        assert!(
+            !worker.is_finished(),
+            "a live sender means further tip changes can still arrive"
+        );
+
+        shutdown_tx.send(true).expect("send shutdown");
+        timeout(Duration::from_secs(1), worker)
+            .await
+            .expect("the state worker reacts to shutdown")
+            .expect("join state worker")
+            .expect("clean state worker shutdown");
+        drop(block_tx);
     }
 }

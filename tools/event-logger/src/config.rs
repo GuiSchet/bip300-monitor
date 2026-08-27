@@ -15,6 +15,24 @@ pub struct Args {
     #[command(flatten)]
     pub nats: NatsArgs,
 
+    /// File whose modification time is refreshed while the subscription is live.
+    ///
+    /// The logger exposes no port, and a quiet chain looks exactly like a dead
+    /// transport: no messages either way. The heartbeat separates them by
+    /// round-tripping the NATS server on a timer and only refreshing the file
+    /// when that succeeds. Unset means no file is written.
+    #[arg(long, env = "BIP300_MONITOR_LIVENESS_FILE")]
+    pub liveness_file: Option<std::path::PathBuf>,
+
+    /// How often the subscription is confirmed, in seconds.
+    #[arg(
+        long,
+        env = "BIP300_MONITOR_LIVENESS_INTERVAL_SECONDS",
+        default_value_t = 30,
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
+    pub liveness_interval_seconds: u64,
+
     /// Default log level when RUST_LOG does not provide a filter.
     #[arg(
         long,
@@ -52,6 +70,11 @@ impl Args {
     }
 
     /// Return the configured graceful-shutdown timeout.
+    /// Return the configured interval between subscription confirmations.
+    pub const fn liveness_interval(&self) -> Duration {
+        Duration::from_secs(self.liveness_interval_seconds)
+    }
+
     pub const fn shutdown_timeout(&self) -> Duration {
         Duration::from_secs(self.shutdown_timeout_seconds)
     }

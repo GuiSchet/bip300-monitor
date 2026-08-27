@@ -83,6 +83,46 @@ fn ctip(sidechain_number: u32, value_sats: u64) -> events::enforcer_event::Event
     })
 }
 
+/// A kind that carries no slot, so its row records `sidechain = NULL`.
+fn chain_info() -> events::enforcer_event::Event {
+    events::enforcer_event::Event::ChainInfo(events::ChainInfo {
+        network: events::Network::Mainnet as i32,
+        bip300_constants: Some(events::Bip300Constants {
+            withdrawal_bundle_max_age: 26_300,
+            withdrawal_bundle_inclusion_threshold: 13_150,
+            used_sidechain_slot_proposal_max_age: 26_300,
+            used_sidechain_slot_activation_threshold: 160,
+            unused_sidechain_slot_proposal_max_age: 2_016,
+            unused_sidechain_slot_activation_threshold: 4,
+            activation_height: 963_648,
+        }),
+    })
+}
+
+fn chain_tip(hash: u8, height: u32) -> events::enforcer_event::Event {
+    events::enforcer_event::Event::ChainTip(events::ChainTip {
+        header: Some(events::BlockHeader {
+            hash: vec![hash; 32],
+            previous_hash: vec![hash.wrapping_sub(1); 32],
+            height,
+            chain_work: vec![0x44; 32],
+            timestamp: 1_750_000_000,
+        }),
+    })
+}
+
+fn sidechain_proposals() -> events::enforcer_event::Event {
+    events::enforcer_event::Event::SidechainProposals(events::SidechainProposalsSnapshot {
+        proposals: Vec::new(),
+    })
+}
+
+fn active_sidechains() -> events::enforcer_event::Event {
+    events::enforcer_event::Event::ActiveSidechains(events::ActiveSidechainsSnapshot {
+        sidechains: Vec::new(),
+    })
+}
+
 fn connected(sidechain_number: u32, height: u32, hash: u8) -> events::enforcer_event::Event {
     events::enforcer_event::Event::BlockConnected(events::BlockConnected {
         header: Some(events::BlockHeader {
@@ -147,6 +187,55 @@ async fn recording_the_same_observation_twice_keeps_one_row() {
     // The republish after a restart and the blocks replayed by a backfill are
     // both observations the record already holds.
     assert_eq!(store.record(&[event]).await.expect("replay"), 0);
+}
+
+#[tokio::test]
+async fn recording_the_same_global_observation_twice_keeps_one_row() {
+    // chain_info carries no slot, so its row records `sidechain = NULL`. A
+    // unique constraint that treats NULLs as distinct never matches those, and
+    // every restart would insert the snapshot again at the same block.
+    let store = store_for("idempotent_global", "enforcer").await;
+    let anchor = ObservedBlock::at_height(vec![0x22; 32], 996_260);
+    let event = envelope(chain_info(), Some(anchor), 1_700_000_000_000);
+
+    assert_eq!(
+        store
+            .record(std::slice::from_ref(&event))
+            .await
+            .expect("record"),
+        1
+    );
+    assert_eq!(store.record(&[event]).await.expect("replay"), 0);
+}
+
+#[tokio::test]
+async fn replaying_a_whole_snapshot_adds_no_rows() {
+    // The shape `record_snapshot` writes on every startup: two slot-less
+    // constants, two slot-less mutable snapshots, and one payload per slot, all
+    // anchored to the same tip.
+    let store = store_for("idempotent_snapshot", "enforcer").await;
+    let anchor = ObservedBlock::at_height(vec![0x22; 32], 996_260);
+    let snapshot: Vec<Event> = [
+        chain_info(),
+        chain_tip(0x22, 996_260),
+        sidechain_proposals(),
+        active_sidechains(),
+        ctip(9, 100),
+        ctip(98, 200),
+    ]
+    .into_iter()
+    .map(|payload| envelope(payload, Some(anchor.clone()), 1_700_000_000_000))
+    .collect();
+
+    assert_eq!(
+        store.record(&snapshot).await.expect("record the snapshot"),
+        snapshot.len() as u64
+    );
+    assert_eq!(
+        store.record(&snapshot).await.expect("republish"),
+        0,
+        "a restart at the same tip must not grow the record"
+    );
 }
 
 #[tokio::test]

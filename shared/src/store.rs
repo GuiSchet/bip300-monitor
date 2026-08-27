@@ -26,7 +26,17 @@ const DEFAULT_PORT: u16 = 5432;
 ///
 /// Every statement is idempotent, and `schema_version` records how far the
 /// record has been migrated so a future statement is applied exactly once.
-const MIGRATIONS: &[&str] = &[include_str!("../schema/0001_event.sql")];
+const MIGRATIONS: &[&str] = &[
+    include_str!("../schema/0001_event.sql"),
+    include_str!("../schema/0002_event_identity_nulls.sql"),
+];
+
+/// Advisory-lock key that serializes the migration of one record.
+///
+/// The check-then-apply below is two statements, so two processes starting at
+/// once would both see a version as unapplied and both run it. `ADD CONSTRAINT`
+/// is not idempotent, so the loser would fail its startup for no real reason.
+const MIGRATION_LOCK_KEY: i64 = 0x6231_3330_305f_6d6f;
 
 /// Reusable command-line arguments for the Postgres record.
 #[derive(ClapArgs, Clone)]
@@ -239,6 +249,27 @@ impl Store {
 
     async fn migrate(&self) -> Result<()> {
         let client = self.client.lock().await;
+        // Held for the whole migration, and released by the session ending even
+        // if this returns early: two extractors starting at once must not both
+        // decide a version is unapplied.
+        client
+            .execute("SELECT pg_advisory_lock($1)", &[&MIGRATION_LOCK_KEY])
+            .await
+            .context("taking the record migration lock")?;
+        let result = Self::apply_migrations(&client).await;
+        // Reported rather than propagated: the session holds the lock, so a
+        // failed unlock is released by the connection ending, and letting it
+        // replace a migration failure would hide the error that matters.
+        if let Err(error) = client
+            .execute("SELECT pg_advisory_unlock($1)", &[&MIGRATION_LOCK_KEY])
+            .await
+        {
+            tracing::warn!(%error, "could not release the record migration lock");
+        }
+        result
+    }
+
+    async fn apply_migrations(client: &Client) -> Result<()> {
         client
             .batch_execute(
                 "CREATE TABLE IF NOT EXISTS schema_version (

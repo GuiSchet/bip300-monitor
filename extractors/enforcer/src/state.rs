@@ -28,6 +28,13 @@ pub(crate) struct Reading {
 ///
 /// The tip is read first so the anchor never claims a block newer than the
 /// state it labels.
+///
+/// The anchor is that tip, not the block whose arrival triggered the read. These
+/// RPCs answer "what is true now", so the tip they were read against is the only
+/// block the reading honestly describes; if the chain moved in between, the
+/// anchor is the later block and the reading belongs to it. A consequence worth
+/// naming: that block may not have a `block_connected` row yet, because the slot
+/// worker that will record it has not seen it.
 pub(crate) async fn collect(client: &mut EnforcerClient, sidechains: &[u8]) -> Result<Reading> {
     let anchor = tip_anchor(&convert::chain_tip(client.get_chain_tip().await?)?)?;
     let payloads = collect_payloads(client, sidechains).await?;

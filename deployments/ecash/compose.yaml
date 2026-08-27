@@ -203,9 +203,24 @@ services:
       BIP300_MONITOR_FULL_EVENTS: ${BIP300_MONITOR_FULL_EVENTS:-true}
       BIP300_MONITOR_NATS_FLUSH_TIMEOUT_SECONDS: "10"
       BIP300_MONITOR_SHUTDOWN_TIMEOUT_SECONDS: "15"
+      BIP300_MONITOR_LIVENESS_FILE: /tmp/liveness
+      BIP300_MONITOR_LIVENESS_INTERVAL_SECONDS: "30"
     depends_on:
       nats:
         condition: service_healthy
+    # A quiet chain delivers nothing, so there is no message to wait for: the
+    # logger round-trips NATS on its own interval and refreshes the file only
+    # when that succeeds. The staleness bound is three intervals, so one slow
+    # round-trip is not an outage.
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          [ $$(( $$(date +%s) - $$(stat -c %Y /tmp/liveness) )) -lt 90 ]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
     networks:
       ecash-internal:
     read_only: true
@@ -246,6 +261,12 @@ services:
       BIP300_MONITOR_REQUEST_TIMEOUT_SECONDS: "10"
       BIP300_MONITOR_NATS_FLUSH_TIMEOUT_SECONDS: "10"
       BIP300_MONITOR_SHUTDOWN_TIMEOUT_SECONDS: "15"
+      # How much history one restart may recover. Past this the extractor
+      # records a window ending at the tip and warns that the rest was skipped,
+      # so raising it is how a long outage is closed rather than dropped.
+      BIP300_MONITOR_BACKFILL_MAX_BLOCKS: ${BIP300_MONITOR_BACKFILL_MAX_BLOCKS:-2000}
+      BIP300_MONITOR_TIP_POLL_INTERVAL_SECONDS: "30"
+      BIP300_MONITOR_LIVENESS_FILE: /tmp/liveness
     depends_on:
       enforcer:
         condition: service_healthy
@@ -257,6 +278,21 @@ services:
         condition: service_healthy
       postgres:
         condition: service_healthy
+    # The extractor exposes no port, so the tip poll is what proves it is alive:
+    # it refreshes this file only after the enforcer answers. `restart:
+    # unless-stopped` alone would leave a running-but-wedged extractor in place.
+    # The staleness bound is three poll intervals, so one slow answer is not an
+    # outage.
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          [ $$(( $$(date +%s) - $$(stat -c %Y /tmp/liveness) )) -lt 90 ]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      # The snapshot and the backfill both run before the first tip poll.
+      start_period: 180s
     networks:
       ecash-internal:
     read_only: true

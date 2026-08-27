@@ -66,7 +66,15 @@ impl EnforcerClient {
             .map(tonic::Response::into_inner)
     }
 
-    /// Fetch block information filtered for one sidechain slot.
+    /// Fetch a block and up to `max_ancestors` of its ancestors, newest-first,
+    /// with each block's contents narrowed to one sidechain slot.
+    ///
+    /// Every walked block is reported, including the ones that hold nothing for
+    /// the slot, which is what makes this the call a backfill can trust.
+    /// `GetTwoWayPegData` looks like the better fit and is not: it omits those
+    /// blocks entirely. The walk stops early, without an error, at the first
+    /// ancestor whose block info the enforcer does not hold, so a caller that
+    /// needs a specific range has to check what came back.
     pub async fn get_block_info(
         &mut self,
         block_hash: impl Into<String>,
@@ -117,36 +125,6 @@ impl EnforcerClient {
             .await
             .with_context(|| {
                 format!("calling ValidatorService.GetCtip for sidechain {sidechain_number}")
-            })
-            .map(tonic::Response::into_inner)
-    }
-
-    /// Fetch every block in a range, filtered for one sidechain slot.
-    ///
-    /// `start_block_hash` is **exclusive** and `end_block_hash` inclusive, and
-    /// the enforcer returns the blocks oldest-first. Omitting the start walks
-    /// back to genesis, so a caller without a starting point must bound the
-    /// request some other way. If the start is not an ancestor of the end — the
-    /// shape a reorg leaves behind — the call fails rather than returning a
-    /// partial range.
-    pub async fn get_two_way_peg_data(
-        &mut self,
-        sidechain_number: u8,
-        start_block_hash: Option<String>,
-        end_block_hash: impl Into<String>,
-    ) -> Result<mainchain::GetTwoWayPegDataResponse> {
-        let request = mainchain::GetTwoWayPegDataRequest {
-            sidechain_id: Some(u32::from(sidechain_number)),
-            start_block_hash: start_block_hash.map(reverse_hex),
-            end_block_hash: Some(reverse_hex(end_block_hash)),
-        };
-        self.inner
-            .get_two_way_peg_data(self.unary_request(request))
-            .await
-            .with_context(|| {
-                format!(
-                    "calling ValidatorService.GetTwoWayPegData for sidechain {sidechain_number}"
-                )
             })
             .map(tonic::Response::into_inner)
     }

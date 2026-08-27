@@ -40,8 +40,6 @@ while :; do
     verification_started_at="$(
         latest_timestamp "${extractor_started_before}" "${logger_started_before}"
     )"
-    # Rows outlive a container, so the record is only asked about this instance.
-    record_since="${extractor_started_before}"
     extractor_logs="$(
         compose logs --no-color --since "${verification_started_at}" \
             enforcer-extractor 2>/dev/null || true
@@ -65,21 +63,26 @@ while :; do
         snapshot_complete=false
     fi
 
-    # The record is the authoritative check. The BIP300 constants and the
-    # startup tip are recorded exactly once per instance, so a second one would
-    # mean an unnoticed republish; every other kind is re-recorded whenever a
-    # block changes it, so more than one is expected.
+    # The record is the authoritative check, asked about the block the snapshot
+    # is anchored to rather than about a time window. Recording is idempotent, so
+    # a restart at an unchanged tip inserts nothing, and a window would read that
+    # healthy state as a missing snapshot. The block is the stricter scope
+    # anyway, because a previous run's rows are at a previous block. Which
+    # instance published is a separate question, already answered above by the
+    # log window.
+    snapshot_anchor=''
     if [[ "${snapshot_complete}" == true ]]; then
-        for event_kind in chain_info chain_tip; do
-            if [[ "$(record_event_count "${event_kind}" "${record_since}")" != 1 ]]; then
-                snapshot_complete=false
-                break
-            fi
-        done
+        snapshot_anchor="$(record_snapshot_anchor)" || snapshot_anchor=''
+        if [[ ! "${snapshot_anchor}" =~ ^[[:xdigit:]]{64}$ ]]; then
+            snapshot_complete=false
+        fi
     fi
+    # Exactly one, not at least one: a second row at the same block would mean
+    # the identity constraint stopped collapsing a republished snapshot, which is
+    # the shape of unbounded growth rather than of a missing event.
     if [[ "${snapshot_complete}" == true ]]; then
-        for event_kind in sidechain_proposals active_sidechains; do
-            if ! record_has_event "${event_kind}" "${record_since}"; then
+        for event_kind in chain_info chain_tip sidechain_proposals active_sidechains; do
+            if [[ "$(record_event_count_at "${event_kind}" "${snapshot_anchor}")" != 1 ]]; then
                 snapshot_complete=false
                 break
             fi
@@ -87,9 +90,9 @@ while :; do
     fi
     if [[ "${snapshot_complete}" == true ]]; then
         for sidechain in "${sidechains[@]}"; do
-            if ! record_has_event ctip "${record_since}" "${sidechain}" ||
-                ! record_has_event \
-                    withdrawal_bundle_proposals "${record_since}" "${sidechain}"; then
+            if [[ "$(record_event_count_at ctip "${snapshot_anchor}" "${sidechain}")" != 1 ]] ||
+                [[ "$(record_event_count_at withdrawal_bundle_proposals \
+                    "${snapshot_anchor}" "${sidechain}")" != 1 ]]; then
                 snapshot_complete=false
                 break
             fi

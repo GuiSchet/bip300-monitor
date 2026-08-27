@@ -66,6 +66,30 @@ pub struct Args {
     )]
     pub backfill_max_blocks: u32,
 
+    /// How often the mainchain tip is re-read, in seconds.
+    ///
+    /// The live streams already report every block, so this is not the usual
+    /// path. It exists because the state worker has to be woken by something
+    /// that does not depend on a slot being observed: with no slot resolved
+    /// there is no stream at all, and a stream that wedges without closing
+    /// would otherwise stop the refresh silently.
+    #[arg(
+        long,
+        env = "BIP300_MONITOR_TIP_POLL_INTERVAL_SECONDS",
+        default_value_t = 30,
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
+    pub tip_poll_interval_seconds: u64,
+
+    /// File whose modification time is refreshed on every successful tip read.
+    ///
+    /// The extractor exposes no port, so a container healthcheck has nothing to
+    /// ask. This gives it something: the time is refreshed by work that only
+    /// succeeds when the enforcer is answering, so a wedged process stops
+    /// refreshing it. Unset means no file is written.
+    #[arg(long, env = "BIP300_MONITOR_LIVENESS_FILE")]
+    pub liveness_file: Option<std::path::PathBuf>,
+
     /// Timeout in seconds for connections, unary requests, and stream setup.
     #[arg(
         long,
@@ -108,6 +132,11 @@ impl Args {
     /// Return the configured request timeout.
     pub const fn request_timeout(&self) -> Duration {
         Duration::from_secs(self.request_timeout_seconds)
+    }
+
+    /// Return the configured interval between tip polls.
+    pub const fn tip_poll_interval(&self) -> Duration {
+        Duration::from_secs(self.tip_poll_interval_seconds)
     }
 
     /// Return the configured graceful-shutdown timeout.

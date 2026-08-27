@@ -6,6 +6,7 @@ mod config;
 mod format;
 
 use anyhow::{Context, Result};
+use shared::liveness::Heartbeat;
 use shared::nats::{EventSubscriber, ReceivedEvent};
 use shared::nats_subjects::Subject;
 use shared::protobuf::event::Event;
@@ -36,13 +37,34 @@ pub async fn run(args: Args, mut shutdown_rx: watch::Receiver<bool>) -> Result<(
         "event logger subscription is ready"
     );
 
+    let heartbeat = Heartbeat::new(args.liveness_file.clone());
+    let liveness_interval = args.liveness_interval();
+    // The first beat says the subscription was established, so a healthcheck
+    // does not have to wait out one interval before the logger looks alive.
+    heartbeat.beat();
+
     let mut invalid_event_count = 0_u64;
     loop {
         let received = tokio::select! {
             biased;
             () = wait_for_shutdown(&mut shutdown_rx) => break,
+            () = tokio::time::sleep(liveness_interval) => {
+                // A quiet chain and a dead transport both deliver nothing, so
+                // the timer round-trips the server rather than beating blind. A
+                // failure is only reported: the next `next_event` is what turns
+                // a genuinely lost subscription into a fatal error.
+                match subscriber.confirm_connection().await {
+                    Ok(()) => heartbeat.beat(),
+                    Err(error) => tracing::warn!(
+                        error = %format!("{error:#}"),
+                        "could not confirm the NATS subscription"
+                    ),
+                }
+                continue;
+            }
             result = subscriber.next_event() => result.context("receiving the next monitor event")?,
         };
+        heartbeat.beat();
         let event = match received {
             ReceivedEvent::Decoded(event) => event,
             ReceivedEvent::Invalid { error, payload_len } => {

@@ -40,7 +40,22 @@ variant in the first pilot.
 - Because a refresh is a poll rather than a per-block query, a snapshot
   describes the state at the moment it was read. Under fast blocks two heights
   can coalesce into one refresh, so consecutive snapshots are consecutive
-  observations, not consecutive blocks.
+  observations, not consecutive blocks. This is a property of the enforcer API,
+  not of the monitor: `GetCtip`, `GetSidechains`, `GetSidechainProposals` and
+  `GetWithdrawalBundleProposals` only answer for the current tip, and no RPC
+  answers "the state at block X", so a value that changed and reverted inside one
+  coalesced window leaves no observation behind.
+- A snapshot's `observed_at_block` is the tip it was read against, which under a
+  moving chain can be a later block than the one whose arrival triggered the
+  read — and can therefore be a block with no `BlockConnected` of its own yet.
+- Reorgs are recorded, not repaired. `BlockDisconnected` says a block left the
+  chain; the `BlockConnected` that preceded it stays in the record, unmarked,
+  because the envelope is a log of observations rather than a view of the current
+  chain. Reconstructing the surviving chain is the consumer's job. Two
+  consequences follow: a block that is disconnected and then connected again
+  produces no second `BlockConnected`, since it is the same observation of the
+  same block; and the backfill checkpoint, being the highest recorded height,
+  can name an orphan until a later block outgrows it.
 - `WithdrawalBundleProposalsSnapshot` carries the bundles still being voted on.
   Its `vote_count` is read against
   `Bip300Constants.withdrawal_bundle_inclusion_threshold` and its

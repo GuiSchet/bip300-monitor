@@ -32,6 +32,11 @@ CREATE TABLE IF NOT EXISTS event (
 -- A named constraint rather than a bare unique index, because the writer names
 -- it in ON CONFLICT: an unnamed index would let a schema change silently move
 -- the conflict target.
+--
+-- As written below this holds only for the kinds that carry a slot: Postgres
+-- treats NULLs in a unique constraint as distinct, so the slot-less kinds never
+-- conflicted. `0002_event_identity_nulls.sql` is what makes the claim above
+-- true. This file is left as it was applied.
 ALTER TABLE event
     DROP CONSTRAINT IF EXISTS event_identity;
 ALTER TABLE event

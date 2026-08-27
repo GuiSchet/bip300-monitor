@@ -429,19 +429,36 @@ count_snapshot_events() {
     printf '%s\n' "${count}"
 }
 
-# Counts rows the record itself holds, which is the authoritative check: the log
-# lines only show what reached a live consumer.
+# The block the newest recorded snapshot is anchored to, as a hex hash.
 #
-# `since` matters. The record is durable, so without it a previous run's rows
-# would satisfy the check and a completely broken instance would still verify.
-record_event_count() {
+# `chain_tip` is recorded once per snapshot and nowhere else, so its newest row
+# names the block the current snapshot describes.
+record_snapshot_anchor() {
+    postgres_query \
+        "SELECT encode(block_hash, 'hex') FROM event
+          WHERE kind = 'chain_tip' AND block_hash IS NOT NULL
+          ORDER BY id DESC LIMIT 1"
+}
+
+# Rows of one kind the record holds at one block, for one slot when given.
+#
+# The record itself is the authoritative check: the log lines only show what
+# reached a live consumer. It is scoped by block rather than by `observed_at`,
+# and that is the whole point. A republished snapshot is idempotent, so a restart
+# at an unchanged tip inserts nothing, and a time window would read that healthy
+# state as a missing snapshot. The block is also the stricter scope, because a
+# previous run's rows are at a previous block -- which is what a time window was
+# there to guard against. Which instance published is a separate question,
+# answered by the log window before this is asked.
+record_event_count_at() {
     local kind="$1"
-    local since="$2"
+    local block_hash="$2"
     local sidechain="${3:-}"
-    local -a filters=(--set=kind="${kind}" --set=since="${since}")
-    local predicate="kind = :'kind' AND observed_at >= :'since'::timestamptz"
+    local -a filters=(--set=kind="${kind}" --set=block_hash="${block_hash}")
+    local predicate="kind = :'kind' AND block_hash = decode(:'block_hash', 'hex')"
 
     [[ "${kind}" =~ ^[a-z_]+$ ]] || return 1
+    [[ "${block_hash}" =~ ^[[:xdigit:]]{64}$ ]] || return 1
     if [[ -n "${sidechain}" ]]; then
         [[ "${sidechain}" =~ ^[0-9]+$ ]] || return 1
         filters+=(--set=sidechain="${sidechain}")
@@ -451,10 +468,10 @@ record_event_count() {
     postgres_query "SELECT count(*) FROM event WHERE ${predicate}" "${filters[@]}"
 }
 
-record_has_event() {
+record_has_event_at() {
     local count
 
-    count="$(record_event_count "$@")" || return 1
+    count="$(record_event_count_at "$@")" || return 1
     [[ "${count}" =~ ^[0-9]+$ ]] || return 1
     ((count >= 1))
 }
@@ -571,6 +588,73 @@ require_rpc_cookie_readable() {
     fi
 
     die "the node RPC cookie ${cookie} is owned by ${cookie_uid}:${cookie_gid} with mode ${cookie_mode}, but the enforcer runs as ${PUID}:${PGID} and cannot read it; the node image did not honour UID/GID"
+}
+
+# The extractor runs as 10001:${PGID} and reads the Postgres password from a
+# bind mount. Nothing else notices when it cannot: the container just dies during
+# startup with a connection error that names the wrong cause. The sibling check
+# above exists for the node cookie for exactly this reason.
+require_postgres_secret_readable() {
+    local mode
+    local secret
+    local secret_gid
+    local secret_mode
+    local secret_uid
+
+    secret="$(data_root)/secrets/postgres-password"
+    [[ -f "${secret}" ]] ||
+        die "the Postgres password does not exist yet: ${secret}; run \`just init\` first"
+
+    read -r secret_uid secret_gid secret_mode < <(
+        stat --format='%u %g %a' "${secret}"
+    )
+    mode="$((8#${secret_mode}))"
+
+    # The extractor has its own UID, so only the group and other bits can help
+    # it. PUID is still accepted because a run as that user reads its own file.
+    if [[ "${secret_uid}" == "${PUID}" ]] && ((mode & 0400)); then
+        return 0
+    fi
+    if [[ "${secret_gid}" == "${PGID}" ]] && ((mode & 0040)); then
+        return 0
+    fi
+    if ((mode & 0004)); then
+        return 0
+    fi
+
+    die "the Postgres password ${secret} is owned by ${secret_uid}:${secret_gid} with mode ${secret_mode}, but the extractor runs as 10001:${PGID} and cannot read it; re-run \`just init\` or chgrp it to ${PGID}"
+}
+
+# The Compose file and VERSIONS.lock describe one system and have to move
+# together: Compose says the extractor records to Postgres and refreshes a
+# liveness file, and only an image built from code that does both can honour
+# that. A pin left behind starts containers that ignore the Postgres settings
+# entirely and never go healthy, which reads as a broken deployment rather than
+# as a forgotten promotion.
+#
+# Deliberately here and not in static-check.sh: that one runs in CI on every pull
+# request, and pull requests structurally cannot publish images, so the same
+# assertion there would fail every branch that touches the monitor.
+require_pinned_images_current() {
+    local changed
+    local short="${MONITOR_IMAGE_COMMIT:0:12}"
+
+    # A deployment unpacked from a tarball has no history to compare against.
+    git -C "${DEPLOYMENT_ROOT}" rev-parse --git-dir >/dev/null 2>&1 || return 0
+
+    git -C "${DEPLOYMENT_ROOT}" cat-file -e "${MONITOR_IMAGE_COMMIT}^{commit}" 2>/dev/null ||
+        die "MONITOR_IMAGE_COMMIT ${short} is not a commit in this checkout; fetch it or correct VERSIONS.lock"
+    git -C "${DEPLOYMENT_ROOT}" merge-base --is-ancestor "${MONITOR_IMAGE_COMMIT}" HEAD ||
+        die "the pinned monitor images are from ${short}, which is not an ancestor of this checkout; deploy from a tree that contains what is pinned"
+
+    # `:/` anchors each pathspec to the repository root. Without it they resolve
+    # against DEPLOYMENT_ROOT, match nothing, and the guard passes every time.
+    changed="$(
+        git -C "${DEPLOYMENT_ROOT}" rev-list --count \
+            "${MONITOR_IMAGE_COMMIT}..HEAD" -- :/shared :/extractors :/tools :/proto
+    )"
+    ((changed == 0)) ||
+        die "the pinned monitor images are from ${short}, but ${changed} commits have changed the monitor sources since; merge to main, let CI publish, and promote the digests in VERSIONS.lock before deploying"
 }
 
 require_node_peer() {

@@ -118,27 +118,6 @@ pub fn ctip(
     )))
 }
 
-/// Convert `GetTwoWayPegData` results, which arrive oldest-first.
-pub fn two_way_peg_data(
-    sidechain_number: u8,
-    response: mainchain::GetTwoWayPegDataResponse,
-) -> Result<Vec<events::EnforcerEvent>> {
-    response
-        .blocks
-        .into_iter()
-        .enumerate()
-        .map(|(index, block)| {
-            let header = required(
-                block.block_header_info,
-                "two_way_peg_data.blocks[].block_header_info",
-            )?;
-            let info = required(block.block_info, "two_way_peg_data.blocks[].block_info")?;
-            connected_block(sidechain_number, header, info)
-                .with_context(|| format!("converting two-way peg data at index {index}"))
-        })
-        .collect()
-}
-
 /// Convert `GetWithdrawalBundleProposals` into a snapshot scoped to one slot.
 pub fn withdrawal_bundle_proposals(
     sidechain_number: u8,

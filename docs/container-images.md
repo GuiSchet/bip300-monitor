@@ -43,13 +43,35 @@ Docker Hub credentials live in the `DOCKERHUB_TOKEN` repository secret for the
 `guischet` account. Secrets are unavailable to pull requests, which is what
 makes the "PRs cannot publish" property structural rather than conventional.
 
+## Release order
+
+The Compose file and `VERSIONS.lock` describe one system, so they move together.
+Compose says the extractor records to Postgres and refreshes a liveness file;
+only an image built from code that does both can honour that. Deploying with a
+pin left behind starts containers that ignore the Postgres settings entirely and
+never go healthy — which reads as a broken deployment rather than as a forgotten
+promotion.
+
+1. Merge to `main`. Pull requests structurally cannot publish, because the Docker
+   Hub secret is unavailable to them.
+2. CI builds and publishes `sha-<commit>` for both monitor images.
+3. Resolve the digests and promote them in `VERSIONS.lock`, together with
+   `MONITOR_IMAGE_COMMIT`, as its own commit.
+4. Deploy.
+
+`preflight.sh` enforces the order rather than trusting anyone to remember it: it
+refuses to start when commits have touched `shared/`, `extractors/`, `tools/` or
+`proto/` since the pinned commit. It is deliberately not a CI check — CI runs on
+pull requests, which cannot publish, so the same assertion there would fail every
+branch that touches the monitor.
+
 ## Pinning
 
 Deployments must pin by digest, never by tag. `deployments/ecash/VERSIONS.lock`
 records the digest alongside the tag it came from:
 
 ```text
-ENFORCER_EXTRACTOR_IMAGE=docker.io/guischet/bip300-enforcer-extractor:sha-7295bce0e4e8@sha256:bb7ce9...
+ENFORCER_EXTRACTOR_IMAGE=docker.io/guischet/bip300-enforcer-extractor:sha-29406f6ceb28@sha256:944f14...
 ```
 
 Resolve a digest with:

@@ -10,7 +10,7 @@ use shared::protobuf::enforcer_extractor::{
     Bip300Constants, ChainInfo, EnforcerEvent, Network, enforcer_event,
 };
 use shared::protobuf::event::{Event, ObservedBlock, event::MonitorEvent};
-use tokio::time::{sleep, timeout};
+use tokio::time::{Instant, sleep, timeout};
 
 struct TestNatsServer {
     child: Option<Child>,
@@ -204,14 +204,29 @@ async fn detected_server_loss_makes_publish_and_flush_time_out() {
     .expect("system clock after Unix epoch");
 
     server.stop();
-    sleep(Duration::from_millis(250)).await;
-    let error = timeout(
-        Duration::from_secs(2),
-        publisher.publish_and_flush(Subject::Enforcer, &event),
-    )
-    .await
-    .expect("publish and flush is bounded")
-    .expect_err("server loss must make the flush fail");
+
+    // Retried rather than slept on: what this waits for is async-nats noticing
+    // the socket is gone, and until it does, a publish lands in the reconnect
+    // buffer and the flush can still succeed. A fixed delay short enough to keep
+    // the test fast is not long enough on a loaded runner, so the loop waits for
+    // the transition itself and the deadline is what fails a real regression.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let error = loop {
+        let attempt = timeout(
+            Duration::from_secs(2),
+            publisher.publish_and_flush(Subject::Enforcer, &event),
+        )
+        .await
+        .expect("publish and flush is bounded");
+        match attempt {
+            Err(error) => break error,
+            Ok(()) => assert!(
+                Instant::now() < deadline,
+                "server loss never made the flush fail"
+            ),
+        }
+        sleep(Duration::from_millis(50)).await;
+    };
 
     assert!(
         format!("{error:#}").contains("flushing the Core NATS connection"),

@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
+use async_nats::connection::State;
 use async_nats::{Client, ConnectOptions, Event as NatsEvent, Subscriber};
 use clap::Args as ClapArgs;
 use futures_util::StreamExt;
@@ -138,8 +139,15 @@ pub struct EventPublisher {
 
 impl EventPublisher {
     /// Connect a publisher using the supplied NATS configuration.
+    ///
+    /// Publication is best-effort, so an unreachable server must not stop the
+    /// extractor: `retry_on_initial_connect` makes this return a client that
+    /// reconnects in the background, and the event callback reports every
+    /// transition. A malformed configuration is still fatal, because
+    /// `connect_options` rejects it before any socket is opened.
     pub async fn connect(args: &NatsArgs, client_name: &'static str) -> Result<Self> {
         let client = connect_options(args, client_name)?
+            .retry_on_initial_connect()
             .connect(&args.nats_url)
             .await
             .with_context(|| format!("connecting to Core NATS at `{}`", args.nats_url))?;
@@ -164,9 +172,98 @@ impl EventPublisher {
         self.flush().await
     }
 
+    /// Whether the transport is established right now.
+    ///
+    /// `Pending` counts as not connected, and that distinction is the whole
+    /// point: a client built with `retry_on_initial_connect` that has never
+    /// reached a server sits in `Pending`, never in `Disconnected`.
+    pub fn is_connected(&self) -> bool {
+        self.client.connection_state() == State::Connected
+    }
+
+    /// Publish a batch best-effort, bounded by the flush budget.
+    ///
+    /// `Client::publish` is an `await` on a bounded queue that only the
+    /// connection task drains, and that task does not run while it is
+    /// reconnecting. So publishing into a disconnected client fills the queue --
+    /// 2048 messages by default -- and then blocks the caller for as long as the
+    /// server stays away. A first-sight backfill is thousands of events, which
+    /// is exactly the burst that reaches the bound, and the caller it would
+    /// block is the extractor's startup path.
+    ///
+    /// Hence two bounds. The state check keeps a known outage from queueing
+    /// anything at all, and the timeout covers a disconnect that lands
+    /// mid-batch. Skipping a batch does discard messages that a reconnect might
+    /// have delivered, but that would only ever be an arbitrary 2048-message
+    /// prefix, Core NATS replays nothing for a consumer that was away, and the
+    /// record already holds every event. Best-effort has to mean best-effort:
+    /// the alternative here is a stalled extractor.
+    pub async fn publish_batch(&self, subject: Subject, events: &[Event]) -> FanOut {
+        let observed = events.len();
+        if observed == 0 {
+            return FanOut::default();
+        }
+        if !self.is_connected() {
+            return FanOut {
+                observed,
+                published: 0,
+                failure: Some("the Core NATS connection is not established".to_owned()),
+            };
+        }
+
+        let mut published = 0;
+        let mut failure = None;
+        let bounded = timeout(self.flush_timeout, async {
+            for event in events {
+                // One bad event must not abandon the rest of the batch; they are
+                // independent, and the timeout is what bounds a broken transport.
+                match self.publish(subject, event).await {
+                    Ok(()) => published += 1,
+                    Err(error) => {
+                        failure.get_or_insert_with(|| format!("{error:#}"));
+                    }
+                }
+            }
+        })
+        .await;
+
+        if bounded.is_err() {
+            failure = Some(format!(
+                "timed out after {}s while publishing the batch",
+                self.flush_timeout.as_secs()
+            ));
+        } else if let Err(error) = self.flush().await {
+            failure.get_or_insert_with(|| format!("{error:#}"));
+        }
+
+        FanOut {
+            observed,
+            published,
+            failure,
+        }
+    }
+
     /// Wait until the NATS client transport buffer has been flushed.
     pub async fn flush(&self) -> Result<()> {
         flush_client(&self.client, self.flush_timeout).await
+    }
+}
+
+/// What one best-effort fan-out managed to do.
+#[derive(Debug, Default)]
+pub struct FanOut {
+    /// Events the batch offered.
+    pub observed: usize,
+    /// Events handed to the transport.
+    pub published: usize,
+    /// Why the rest were dropped, when some were.
+    pub failure: Option<String>,
+}
+
+impl FanOut {
+    /// Events the transport never took.
+    pub const fn dropped(&self) -> usize {
+        self.observed - self.published
     }
 }
 
@@ -194,6 +291,11 @@ pub struct EventSubscriber {
 
 impl EventSubscriber {
     /// Connect and register a subscription before returning.
+    ///
+    /// Deliberately fail-fast, unlike [`EventPublisher::connect`]: a subscriber
+    /// exists only to receive, so an unreachable server is its whole job
+    /// failing rather than a degraded side channel. Retrying here would also
+    /// hang the flush that confirms the subscription.
     pub async fn connect(
         args: &NatsArgs,
         subject: Subject,
@@ -232,6 +334,17 @@ impl EventSubscriber {
             Ok(event) => ReceivedEvent::Decoded(event),
             Err(error) => ReceivedEvent::Invalid { error, payload_len },
         })
+    }
+
+    /// Round-trip the server to confirm the subscription is still live.
+    ///
+    /// A subscriber has no other way to tell "the chain is quiet" from "the
+    /// transport died": both look like no messages arriving. A flush is answered
+    /// by the server, so it fails when the connection is gone.
+    pub async fn confirm_connection(&self) -> Result<()> {
+        flush_client(&self.client, self.flush_timeout)
+            .await
+            .with_context(|| format!("confirming the NATS subscription to `{}`", self.subject))
     }
 
     /// Remove the subscription and flush the client transport.
@@ -273,11 +386,99 @@ async fn flush_client(client: &Client, flush_timeout: Duration) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::net::TcpListener;
     use std::time::Duration;
 
-    use super::{NatsArgs, connect_options};
+    use tokio::time::timeout;
+
+    use super::{EventPublisher, NatsArgs, connect_options};
+    use crate::nats_subjects::Subject;
+    use crate::protobuf::enforcer_extractor as events;
+    use crate::protobuf::event::{Event, ObservedBlock, event::MonitorEvent};
 
     const TEST_CLIENT_NAME: &str = "bip300-monitor-test";
+
+    /// A port nothing is listening on, taken by binding and releasing it.
+    fn closed_port() -> u16 {
+        TcpListener::bind("127.0.0.1:0")
+            .expect("bind an ephemeral port")
+            .local_addr()
+            .expect("read the bound port")
+            .port()
+    }
+
+    fn ctip_event() -> Event {
+        Event::new(
+            MonitorEvent::Enforcer(events::EnforcerEvent {
+                event: Some(events::enforcer_event::Event::Ctip(events::CtipSnapshot {
+                    sidechain_number: 9,
+                    ctip: None,
+                })),
+            }),
+            Some(ObservedBlock::at_height(vec![0x11; 32], 996_259)),
+        )
+        .expect("system clock after the Unix epoch")
+    }
+
+    #[tokio::test]
+    async fn a_batch_never_blocks_when_the_transport_never_connected() {
+        // Regression. `Client::publish` awaits a bounded queue that only the
+        // connection task drains, and with retry-on-initial-connect that task
+        // stays inside its reconnect loop and never drains anything. A batch
+        // larger than the queue used to park the caller until a server appeared
+        // -- on the extractor's startup path, that meant a first-sight backfill
+        // stalled the process with its rows already committed and no worker
+        // running.
+        let publisher = EventPublisher::connect(
+            &NatsArgs {
+                nats_url: format!("nats://127.0.0.1:{}", closed_port()),
+                nats_flush_timeout_seconds: 1,
+                ..NatsArgs::default()
+            },
+            TEST_CLIENT_NAME,
+        )
+        .await
+        .expect("retry-on-initial-connect yields a client with no server present");
+
+        assert!(
+            !publisher.is_connected(),
+            "a client that never reached a server is Pending, which is not connected"
+        );
+
+        // Comfortably past the 2048-message default queue.
+        let batch = vec![ctip_event(); 3_000];
+        let outcome = timeout(
+            Duration::from_secs(5),
+            publisher.publish_batch(Subject::Enforcer, &batch),
+        )
+        .await
+        .expect("a best-effort fan-out must never block its caller");
+
+        assert_eq!(outcome.published, 0);
+        assert_eq!(outcome.dropped(), 3_000);
+        assert!(
+            outcome.failure.is_some(),
+            "a dropped batch has to say why, or the gap reads as nothing happened"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_empty_batch_is_not_reported_as_a_failure() {
+        let publisher = EventPublisher::connect(
+            &NatsArgs {
+                nats_url: format!("nats://127.0.0.1:{}", closed_port()),
+                nats_flush_timeout_seconds: 1,
+                ..NatsArgs::default()
+            },
+            TEST_CLIENT_NAME,
+        )
+        .await
+        .expect("retry-on-initial-connect yields a client with no server present");
+
+        let outcome = publisher.publish_batch(Subject::Enforcer, &[]).await;
+        assert_eq!(outcome.observed, 0);
+        assert!(outcome.failure.is_none());
+    }
 
     #[test]
     fn accepts_anonymous_and_password_authentication() {

@@ -80,14 +80,19 @@ jobs:
             git ls-files | .github/scripts/classify-changes.sh
           fi
 
-  # Run the expensive Rust suite only when code, image inputs, or CI behavior
-  # changed. A deployment-only PR skips this job.
+  # Run the expensive Rust suite when code, image inputs, or CI behavior
+  # changed -- and also on a deployment-only change, because the deployment
+  # checks assert things about the binaries: `static-check.sh` pins the
+  # extractor's environment variables and `verify-live.sh` matches its log
+  # lines. Skipping the Rust suite there let a rename break the deployment with
+  # both CI paths green.
   quality:
     name: Rust quality checks
     needs: changes
     if: >-
       needs.changes.outputs.rust == 'true'
       || needs.changes.outputs.image_inputs == 'true'
+      || needs.changes.outputs.deployment == 'true'
       || needs.changes.outputs.workflow == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 20
