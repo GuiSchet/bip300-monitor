@@ -48,19 +48,34 @@ just snapshot
 just status
 ```
 
-Once the node reaches the active network tip and finishes validating the
-AssumeUTXO history, start the pinned validator-only enforcer. Wallet and mining
-services remain disabled:
+Once the snapshot-backed node reaches the active network tip, start the pinned
+validator-only enforcer. Wallet and mining services remain disabled:
 
 ```bash
 just enforcer-up
 just status
 ```
 
-`initialblockdownload=false` only means the snapshot-backed chainstate can
-serve the active tip. `just enforcer-up` also requires `getchainstates` to
-return one fully validated chainstate, preventing the enforcer from reading
-unavailable historical blocks.
+The default `.env.example` deliberately sets
+`TRUST_ASSUMEUTXO_SNAPSHOT=true`. With that policy, `just enforcer-up` accepts
+either a fully validated chainstate or exactly two chainstates whose active one
+is backed by the pinned activation block. It never accepts an arbitrary
+snapshot: the downloaded file must match the size and SHA-256 in
+`VERSIONS.lock`, and `loadtxoutset` must deserialize it and match its UTXO hash
+to the AssumeUTXO commitment compiled into the pinned node image.
+
+This removes historical validation from the deployment's critical path; it
+does not disable it. The node continues its independent replay from genesis in
+the background. `just status` reports `history_fully_validated`,
+`trusted_snapshot_ready`, and `monitoring_ready` separately so accepting the
+snapshot is never confused with finishing that replay. Set
+`TRUST_ASSUMEUTXO_SNAPSHOT=false` to restore the full-history gate.
+
+This is an explicit trust tradeoff: before the replay finishes, the deployment
+trusts the locked node build and snapshot commitments. Alphanet is experimental
+and must not carry real funds. The enforcer also performs its own initial block
+sync, so its first startup can still take time even though node history no
+longer blocks it.
 
 Start the observation pipeline after the enforcer catches up:
 
@@ -98,9 +113,16 @@ live checks and atomically writes `${ECASH_DATA_ROOT}/.deployment-accepted`.
 The marker records the network, repository SHA, image/source pins, and verified
 live block. Acceptance refuses to run from a dirty Git checkout.
 
-Timeouts can be adjusted in `.env`. All values in `VERSIONS.lock` are
-repository-owned pins and cannot be overridden there. `just down` stops the
-stack without deleting `${ECASH_DATA_ROOT}`.
+Timeouts can be adjusted in `.env`. `SNAPSHOT_RPC_WAIT_SECONDS` lets the
+snapshot command remain parked while a recovering node keeps RPC in warmup,
+instead of exiting and re-hashing the 9.5 GB file on every service retry. All
+values in `VERSIONS.lock` are repository-owned pins and cannot be overridden
+there. `just down` stops the stack without deleting `${ECASH_DATA_ROOT}`.
+
+Existing installations keep their conservative behavior until
+`TRUST_ASSUMEUTXO_SNAPSHOT=true` is added to their `.env`; `just init` never
+overwrites an existing file. New installations receive the reviewed setting
+from `.env.example`.
 
 ## Network configuration
 
@@ -165,11 +187,10 @@ pinned commit, so the order is checked rather than remembered. Details in
 
 ## Knowing the monitor is alive
 
-Neither monitor service exposes a port, so `restart: unless-stopped` on its own
-only covers a process that exits — not one that is running and no longer doing
-its work. Each refreshes `/tmp/liveness` from something that only succeeds when
-it is healthy, and its healthcheck fails once that file is older than three
-intervals:
+Neither monitor service exposes a port, so a restart policy only covers a
+process that exits — not one that is running and no longer doing its work. Each
+refreshes `/tmp/liveness` from something that only succeeds when it is healthy,
+and its healthcheck fails once that file is older than three intervals:
 
 - The **extractor** refreshes it on every successful tip read, which proves both
   that it is scheduling and that the enforcer is answering. A quiet chain still
@@ -177,6 +198,12 @@ intervals:
 - The **event logger** refreshes it on every event and, on a timer, after a
   round-trip to the NATS server. A quiet chain and a dead subscription both
   deliver no messages, and the round-trip is what separates them.
+
+The node uses `restart: unless-stopped` so it can resume long-running sync and
+background validation after a VM reboot. Every dependent service uses
+`restart: on-failure`: crashes still recover, but a Docker daemon restart does
+not start the enforcer and monitor out of order before the bootstrap checks the
+node and snapshot again.
 
 ## Persistent layout
 
