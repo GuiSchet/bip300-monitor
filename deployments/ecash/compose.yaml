@@ -56,7 +56,7 @@ services:
   enforcer:
     image: ${ENFORCER_IMAGE:?ENFORCER_IMAGE must be set by VERSIONS.lock}
     init: true
-    restart: unless-stopped
+    restart: on-failure
     stop_grace_period: 2m
     user: ${PUID:-1000}:${PGID:-1000}
     environment:
@@ -115,7 +115,7 @@ services:
   nats:
     image: ${NATS_IMAGE:?NATS_IMAGE must be set by VERSIONS.lock}
     init: true
-    restart: unless-stopped
+    restart: on-failure
     stop_grace_period: 30s
     user: 10002:10002
     command:
@@ -151,7 +151,7 @@ services:
   postgres:
     image: ${POSTGRES_IMAGE:?POSTGRES_IMAGE must be set by VERSIONS.lock}
     init: true
-    restart: unless-stopped
+    restart: on-failure
     stop_grace_period: 1m
     user: ${PUID:-1000}:${PGID:-1000}
     environment:
@@ -194,7 +194,7 @@ services:
   event-logger:
     image: ${EVENT_LOGGER_IMAGE:?EVENT_LOGGER_IMAGE must be set by VERSIONS.lock}
     init: true
-    restart: unless-stopped
+    restart: on-failure
     stop_grace_period: 20s
     user: 10001:10001
     environment:
@@ -239,7 +239,7 @@ services:
   enforcer-extractor:
     image: ${ENFORCER_EXTRACTOR_IMAGE:?ENFORCER_EXTRACTOR_IMAGE must be set by VERSIONS.lock}
     init: true
-    restart: unless-stopped
+    restart: on-failure
     stop_grace_period: 20s
     # Its own UID, but PGID as the group so it can read the group-readable
     # Postgres password without sharing an identity with any other service.
@@ -279,8 +279,8 @@ services:
       postgres:
         condition: service_healthy
     # The extractor exposes no port, so the tip poll is what proves it is alive:
-    # it refreshes this file only after the enforcer answers. `restart:
-    # unless-stopped` alone would leave a running-but-wedged extractor in place.
+    # it refreshes this file only after the enforcer answers. A restart policy
+    # alone would leave a running-but-wedged extractor in place.
     # The staleness bound is three poll intervals, so one slow answer is not an
     # outage.
     healthcheck:

@@ -13,7 +13,7 @@ done
 
 compose config --quiet
 require_node_ready
-require_node_history_ready
+require_node_monitoring_ready
 
 blockchain_info="$(node_cli getblockchaininfo)"
 

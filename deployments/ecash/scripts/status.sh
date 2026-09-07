@@ -30,13 +30,29 @@ info "chainstates"
 chainstates="$(node_cli getchainstates)"
 jq '{headers, chainstates}' <<<"${chainstates}"
 
-info "AssumeUTXO history"
-history_ready=false
-if node_history_is_ready "${chainstates}"; then
-    history_ready=true
+info "AssumeUTXO readiness"
+history_fully_validated=false
+trusted_snapshot_ready=false
+monitoring_ready=false
+if node_history_is_fully_validated "${chainstates}"; then
+    history_fully_validated=true
 fi
-jq --argjson history_ready "${history_ready}" '{
-    history_ready: $history_ready,
+if node_trusted_snapshot_is_ready "${chainstates}"; then
+    trusted_snapshot_ready=true
+fi
+if node_monitoring_is_ready "${chainstates}"; then
+    monitoring_ready=true
+fi
+jq \
+    --argjson history_fully_validated "${history_fully_validated}" \
+    --argjson trusted_snapshot_ready "${trusted_snapshot_ready}" \
+    --argjson monitoring_ready "${monitoring_ready}" \
+    --argjson snapshot_trust_enabled "${TRUST_ASSUMEUTXO_SNAPSHOT}" '{
+    history_ready: $history_fully_validated,
+    history_fully_validated: $history_fully_validated,
+    snapshot_trust_enabled: $snapshot_trust_enabled,
+    trusted_snapshot_ready: $trusted_snapshot_ready,
+    monitoring_ready: $monitoring_ready,
     chainstate_count: (.chainstates | length),
     historical_blocks: (.chainstates[0].blocks // null),
     active_blocks: (.chainstates[-1].blocks // null),
@@ -54,7 +70,11 @@ node_cli getpeerinfo |
     jq '[.[] | {addr, inbound, startingheight, synced_headers, synced_blocks}]'
 
 if ! service_is_running enforcer; then
-    info "enforcer is not running; start it with 'just enforcer-up' after AssumeUTXO history is fully validated"
+    if [[ "${monitoring_ready}" == true ]]; then
+        info "enforcer is not running; the node passed the configured readiness policy, so start it with 'just enforcer-up'"
+    else
+        info "enforcer is not running; wait for the pinned snapshot or full history validation before 'just enforcer-up'"
+    fi
     exit 0
 fi
 

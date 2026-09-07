@@ -47,38 +47,70 @@ done
 [[ "${ECASH_DATA_ROOT}" == "${DEPLOYMENT_ROOT}/data/${NETWORK_ID}" ]] ||
     die "data root is not derived from ECASH_DATA_BASE and NETWORK_ID"
 
-for invalid_live_event_wait in 0 invalid; do
+for invalid_assignment in \
+    'LIVE_EVENT_WAIT_SECONDS=0' \
+    'LIVE_EVENT_WAIT_SECONDS=invalid' \
+    'SNAPSHOT_RPC_WAIT_SECONDS=0' \
+    'SNAPSHOT_RPC_WAIT_SECONDS=invalid' \
+    'TRUST_ASSUMEUTXO_SNAPSHOT=1' \
+    'TRUST_ASSUMEUTXO_SNAPSHOT=yes'; do
     cp "${DEPLOYMENT_ROOT}/.env.example" "${override_env}"
-    printf '\nLIVE_EVENT_WAIT_SECONDS=%s\n' "${invalid_live_event_wait}" >>"${override_env}"
+    printf '\n%s\n' "${invalid_assignment}" >>"${override_env}"
     if (
         COMPOSE_ENV_FILE="${override_env}"
         load_deployment_env
     ) >/dev/null 2>&1; then
-        die "deployment configuration accepted invalid LIVE_EVENT_WAIT_SECONDS=${invalid_live_event_wait}"
+        die "deployment configuration accepted invalid ${invalid_assignment}"
     fi
 done
 
 ready_chainstates='{"headers":996259,"chainstates":[{"blocks":996259,"validated":true}]}'
 pre_activation_chainstate='{"headers":996259,"chainstates":[{"blocks":564987,"validated":true}]}'
-syncing_chainstates='{"headers":996259,"chainstates":[{"blocks":763703,"validated":true},{"blocks":996259,"snapshot_blockhash":"snapshot","validated":false}]}'
-unvalidated_chainstate='{"headers":996259,"chainstates":[{"blocks":996259,"snapshot_blockhash":"snapshot","validated":false}]}'
+syncing_chainstates="{\"headers\":996259,\"chainstates\":[{\"blocks\":763703,\"validated\":true},{\"blocks\":996259,\"snapshot_blockhash\":\"${ECASH_ACTIVATION_BLOCK_HASH}\",\"validated\":false}]}"
+wrong_snapshot_chainstates='{"headers":996259,"chainstates":[{"blocks":763703,"validated":true},{"blocks":996259,"snapshot_blockhash":"0000000000000000000000000000000000000000000000000000000000000000","validated":false}]}'
+pre_activation_snapshot="{\"headers\":996259,\"chainstates\":[{\"blocks\":763703,\"validated\":true},{\"blocks\":$((ECASH_ACTIVATION_HEIGHT - 1)),\"snapshot_blockhash\":\"${ECASH_ACTIVATION_BLOCK_HASH}\",\"validated\":false}]}"
+unvalidated_chainstate="{\"headers\":996259,\"chainstates\":[{\"blocks\":996259,\"snapshot_blockhash\":\"${ECASH_ACTIVATION_BLOCK_HASH}\",\"validated\":false}]}"
 empty_chainstates='{"headers":996259,"chainstates":[]}'
 
-node_history_is_ready "${ready_chainstates}" ||
-    die "node history readiness rejected one validated chainstate"
+node_history_is_fully_validated "${ready_chainstates}" ||
+    die "full-history readiness rejected one validated chainstate"
 for incomplete_chainstates in \
     "${pre_activation_chainstate}" \
     "${syncing_chainstates}" \
     "${unvalidated_chainstate}" \
     "${empty_chainstates}" \
     'not-json'; do
-    if node_history_is_ready "${incomplete_chainstates}"; then
-        die "node history readiness accepted incomplete or invalid chainstates"
+    if node_history_is_fully_validated "${incomplete_chainstates}"; then
+        die "full-history readiness accepted incomplete or invalid chainstates"
     fi
 done
-grep -Fq "node_history_is_ready \"\${chainstates}\"" \
+node_trusted_snapshot_is_ready "${syncing_chainstates}" ||
+    die "trusted-snapshot readiness rejected the pinned active snapshot"
+node_monitoring_is_ready "${syncing_chainstates}" ||
+    die "monitoring readiness rejected the configured trusted snapshot"
+node_history_is_ready "${syncing_chainstates}" ||
+    die "legacy bootstrap readiness did not follow the trusted-snapshot policy"
+for invalid_snapshot_state in \
+    "${wrong_snapshot_chainstates}" \
+    "${pre_activation_snapshot}" \
+    "${unvalidated_chainstate}" \
+    "${empty_chainstates}" \
+    'not-json'; do
+    if node_trusted_snapshot_is_ready "${invalid_snapshot_state}"; then
+        die "trusted-snapshot readiness accepted an invalid chainstate"
+    fi
+done
+if TRUST_ASSUMEUTXO_SNAPSHOT=false node_trusted_snapshot_is_ready "${syncing_chainstates}"; then
+    die "trusted-snapshot readiness ignored an explicit opt-out"
+fi
+if TRUST_ASSUMEUTXO_SNAPSHOT=false node_monitoring_is_ready "${syncing_chainstates}"; then
+    die "monitoring readiness bypassed full validation after snapshot trust was disabled"
+fi
+grep -Fq "node_history_is_fully_validated \"\${chainstates}\"" \
     "${DEPLOYMENT_ROOT}/scripts/status.sh" ||
-    die "status.sh does not use the activation-gated node history readiness check"
+    die "status.sh does not report strict historical validation separately"
+grep -Fq 'SNAPSHOT_RPC_WAIT_SECONDS' "${DEPLOYMENT_ROOT}/scripts/snapshot.sh" ||
+    die "snapshot.sh does not wait through node RPC warmup"
 
 # The enforcer reads a cookie the node image creates, so the check has to accept
 # owner, group, and world readability and reject the root:root 0600 case.
@@ -284,6 +316,15 @@ jq -e '[.services[]? | select(.network_mode == "host")] | length == 0' \
     <<<"${config_json}" >/dev/null
 jq -e '.services.enforcer.depends_on["ecash-node"].condition == "service_healthy"' \
     <<<"${config_json}" >/dev/null
+jq -e '.services["ecash-node"].restart == "unless-stopped"' \
+    <<<"${config_json}" >/dev/null ||
+    die "ecash-node must recover automatically after a Docker or host restart"
+for bootstrap_owned_service in enforcer enforcer-extractor event-logger nats postgres; do
+    jq -e --arg service "${bootstrap_owned_service}" \
+        '.services[$service].restart == "on-failure"' \
+        <<<"${config_json}" >/dev/null ||
+        die "${bootstrap_owned_service} must not bypass ordered bootstrap after a host restart"
+done
 jq -e '[.services.enforcer.volumes[] | select(.target == "/rpc-cookie" and .read_only == true)] | length == 1' \
     <<<"${config_json}" >/dev/null
 jq -e '[.services.enforcer.volumes[] | select(.target == "/node-blocks" and .read_only == true)] | length == 1' \
@@ -378,7 +419,7 @@ jq -e '.services["enforcer-extractor"].environment.BIP300_MONITOR_BACKFILL_MAX_B
 
 # Neither monitor service exposes a port, so each one proves it is alive by
 # refreshing a file that only successful work touches. Without the healthcheck
-# `restart: unless-stopped` covers a process that exits and nothing else.
+# A restart policy covers a process that exits and nothing else.
 for monitor_service in enforcer-extractor event-logger; do
     jq -e --arg service "${monitor_service}" \
         '.services[$service].environment.BIP300_MONITOR_LIVENESS_FILE == "/tmp/liveness"' \

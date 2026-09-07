@@ -26,6 +26,13 @@ require_positive_integer() {
     ((value > 0)) || die "${name} must be greater than zero"
 }
 
+require_boolean() {
+    local name="$1"
+    local value="$2"
+    [[ "${value}" == true || "${value}" == false ]] ||
+        die "${name} must be true or false"
+}
+
 load_versions() {
     [[ -f "${VERSIONS_FILE}" ]] || die "missing ${VERSIONS_FILE}"
     # This file is tracked in the repository and contains assignments only.
@@ -189,6 +196,8 @@ load_deployment_env() {
     require_positive_integer \
         ENFORCER_SYNC_WAIT_SECONDS "${ENFORCER_SYNC_WAIT_SECONDS:-300}"
     require_positive_integer \
+        SNAPSHOT_RPC_WAIT_SECONDS "${SNAPSHOT_RPC_WAIT_SECONDS:-43200}"
+    require_positive_integer \
         SNAPSHOT_HEADER_WAIT_SECONDS "${SNAPSHOT_HEADER_WAIT_SECONDS:-1800}"
     require_positive_integer \
         MONITOR_STARTUP_WAIT_SECONDS "${MONITOR_STARTUP_WAIT_SECONDS:-60}"
@@ -198,6 +207,9 @@ load_deployment_env() {
         LIVE_BLOCK_WAIT_SECONDS "${LIVE_BLOCK_WAIT_SECONDS:-3600}"
     require_positive_integer \
         LIVE_EVENT_WAIT_SECONDS "${LIVE_EVENT_WAIT_SECONDS:-60}"
+    TRUST_ASSUMEUTXO_SNAPSHOT="${TRUST_ASSUMEUTXO_SNAPSHOT:-false}"
+    require_boolean TRUST_ASSUMEUTXO_SNAPSHOT "${TRUST_ASSUMEUTXO_SNAPSHOT}"
+    export TRUST_ASSUMEUTXO_SNAPSHOT
 
     # Restore every repository pin after loading operator-owned configuration.
     load_versions
@@ -685,7 +697,7 @@ require_node_ready() {
     require_node_peer
 }
 
-node_history_is_ready() {
+node_history_is_fully_validated() {
     local chainstates="${1:-}"
 
     if [[ -z "${chainstates}" ]]; then
@@ -700,7 +712,50 @@ node_history_is_ready() {
     ' <<<"${chainstates}" >/dev/null 2>&1
 }
 
-require_node_history_ready() {
+node_trusted_snapshot_is_ready() {
+    local chainstates="${1:-}"
+
+    [[ "${TRUST_ASSUMEUTXO_SNAPSHOT:-false}" == true ]] || return 1
+    if [[ -z "${chainstates}" ]]; then
+        chainstates="$(node_cli getchainstates 2>/dev/null)" || return 1
+    fi
+
+    # loadtxoutset only activates a snapshot after the node has deserialized it
+    # and matched its UTXO hash against the commitment compiled into the pinned
+    # node image. Tie that active state back to our separately pinned activation
+    # block before allowing monitoring to start ahead of the historical replay.
+    jq -e \
+        --arg snapshot_hash "${ECASH_ACTIVATION_BLOCK_HASH}" \
+        --argjson activation_height "${ECASH_ACTIVATION_HEIGHT}" '
+        (.headers | type == "number")
+        and (.chainstates | type == "array")
+        and (.chainstates | length == 2)
+        and ((.chainstates[0] | has("snapshot_blockhash")) | not)
+        and (.chainstates[0].validated == true)
+        and (.chainstates[-1].snapshot_blockhash == $snapshot_hash)
+        and (.chainstates[-1].blocks >= $activation_height)
+        and (.headers >= .chainstates[-1].blocks)
+    ' <<<"${chainstates}" >/dev/null 2>&1
+}
+
+node_monitoring_is_ready() {
+    local chainstates="${1:-}"
+
+    if [[ -z "${chainstates}" ]]; then
+        chainstates="$(node_cli getchainstates 2>/dev/null)" || return 1
+    fi
+    node_history_is_fully_validated "${chainstates}" ||
+        node_trusted_snapshot_is_ready "${chainstates}"
+}
+
+# Kept as a compatibility entrypoint for the VM bootstrap installed before the
+# trusted-snapshot policy existed. "Ready" now means ready for monitoring; use
+# node_history_is_fully_validated when the completed historical replay matters.
+node_history_is_ready() {
+    node_monitoring_is_ready "$@"
+}
+
+require_node_monitoring_ready() {
     local active_blocks
     local chainstate_count
     local chainstates
@@ -712,10 +767,20 @@ require_node_history_ready() {
         <<<"${chainstates}" >/dev/null ||
         die "ecash-node returned no usable chainstate"
 
-    node_history_is_ready "${chainstates}" && return 0
+    if node_history_is_fully_validated "${chainstates}"; then
+        return 0
+    fi
+    if node_trusted_snapshot_is_ready "${chainstates}"; then
+        info "accepting the pinned AssumeUTXO snapshot at ${ECASH_ACTIVATION_BLOCK_HASH}; historical validation continues in the background"
+        return 0
+    fi
 
     chainstate_count="$(jq -r '.chainstates | length' <<<"${chainstates}")"
     historical_blocks="$(jq -r '.chainstates[0].blocks // "unavailable"' <<<"${chainstates}")"
     active_blocks="$(jq -r '.chainstates[-1].blocks // "unavailable"' <<<"${chainstates}")"
-    die "ecash-node history is not ready (chainstates=${chainstate_count}, historical_blocks=${historical_blocks}, active_blocks=${active_blocks}); wait until 'getchainstates' reports one validated chainstate at or above activation height ${ECASH_ACTIVATION_HEIGHT}"
+    die "ecash-node is not ready for monitoring (chainstates=${chainstate_count}, historical_blocks=${historical_blocks}, active_blocks=${active_blocks}); require one fully validated chainstate or set TRUST_ASSUMEUTXO_SNAPSHOT=true and load the pinned snapshot at ${ECASH_ACTIVATION_BLOCK_HASH}"
+}
+
+require_node_history_ready() {
+    require_node_monitoring_ready
 }

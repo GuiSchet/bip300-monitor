@@ -71,7 +71,16 @@ fi
 
 service_is_running ecash-node || die "ecash-node is not running; run 'just up' first"
 
-chainstates="$(node_cli getchainstates)"
+wait_seconds="${SNAPSHOT_RPC_WAIT_SECONDS:-43200}"
+deadline="$((SECONDS + wait_seconds))"
+info "waiting up to ${wait_seconds}s for ecash-node RPC after startup or recovery"
+until chainstates="$(node_cli getchainstates 2>/dev/null)" &&
+    jq -e '.chainstates | type == "array"' <<<"${chainstates}" >/dev/null; do
+    ((SECONDS < deadline)) ||
+        die "ecash-node RPC did not leave warmup after ${wait_seconds}s"
+    sleep 10
+done
+
 if jq -e '.chainstates | any(has("snapshot_blockhash"))' \
     <<<"${chainstates}" >/dev/null; then
     active_snapshot_hash="$(
@@ -85,7 +94,7 @@ if jq -e '.chainstates | any(has("snapshot_blockhash"))' \
     info "an AssumeUTXO snapshot chainstate is already active"
     exit 0
 fi
-if node_history_is_ready "${chainstates}"; then
+if node_history_is_fully_validated "${chainstates}"; then
     require_activation_block
     info "the complete ${NETWORK_ID} chainstate is already validated; no snapshot is needed"
     exit 0
