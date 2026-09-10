@@ -3,8 +3,8 @@
 These protobuf files are copied from:
 
 - Repository: <https://github.com/LayerTwo-Labs/bip300301_enforcer>
-- Commit: `b6601add8cd7361f064d38196ee0bd32c7bd5f4b`
-- Copied: 2026-08-26
+- Commit: `9c056a465c9e940e80d47ccb36fe10c6f3fbcb0d`
+- Copied: 2026-09-10
 
 Only the read-only `ValidatorService` contract and its direct CUSF message
 dependencies are vendored. The monitor does not link to the enforcer
