@@ -56,6 +56,14 @@ just enforcer-up
 just status
 ```
 
+The pinned enforcer connects the pre-activation prefix from the headers it has
+already synchronized, without fetching the corresponding block bodies. The
+raw block-file fast path remains available for the post-activation history,
+where BIP300 messages must be inspected. On an initial sync, the journal should
+therefore report `Connected ... pre-activation block(s) from stored headers`
+before the validator processes blocks at and above the locked activation
+height.
+
 The default `.env.example` deliberately sets
 `TRUST_ASSUMEUTXO_SNAPSHOT=true`. With that policy, `just enforcer-up` accepts
 either a fully validated chainstate or exactly two chainstates whose active one
