@@ -659,11 +659,13 @@ require_pinned_images_current() {
     git -C "${DEPLOYMENT_ROOT}" merge-base --is-ancestor "${MONITOR_IMAGE_COMMIT}" HEAD ||
         die "the pinned monitor images are from ${short}, which is not an ancestor of this checkout; deploy from a tree that contains what is pinned"
 
-    # `:/` anchors each pathspec to the repository root. Without it they resolve
-    # against DEPLOYMENT_ROOT, match nothing, and the guard passes every time.
+    # `:/` and `:(top,glob)` anchor each pathspec to the repository root. Keep
+    # provenance documentation out of this check: CI rebuilds images only when
+    # a protobuf definition changes, not when proto/upstream/README.md changes.
     changed="$(
         git -C "${DEPLOYMENT_ROOT}" rev-list --count \
-            "${MONITOR_IMAGE_COMMIT}..HEAD" -- :/shared :/extractors :/tools :/proto
+            "${MONITOR_IMAGE_COMMIT}..HEAD" -- :/shared :/extractors :/tools \
+            ':(top,glob)proto/**/*.proto'
     )"
     ((changed == 0)) ||
         die "the pinned monitor images are from ${short}, but ${changed} commits have changed the monitor sources since; merge to main, let CI publish, and promote the digests in VERSIONS.lock before deploying"
