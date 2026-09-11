@@ -44,9 +44,9 @@ POSTGRES_IMAGE=docker.io/library/postgres:18.2-alpine@sha256:035b9ab53cfa147d720
 POSTGRES_DB=bip300_monitor
 POSTGRES_USER=bip300_monitor
 
-MONITOR_IMAGE_COMMIT=5d85b5b4d0d3d1ae8509a290430b920f2506f018
-ENFORCER_EXTRACTOR_IMAGE=docker.io/guischet/bip300-enforcer-extractor:sha-5d85b5b4d0d3@sha256:ace3d2a57e8f742c440c0565fbcc8e5d1a07f3c659aba0a9e83f2dd62fb71a3d
-EVENT_LOGGER_IMAGE=docker.io/guischet/bip300-event-logger:sha-5d85b5b4d0d3@sha256:543605f376f1ce1222fe07ac6820843848a38877215b3efc066c3b7d81ae79b2
+MONITOR_IMAGE_COMMIT=d3349359f516ded218ef924924aba3854e1d90ac
+ENFORCER_EXTRACTOR_IMAGE=docker.io/guischet/bip300-enforcer-extractor:sha-d3349359f516@sha256:370bda7338320c084645cf997620fc704dc6d1ad93567db33c35f07e09e9e8ae
+EVENT_LOGGER_IMAGE=docker.io/guischet/bip300-event-logger:sha-d3349359f516@sha256:a6247ad988d9a94b04d51cf2ab931b2ff7e5ce9b1ba5778009d1142bf26d0e74
 
 JUST_VERSION=1.57.0
 JUST_TARGET=x86_64-unknown-linux-musl
