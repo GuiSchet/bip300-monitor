@@ -50,6 +50,11 @@ done
 for invalid_assignment in \
     'LIVE_EVENT_WAIT_SECONDS=0' \
     'LIVE_EVENT_WAIT_SECONDS=invalid' \
+    'HISTORY_WAIT_SECONDS=0' \
+    'BIP300_MONITOR_BACKFILL_PAGE_BLOCKS=0' \
+    'BIP300_MONITOR_BACKFILL_PAGE_BLOCKS=513' \
+    'BIP300_MONITOR_BACKFILL_PAGE_PAUSE_MS=invalid' \
+    'BIP300_MONITOR_BACKFILL_MAX_BLOCKS=2000' \
     'SNAPSHOT_RPC_WAIT_SECONDS=0' \
     'SNAPSHOT_RPC_WAIT_SECONDS=invalid' \
     'TRUST_ASSUMEUTXO_SNAPSHOT=1' \
@@ -172,6 +177,29 @@ if grep -nE '^[^#]*observed_at' "${DEPLOYMENT_ROOT}/scripts/lib.sh"; then
 fi
 grep -Fq 'record_has_block' "${DEPLOYMENT_ROOT}/scripts/verify-live.sh" ||
     die "verify-live.sh does not assert that the live block reached the record"
+grep -Fq 'record_block_history_is_complete' "${DEPLOYMENT_ROOT}/scripts/verify.sh" ||
+    die "verify.sh does not assert complete block history"
+grep -Fq 'compose stop enforcer-extractor postgres' \
+    "${DEPLOYMENT_ROOT}/scripts/reset-record.sh" ||
+    die "reset-record.sh no longer preserves the node and enforcer services"
+if grep -nE 'rm .*(node|enforcer|postgres)' \
+    "${DEPLOYMENT_ROOT}/scripts/reset-record.sh"; then
+    die "reset-record.sh must move recoverable data rather than delete it"
+fi
+
+sidechain_fixture='{"sidechains":[]}'
+enforcer_rpc() {
+    printf '%s\n' "${sidechain_fixture}"
+}
+[[ -z "$(active_sidechain_activations)" ]] ||
+    die "active sidechain discovery rejected an empty pre-activation network"
+sidechain_fixture='{"sidechains":[{"sidechainNumber":98,"activationHeight":987402},{"sidechainNumber":9,"activationHeight":987401}]}'
+[[ "$(active_sidechain_activations)" == $'9 987401\n98 987402' ]] ||
+    die "active sidechain discovery did not return sorted slots and activation heights"
+sidechain_fixture='{"wrong":[]}'
+if active_sidechain_activations >/dev/null 2>&1; then
+    die "active sidechain discovery accepted a malformed response"
+fi
 # Both fail the deployment before `up`. Dropped, each one comes back as a
 # container that dies or never goes healthy, with the real cause nowhere in the
 # error.
@@ -409,13 +437,16 @@ jq -e '.services["event-logger"].environment.BIP300_MONITOR_NATS_URL == "nats://
     <<<"${config_json}" >/dev/null
 jq -e '.services["enforcer-extractor"].environment.BIP300_MONITOR_NATS_URL == "nats://nats:4222"
     and .services["enforcer-extractor"].environment.BIP300_MONITOR_ENFORCER_ENDPOINT == "http://enforcer:50051"
-    and .services["enforcer-extractor"].environment.BIP300_MONITOR_SIDECHAINS == "9,98"' \
+    and (.services["enforcer-extractor"].environment | has("BIP300_MONITOR_SIDECHAINS") | not)' \
     <<<"${config_json}" >/dev/null
-# The bound on how much history one restart recovers. Left unpinned it would
-# only ever be the compiled-in default, and an operator closing a long outage
-# has to be able to raise it.
-jq -e '.services["enforcer-extractor"].environment.BIP300_MONITOR_BACKFILL_MAX_BLOCKS == "2000"' \
+# The full history is mandatory; only one page is bounded in memory.
+jq -e '.services["enforcer-extractor"].environment.BIP300_MONITOR_BACKFILL_PAGE_BLOCKS == "128"
+    and .services["enforcer-extractor"].environment.BIP300_MONITOR_BACKFILL_PAGE_PAUSE_MS == "100"
+    and (.services["enforcer-extractor"].environment
+         | has("BIP300_MONITOR_BACKFILL_MAX_BLOCKS") | not)' \
     <<<"${config_json}" >/dev/null
+jq -e '.services["enforcer-extractor"].mem_limit == "536870912"
+    and .services.postgres.mem_limit == "1073741824"' <<<"${config_json}" >/dev/null
 
 # Neither monitor service exposes a port, so each one proves it is alive by
 # refreshing a file that only successful work touches. Without the healthcheck

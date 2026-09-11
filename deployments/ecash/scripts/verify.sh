@@ -22,15 +22,21 @@ wait_for_nats_health
 wait_for_event_logger_subscription
 wait_for_nats_client bip300-monitor-enforcer-extractor
 
-configured_sidechains="${BIP300_MONITOR_SIDECHAINS:-9,98}"
-IFS=',' read -r -a sidechains <<<"${configured_sidechains}"
-((${#sidechains[@]} > 0)) || die "BIP300_MONITOR_SIDECHAINS must not be empty"
-for sidechain in "${sidechains[@]}"; do
-    [[ "${sidechain}" =~ ^[0-9]+$ ]] ||
-        die "invalid configured sidechain slot: ${sidechain}"
-    ((10#${sidechain} <= 255)) ||
-        die "sidechain slot must fit in a u8: ${sidechain}"
-done
+declare -a active_sidechains=()
+declare -A activation_heights=()
+active_activations="$(active_sidechain_activations)"
+while read -r sidechain activation_height; do
+    [[ -n "${sidechain}" ]] || continue
+    [[ "${sidechain}" =~ ^[0-9]+$ && "${activation_height}" =~ ^[0-9]+$ ]] ||
+        die "enforcer returned an invalid active sidechain"
+    ((10#${sidechain} <= 255)) || die "sidechain slot must fit in a u8: ${sidechain}"
+    active_sidechains+=("${sidechain}")
+    activation_heights["${sidechain}"]="${activation_height}"
+done <<<"${active_activations}"
+observed_sidechains="$(
+    IFS=,
+    printf '%s' "${active_sidechains[*]}"
+)"
 
 wait_seconds="${MONITOR_EVENT_WAIT_SECONDS:-60}"
 deadline="$((SECONDS + wait_seconds))"
@@ -58,10 +64,6 @@ while :; do
     fi
 
     snapshot_complete=true
-    if ! logs_contain_snapshot_completion \
-        "${extractor_logs}" "${#sidechains[@]}"; then
-        snapshot_complete=false
-    fi
 
     # The record is the authoritative check, asked about the block the snapshot
     # is anchored to rather than about a time window. Recording is idempotent, so
@@ -88,8 +90,31 @@ while :; do
             fi
         done
     fi
+    declare -a snapshot_sidechains=()
     if [[ "${snapshot_complete}" == true ]]; then
-        for sidechain in "${sidechains[@]}"; do
+        snapshot_activations="$(
+            record_snapshot_sidechain_activations "${snapshot_anchor}"
+        )" || snapshot_complete=false
+        if [[ "${snapshot_complete}" == true ]]; then
+            while read -r sidechain activation_height; do
+                [[ -n "${sidechain}" ]] || continue
+                if [[ ! "${sidechain}" =~ ^[0-9]+$ ||
+                    ! "${activation_height}" =~ ^[0-9]+$ ]] ||
+                    ((10#${sidechain} > 255)); then
+                    snapshot_complete=false
+                    break
+                fi
+                snapshot_sidechains+=("${sidechain}")
+            done <<<"${snapshot_activations}"
+        fi
+    fi
+    if [[ "${snapshot_complete}" == true ]] &&
+        ! logs_contain_snapshot_completion \
+            "${extractor_logs}" "${#snapshot_sidechains[@]}"; then
+        snapshot_complete=false
+    fi
+    if [[ "${snapshot_complete}" == true ]]; then
+        for sidechain in "${snapshot_sidechains[@]}"; do
             if [[ "$(record_event_count_at ctip "${snapshot_anchor}" "${sidechain}")" != 1 ]] ||
                 [[ "$(record_event_count_at withdrawal_bundle_proposals \
                     "${snapshot_anchor}" "${sidechain}")" != 1 ]]; then
@@ -130,4 +155,32 @@ while :; do
     sleep 2
 done
 
-info "${NETWORK_ID} observation pipeline verification passed (fresh semantic snapshot recorded and fanned out, slots=${configured_sidechains})"
+snapshot_height="$(record_snapshot_height)"
+[[ "${snapshot_height}" =~ ^[0-9]+$ ]] ||
+    die "the recorded semantic snapshot has no valid height"
+history_wait_seconds="${HISTORY_WAIT_SECONDS:-43200}"
+history_deadline="$((SECONDS + history_wait_seconds))"
+while :; do
+    history_complete=true
+    for sidechain in "${active_sidechains[@]}"; do
+        if ! record_block_history_is_complete \
+            "${sidechain}" "${activation_heights[${sidechain}]}" "${snapshot_height}"; then
+            history_complete=false
+            break
+        fi
+    done
+    if [[ "${history_complete}" == true ]]; then
+        break
+    fi
+    if ((SECONDS >= history_deadline)); then
+        coverage="$(history_coverage_json 2>/dev/null || printf 'unavailable')"
+        die "complete block history was not recorded after ${history_wait_seconds}s; coverage=${coverage}"
+    fi
+    sleep 5
+done
+
+final_active_activations="$(active_sidechain_activations)"
+[[ "${final_active_activations}" == "${active_activations}" ]] ||
+    die "the active sidechain set changed during verification; run 'just verify' again so the new slot is included"
+
+info "${NETWORK_ID} observation pipeline verification passed (snapshot live, block history complete, slots=${observed_sidechains:-none})"

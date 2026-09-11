@@ -40,10 +40,9 @@ pub struct Args {
 
     /// Sidechain slots to monitor. May be repeated or comma-separated.
     ///
-    /// Left unset, the slots are discovered from the enforcer's active
-    /// sidechains at startup. A deployment that pins what it expects to observe
-    /// should still set this: then a slot going missing is a failure rather
-    /// than a silently smaller set.
+    /// Left unset, active slots are discovered at startup and newly activated
+    /// slots are added while the extractor is running. A deployment that pins
+    /// an exact observation set may still configure this list.
     #[arg(
         long = "sidechain",
         env = "BIP300_MONITOR_SIDECHAINS",
@@ -53,18 +52,29 @@ pub struct Args {
     )]
     pub sidechains: Vec<u8>,
 
-    /// Maximum number of blocks a single startup backfill may recover.
+    /// Maximum number of blocks held by one historical page.
     ///
-    /// A range walk returns every block in one message, so an unbounded gap
-    /// would be one enormous response. Past this bound the extractor records a
-    /// window ending at the tip and warns that the rest was skipped.
+    /// The complete history is always recovered; this controls only the memory
+    /// and transaction size of each resumable step.
     #[arg(
         long,
-        env = "BIP300_MONITOR_BACKFILL_MAX_BLOCKS",
-        default_value_t = 2_000,
-        value_parser = clap::value_parser!(u32).range(1..)
+        env = "BIP300_MONITOR_BACKFILL_PAGE_BLOCKS",
+        default_value_t = 128,
+        value_parser = clap::value_parser!(u32).range(1..=512)
     )]
-    pub backfill_max_blocks: u32,
+    pub backfill_page_blocks: u32,
+
+    /// Delay between historical pages, in milliseconds.
+    ///
+    /// Live writes can use the Postgres connection between these short pages,
+    /// and the enforcer is never hammered by an unbounded catch-up loop.
+    #[arg(
+        long,
+        env = "BIP300_MONITOR_BACKFILL_PAGE_PAUSE_MS",
+        default_value_t = 100,
+        value_parser = clap::value_parser!(u64).range(0..)
+    )]
+    pub backfill_page_pause_ms: u64,
 
     /// How often the mainchain tip is re-read, in seconds.
     ///
@@ -112,6 +122,13 @@ pub struct Args {
 impl Args {
     /// Validate invariants that are not expressible directly through clap.
     pub fn validate(&self) -> Result<()> {
+        if std::env::var_os("BIP300_MONITOR_BACKFILL_MAX_BLOCKS").is_some() {
+            bail!(
+                "BIP300_MONITOR_BACKFILL_MAX_BLOCKS was removed: use \
+                 BIP300_MONITOR_BACKFILL_PAGE_BLOCKS to bound each page; \
+                 total history is no longer capped"
+            );
+        }
         if self.shutdown_timeout_seconds <= self.nats.nats_flush_timeout_seconds {
             bail!(
                 "shutdown timeout ({}s) must be greater than the NATS flush timeout ({}s)",
@@ -137,6 +154,11 @@ impl Args {
     /// Return the configured interval between tip polls.
     pub const fn tip_poll_interval(&self) -> Duration {
         Duration::from_secs(self.tip_poll_interval_seconds)
+    }
+
+    /// Return the configured pause between historical pages.
+    pub const fn backfill_page_pause(&self) -> Duration {
+        Duration::from_millis(self.backfill_page_pause_ms)
     }
 
     /// Return the configured graceful-shutdown timeout.
@@ -168,6 +190,8 @@ mod tests {
         assert_eq!(args.nats.nats_url, "nats://nats:4222");
         assert_eq!(args.log_level, LogLevel::Info);
         assert_eq!(args.request_timeout_seconds, 10);
+        assert_eq!(args.backfill_page_blocks, 128);
+        assert_eq!(args.backfill_page_pause_ms, 100);
         assert_eq!(args.nats.nats_flush_timeout_seconds, 10);
         assert_eq!(args.shutdown_timeout_seconds, 15);
         args.validate().expect("unique sidechains");

@@ -13,7 +13,7 @@
 
 use shared::protobuf::enforcer_extractor as events;
 use shared::protobuf::event::{Event, ObservedBlock, event::MonitorEvent};
-use shared::store::{PostgresArgs, Store};
+use shared::store::{HistoryPage, HistoryStatus, PostgresArgs, Store};
 
 /// Each test owns a database of its own so they can run concurrently.
 async fn store_for(test: &str, source: &'static str) -> Store {
@@ -329,4 +329,168 @@ async fn a_disconnect_without_a_height_does_not_move_the_checkpoint() {
         None,
         "an absent height must not be recorded as zero"
     );
+}
+
+#[tokio::test]
+async fn historical_pages_commit_events_and_cursor_together() {
+    let store = store_for("history_pages", "enforcer").await;
+    let target = ObservedBlock::at_height(vec![0x68; 32], 104);
+    let mut coverage = store
+        .begin_history_cycle("block", Some(9), 101, None, &target, None, Some(100), 2)
+        .await
+        .expect("start history");
+    assert_eq!(coverage.status, HistoryStatus::Running);
+    assert_eq!(coverage.next, Some(target.clone()));
+
+    let cursor = coverage.next.clone().expect("first cursor");
+    let next = ObservedBlock::at_height(vec![0x66; 32], 102);
+    let first = [
+        envelope(
+            connected(9, 103, 0x67),
+            Some(ObservedBlock::at_height(vec![0x67; 32], 103)),
+            1_700_000_000_103,
+        ),
+        envelope(
+            connected(9, 104, 0x68),
+            Some(ObservedBlock::at_height(vec![0x68; 32], 104)),
+            1_700_000_000_104,
+        ),
+    ];
+    assert_eq!(
+        store
+            .record_history_page(
+                &first,
+                HistoryPage {
+                    stream: "block",
+                    sidechain: Some(9),
+                    expected_next: &cursor,
+                    next: Some(&next),
+                },
+            )
+            .await
+            .expect("record first page"),
+        2
+    );
+    coverage = store
+        .history_coverage("block", Some(9))
+        .await
+        .expect("read coverage")
+        .expect("coverage exists");
+    assert_eq!(coverage.next, Some(next.clone()));
+    assert_eq!(coverage.rows_recorded, 2);
+
+    let second = [
+        envelope(
+            connected(9, 101, 0x65),
+            Some(ObservedBlock::at_height(vec![0x65; 32], 101)),
+            1_700_000_000_101,
+        ),
+        envelope(
+            connected(9, 102, 0x66),
+            Some(ObservedBlock::at_height(vec![0x66; 32], 102)),
+            1_700_000_000_102,
+        ),
+    ];
+    store
+        .record_history_page(
+            &second,
+            HistoryPage {
+                stream: "block",
+                sidechain: Some(9),
+                expected_next: &next,
+                next: None,
+            },
+        )
+        .await
+        .expect("record final page");
+    coverage = store
+        .history_coverage("block", Some(9))
+        .await
+        .expect("read coverage")
+        .expect("coverage exists");
+    assert_eq!(coverage.status, HistoryStatus::Complete);
+    assert_eq!(coverage.next, None);
+    assert_eq!(coverage.covered_tip, Some(target));
+    assert_eq!(coverage.rows_recorded, 4);
+}
+
+#[tokio::test]
+async fn a_failed_historical_page_advances_neither_events_nor_cursor() {
+    let store = store_for("atomic_history_page", "enforcer").await;
+    let target = ObservedBlock::at_height(vec![0x68; 32], 104);
+    store
+        .begin_history_cycle("block", Some(9), 101, None, &target, None, Some(100), 2)
+        .await
+        .expect("start history");
+    let good = envelope(
+        connected(9, 104, 0x68),
+        Some(target.clone()),
+        1_700_000_000_104,
+    );
+    let malformed = Event {
+        timestamp: 1_700_000_000_103,
+        observed_at_block: None,
+        monitor_event: None,
+    };
+    let next = ObservedBlock::at_height(vec![0x66; 32], 102);
+
+    store
+        .record_history_page(
+            &[good, malformed],
+            HistoryPage {
+                stream: "block",
+                sidechain: Some(9),
+                expected_next: &target,
+                next: Some(&next),
+            },
+        )
+        .await
+        .expect_err("malformed page must roll back");
+
+    let coverage = store
+        .history_coverage("block", Some(9))
+        .await
+        .expect("read coverage")
+        .expect("coverage exists");
+    assert_eq!(coverage.next, Some(target));
+    assert_eq!(coverage.rows_recorded, 0);
+    assert_eq!(
+        store
+            .last_recorded_height("block_connected", 9)
+            .await
+            .expect("read event rows"),
+        None
+    );
+}
+
+#[tokio::test]
+async fn a_failed_history_cursor_resumes_with_its_smaller_page() {
+    let store = store_for("resume_history", "enforcer").await;
+    let target = ObservedBlock::at_height(vec![0x68; 32], 104);
+    store
+        .begin_history_cycle("block", Some(9), 101, None, &target, None, Some(100), 128)
+        .await
+        .expect("start history");
+    store
+        .resize_history_page("block", Some(9), 64, "deadline")
+        .await
+        .expect("resize page");
+    store
+        .fail_history("block", Some(9), "bad response")
+        .await
+        .expect("mark failed");
+    store
+        .resume_history("block", Some(9))
+        .await
+        .expect("resume exact cursor");
+
+    let coverage = store
+        .history_coverage("block", Some(9))
+        .await
+        .expect("read coverage")
+        .expect("coverage exists");
+    assert_eq!(coverage.status, HistoryStatus::Running);
+    assert_eq!(coverage.next, Some(target));
+    assert_eq!(coverage.effective_page_blocks, 64);
+    assert_eq!(coverage.last_error, None);
 }

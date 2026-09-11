@@ -1,5 +1,6 @@
 //! Continuous enforcer event extraction.
 
+use std::collections::BTreeSet;
 use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
@@ -13,7 +14,7 @@ use shared::protobuf::enforcer_extractor as events;
 use shared::protobuf::event::event::MonitorEvent;
 use shared::protobuf::event::{Event, ObservedBlock};
 use shared::recorder::Recorder;
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
 use tokio::task::JoinSet;
 use tonic::{Status, Streaming};
 
@@ -101,6 +102,13 @@ struct PreparedObservation<S> {
     tip_after_snapshot: Vec<u8>,
 }
 
+#[derive(Clone)]
+struct BackfillRequest {
+    sidechain: u8,
+    activation_height: u32,
+    target: ObservedBlock,
+}
+
 /// Publish an initial snapshot and then monitor every configured sidechain.
 pub async fn run(args: Args, mut shutdown_rx: watch::Receiver<bool>) -> Result<()> {
     args.validate()
@@ -154,27 +162,7 @@ pub async fn run(args: Args, mut shutdown_rx: watch::Receiver<bool>) -> Result<(
         return Ok(());
     }
 
-    // Before any live event is forwarded, recover whatever passed while the
-    // extractor was not subscribed. The live streams are already open, so this
-    // only competes with buffered events, and the identity of an observation
-    // makes an overlap idempotent rather than duplicated.
-    let mut backfill_client = client.clone();
-    for sidechain in &sidechains {
-        backfill::run(
-            &mut backfill_client,
-            &recorder,
-            *sidechain,
-            &snapshot.anchor,
-            args.backfill_max_blocks,
-        )
-        .await
-        .with_context(|| format!("backfilling sidechain {sidechain}"))?;
-
-        if *shutdown_rx.borrow() {
-            tracing::info!("shutdown requested during the backfill");
-            return Ok(());
-        }
-    }
+    let activations = activation_heights(&snapshot.state, &sidechains)?;
 
     // Every slot worker reports the blocks it sees here, so one state worker can
     // re-read the mutable enforcer state once per tip change instead of once per
@@ -184,18 +172,31 @@ pub async fn run(args: Args, mut shutdown_rx: watch::Receiver<bool>) -> Result<(
     // process with a success code and no work done.
     let snapshot_block = snapshot.anchor.hash.clone();
     let (block_tx, block_rx) = watch::channel(snapshot.anchor.hash.clone());
+    let (sidechains_tx, sidechains_rx) = watch::channel(sidechains.clone());
+    let (backfill_tx, backfill_rx) = mpsc::channel(256);
+    for (sidechain, activation_height) in &activations {
+        backfill_tx
+            .try_send(BackfillRequest {
+                sidechain: *sidechain,
+                activation_height: *activation_height,
+                target: snapshot.anchor.clone(),
+            })
+            .expect("at most 256 sidechain slots fit in the initial backfill queue");
+    }
     let tracker = state::Tracker::new(snapshot.state);
 
     let mut workers = JoinSet::new();
-    for (sidechain, stream) in streams {
-        workers.spawn(monitor_sidechain(
-            stream,
-            recorder.clone(),
-            sidechain,
-            block_tx.clone(),
-            shutdown_rx.clone(),
-        ));
-    }
+    workers.spawn(monitor_sidechains(
+        streams,
+        client.clone(),
+        recorder.clone(),
+        block_tx.clone(),
+        sidechains_tx,
+        backfill_tx,
+        args.sidechains.is_empty(),
+        args.tip_poll_interval(),
+        shutdown_rx.clone(),
+    ));
     workers.spawn(monitor_tip(
         client.clone(),
         args.tip_poll_interval(),
@@ -204,18 +205,114 @@ pub async fn run(args: Args, mut shutdown_rx: watch::Receiver<bool>) -> Result<(
         shutdown_rx.clone(),
     ));
     workers.spawn(monitor_state(
-        client,
-        recorder,
-        sidechains.clone(),
+        client.clone(),
+        recorder.clone(),
+        sidechains_rx,
         tracker,
         snapshot_block,
         block_rx,
+        shutdown_rx.clone(),
+    ));
+    // Live workers are installed before this task. Historical pages are small,
+    // persisted without NATS fan-out, and use the same short Postgres critical
+    // section as live writes, so catch-up cannot build an unbounded stream
+    // buffer or monopolize the record.
+    workers.spawn(backfill_sidechains(
+        client,
+        recorder,
+        backfill_rx,
+        args.backfill_page_blocks,
+        args.backfill_page_pause(),
         shutdown_rx,
     ));
 
     supervise_workers(workers).await?;
     tracing::info!("enforcer extractor stopped");
     Ok(())
+}
+
+fn activation_heights(
+    snapshot_state: &[events::EnforcerEvent],
+    sidechains: &[u8],
+) -> Result<Vec<(u8, u32)>> {
+    let discovered = snapshot_state
+        .iter()
+        .find_map(state::active_slot_activations)
+        .context("initial snapshot has no active-sidechains payload")??;
+    sidechains
+        .iter()
+        .map(|slot| {
+            discovered
+                .iter()
+                .find(|(candidate, _)| candidate == slot)
+                .copied()
+                .with_context(|| {
+                    format!("configured sidechain {slot} is not active at the snapshot tip")
+                })
+        })
+        .collect()
+}
+
+async fn backfill_sidechains(
+    mut client: EnforcerClient,
+    recorder: Recorder,
+    mut requests: mpsc::Receiver<BackfillRequest>,
+    page_blocks: u32,
+    page_pause: Duration,
+    mut shutdown_rx: watch::Receiver<bool>,
+) -> Result<()> {
+    loop {
+        let request = tokio::select! {
+            biased;
+            () = wait_for_shutdown(&mut shutdown_rx) => return Ok(()),
+            request = requests.recv() => match request {
+                Some(request) => request,
+                None => return Ok(()),
+            }
+        };
+        let BackfillRequest {
+            sidechain,
+            activation_height,
+            mut target,
+        } = request;
+        loop {
+            let outcome = backfill::run(
+                &mut client,
+                &recorder,
+                sidechain,
+                activation_height,
+                &target,
+                backfill::Settings {
+                    page_blocks,
+                    page_pause,
+                },
+                shutdown_rx.clone(),
+            )
+            .await
+            .with_context(|| format!("backfilling sidechain {sidechain}"))?;
+            if matches!(outcome, backfill::Outcome::Interrupted { .. }) {
+                tracing::info!(
+                    sidechain,
+                    "shutdown requested during block history backfill"
+                );
+                return Ok(());
+            }
+
+            let current_tip = snapshot::current_tip(&mut client).await.with_context(|| {
+                format!("reconciling sidechain {sidechain} history with the tip")
+            })?;
+            if current_tip.hash == target.hash {
+                break;
+            }
+            tracing::info!(
+                sidechain,
+                previous_target = %hex::encode(&target.hash),
+                current_target = %hex::encode(&current_tip.hash),
+                "mainchain advanced during backfill; reconciling the remaining gap"
+            );
+            target = current_tip;
+        }
+    }
 }
 
 /// Slots to observe: the configured list, or the enforcer's active sidechains
@@ -331,6 +428,125 @@ where
         tip_before_snapshot,
         tip_after_snapshot,
     })
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn monitor_sidechains(
+    streams: Vec<(u8, EventStream)>,
+    mut client: EnforcerClient,
+    recorder: Recorder,
+    block_tx: watch::Sender<Vec<u8>>,
+    sidechains_tx: watch::Sender<Vec<u8>>,
+    backfill_tx: mpsc::Sender<BackfillRequest>,
+    discover_new_slots: bool,
+    discovery_interval: Duration,
+    mut shutdown_rx: watch::Receiver<bool>,
+) -> Result<()> {
+    let mut observed = streams
+        .iter()
+        .map(|(sidechain, _)| *sidechain)
+        .collect::<BTreeSet<_>>();
+    let mut workers = JoinSet::new();
+    for (sidechain, stream) in streams {
+        workers.spawn(monitor_sidechain(
+            stream,
+            recorder.clone(),
+            sidechain,
+            block_tx.clone(),
+            shutdown_rx.clone(),
+        ));
+    }
+
+    if !discover_new_slots {
+        return supervise_workers(workers).await;
+    }
+
+    loop {
+        tokio::select! {
+            biased;
+            () = wait_for_shutdown(&mut shutdown_rx) => {
+                abort_and_drain(&mut workers).await;
+                return Ok(());
+            }
+            result = workers.join_next(), if !workers.is_empty() => {
+                match result {
+                    Some(Ok(Ok(()))) if *shutdown_rx.borrow() => continue,
+                    Some(Ok(Ok(()))) => {
+                        abort_and_drain(&mut workers).await;
+                        bail!("a sidechain event worker stopped unexpectedly");
+                    }
+                    Some(Ok(Err(error))) => {
+                        abort_and_drain(&mut workers).await;
+                        return Err(error);
+                    }
+                    Some(Err(error)) => {
+                        abort_and_drain(&mut workers).await;
+                        return Err(error).context("joining a sidechain subscription task");
+                    }
+                    None => {}
+                }
+            }
+            () = tokio::time::sleep(discovery_interval) => {}
+        }
+
+        let active = match client.get_sidechains().await.and_then(|response| {
+            let payload = convert::active_sidechains(response)?;
+            state::active_slot_activations(&payload)
+                .context("expected active-sidechains payload during slot discovery")?
+        }) {
+            Ok(active) => active,
+            Err(error) => {
+                tracing::warn!(
+                    error = %format!("{error:#}"),
+                    "could not refresh active sidechains; retrying discovery"
+                );
+                continue;
+            }
+        };
+
+        for (sidechain, activation_height) in unobserved_activations(&observed, active) {
+            // Subscribe before fixing the backfill target. Any later block is
+            // either delivered live or included by the final reconciliation.
+            let stream = client
+                .subscribe_events(sidechain)
+                .await
+                .with_context(|| format!("subscribing to newly active sidechain {sidechain}"))?;
+            let target = snapshot::current_tip(&mut client)
+                .await
+                .with_context(|| format!("anchoring newly active sidechain {sidechain}"))?;
+            workers.spawn(monitor_sidechain(
+                stream,
+                recorder.clone(),
+                sidechain,
+                block_tx.clone(),
+                shutdown_rx.clone(),
+            ));
+            observed.insert(sidechain);
+            let all_observed = observed.iter().copied().collect::<Vec<_>>();
+            let _ = sidechains_tx.send(all_observed);
+            backfill_tx
+                .send(BackfillRequest {
+                    sidechain,
+                    activation_height,
+                    target: target.clone(),
+                })
+                .await
+                .context("queueing a newly active sidechain backfill")?;
+            let _ = block_tx.send(target.hash);
+            tracing::info!(
+                sidechain,
+                activation_height,
+                "started observation and queued full history for a newly active sidechain"
+            );
+        }
+    }
+}
+
+fn unobserved_activations(observed: &BTreeSet<u8>, active: Vec<(u8, u32)>) -> Vec<(u8, u32)> {
+    active
+        .into_iter()
+        .filter(|(sidechain, _)| !observed.contains(sidechain))
+        .collect()
 }
 
 fn snapshot_tips_are_consistent(tip_before: &[u8], snapshot_tip: &[u8], tip_after: &[u8]) -> bool {
@@ -466,7 +682,7 @@ where
 async fn monitor_state(
     client: EnforcerClient,
     recorder: Recorder,
-    sidechains: Vec<u8>,
+    sidechains_rx: watch::Receiver<Vec<u8>>,
     tracker: state::Tracker,
     snapshot_block: Vec<u8>,
     block_rx: watch::Receiver<Vec<u8>>,
@@ -476,7 +692,7 @@ async fn monitor_state(
 
     refresh_on_new_blocks(
         client,
-        sidechains,
+        sidechains_rx,
         tracker,
         snapshot_block,
         block_rx,
@@ -509,7 +725,7 @@ async fn monitor_state(
 
 async fn refresh_on_new_blocks<S, P, F>(
     mut source: S,
-    sidechains: Vec<u8>,
+    sidechains_rx: watch::Receiver<Vec<u8>>,
     mut tracker: state::Tracker,
     snapshot_block: Vec<u8>,
     mut block_rx: watch::Receiver<Vec<u8>>,
@@ -555,13 +771,13 @@ where
         // silently skipping it would leave a gap that looks like "nothing
         // changed". The deployment restarts the extractor, which republishes the
         // whole snapshot.
+        let sidechains = sidechains_rx.borrow().clone();
         let reading = source.collect_state(&sidechains).await.with_context(|| {
             format!("refreshing enforcer state at block {}", hex::encode(&block))
         })?;
         refreshed_at = block;
 
         let changed = tracker.take_changed(reading.payloads)?;
-        report_unobserved_slots(&sidechains, &changed);
         if changed.is_empty() {
             continue;
         }
@@ -649,30 +865,6 @@ fn enforcer_payload(event: &Event) -> Result<&events::EnforcerEvent> {
     match event.monitor_event.as_ref() {
         Some(MonitorEvent::Enforcer(payload)) => Ok(payload),
         None => bail!("event envelope does not contain a monitor event"),
-    }
-}
-
-/// Warn about a sidechain that activated into a slot nobody is subscribed to.
-///
-/// Subscriptions are opened once, at startup, so a slot that activates later is
-/// invisible until a restart. Spawning a worker for it mid-flight would be the
-/// obvious fix, but activation takes tens of thousands of blocks of miner ACKs,
-/// and a slot set that flapped through a reorg would turn dynamic
-/// re-subscription into a restart loop. Saying so loudly is the honest trade:
-/// the gap becomes visible instead of silent.
-fn report_unobserved_slots(observed: &[u8], changed: &[events::EnforcerEvent]) {
-    let Some(active) = changed.iter().find_map(state::active_slots) else {
-        return;
-    };
-
-    for slot in active {
-        if !observed.contains(&slot) {
-            tracing::warn!(
-                sidechain = slot,
-                "a sidechain is active in a slot this extractor is not subscribed to; \
-                 restart it to observe that slot"
-            );
-        }
     }
 }
 
@@ -774,8 +966,8 @@ mod tests {
 
     use super::{
         Heartbeat, SourceFuture, StartupSource, StateSource, TipSource, announce_tip_changes,
-        forward_stream, prepare_observation, refresh_on_new_blocks, report_unobserved_slots,
-        snapshot_tips_are_consistent, supervise_workers,
+        forward_stream, prepare_observation, refresh_on_new_blocks, snapshot_tips_are_consistent,
+        supervise_workers, unobserved_activations,
     };
     use crate::proto::{common, mainchain};
     use crate::snapshot::InitialSnapshot;
@@ -792,6 +984,15 @@ mod tests {
         Some(common::ConsensusHex {
             hex: Some(hex::encode(bytes)),
         })
+    }
+
+    #[test]
+    fn dynamic_discovery_returns_only_new_active_slots() {
+        let observed = [9_u8, 98].into_iter().collect();
+        assert_eq!(
+            unobserved_activations(&observed, vec![(9, 987_402), (98, 987_402), (130, 996_485)]),
+            vec![(130, 996_485)]
+        );
     }
 
     fn disconnected(byte: u8) -> mainchain::SubscribeEventsResponse {
@@ -1137,7 +1338,7 @@ mod tests {
 
         let worker = tokio::spawn(refresh_on_new_blocks(
             source,
-            vec![9],
+            watch::channel(vec![9]).1,
             state::Tracker::new(vec![ctip_payload(9, 100)]),
             snapshot_tip,
             block_rx,
@@ -1187,7 +1388,7 @@ mod tests {
 
         let worker = tokio::spawn(refresh_on_new_blocks(
             source,
-            vec![9],
+            watch::channel(vec![9]).1,
             state::Tracker::new(vec![ctip_payload(9, 100)]),
             snapshot_tip.clone(),
             block_rx,
@@ -1241,33 +1442,6 @@ mod tests {
         );
     }
 
-    fn active_sidechains(slots: &[u32]) -> events::EnforcerEvent {
-        events::EnforcerEvent {
-            event: Some(events::enforcer_event::Event::ActiveSidechains(
-                events::ActiveSidechainsSnapshot {
-                    sidechains: slots
-                        .iter()
-                        .map(|slot| events::ActiveSidechain {
-                            sidechain_number: *slot,
-                            ..Default::default()
-                        })
-                        .collect(),
-                },
-            )),
-        }
-    }
-
-    #[test]
-    fn an_activation_into_an_unobserved_slot_is_reported() {
-        // A pure-function check would be better, but the report is a log line;
-        // this at least pins that the scan reaches the right payload and does
-        // not panic on collections that hold no snapshot.
-        report_unobserved_slots(&[9, 98], &[active_sidechains(&[9, 98])]);
-        report_unobserved_slots(&[9, 98], &[active_sidechains(&[9, 98, 5])]);
-        report_unobserved_slots(&[9], &[ctip_payload(9, 100)]);
-        report_unobserved_slots(&[], &[]);
-    }
-
     #[tokio::test]
     async fn the_state_worker_stops_when_every_slot_worker_is_gone() {
         let (block_tx, block_rx) = watch::channel(vec![0x11; 32]);
@@ -1275,7 +1449,7 @@ mod tests {
 
         let worker = tokio::spawn(refresh_on_new_blocks(
             FakeStateSource::new(Vec::new()),
-            vec![9],
+            watch::channel(vec![9]).1,
             state::Tracker::new(Vec::new()),
             vec![0x11; 32],
             block_rx,
@@ -1301,7 +1475,7 @@ mod tests {
         let worker = tokio::spawn(refresh_on_new_blocks(
             // No scripted collection: the fake reports a failure.
             FakeStateSource::new(Vec::new()),
-            vec![9],
+            watch::channel(vec![9]).1,
             state::Tracker::new(Vec::new()),
             vec![0x11; 32],
             block_rx,
@@ -1494,7 +1668,7 @@ mod tests {
 
         let worker = tokio::spawn(refresh_on_new_blocks(
             FakeStateSource::new(Vec::new()),
-            Vec::new(),
+            watch::channel(Vec::new()).1,
             state::Tracker::new(Vec::new()),
             vec![0x11; 32],
             block_rx,
