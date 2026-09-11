@@ -109,23 +109,28 @@ fan-out still reaches the logger, which is a different path from the record and
 so gets its own check. Verification resets its log window if either monitor container
 restarts.
 
-Before accepting a VM, wait for a new network block and prove delivery for
-every configured sidechain slot:
-
 ```bash
 just verify-live
 ```
 
 After reviewing the verification output, `just accept` repeats the fast and
 live checks and atomically writes `${ECASH_DATA_ROOT}/.deployment-accepted`.
-The marker records the network, repository SHA, image/source pins, and verified
-live block. Acceptance refuses to run from a dirty Git checkout.
+The marker records the network, repository SHA, image/source pins, discovered
+slots, block-history status, mutable-state-history status, and verified live
+block. Acceptance refuses to run from a dirty Git checkout.
 
 Timeouts can be adjusted in `.env`. `SNAPSHOT_RPC_WAIT_SECONDS` lets the
 snapshot command remain parked while a recovering node keeps RPC in warmup,
 instead of exiting and re-hashing the 9.5 GB file on every service retry. All
 values in `VERSIONS.lock` are repository-owned pins and cannot be overridden
 there. `just down` stops the stack without deleting `${ECASH_DATA_ROOT}`.
+
+`HISTORY_WAIT_SECONDS` bounds only deployment verification. The extractor
+always continues page by page until complete. `BIP300_MONITOR_BACKFILL_PAGE_BLOCKS`
+defaults to 128 (maximum 512) and bounds one RPC/transaction; it never limits
+total coverage. `BIP300_MONITOR_BACKFILL_PAGE_PAUSE_MS` defaults to 100.
+Existing `.env` files must remove `BIP300_MONITOR_BACKFILL_MAX_BLOCKS`, which is
+rejected to prevent the old silent truncation semantics.
 
 Existing installations keep their conservative behavior until
 `TRUST_ASSUMEUTXO_SNAPSHOT=true` is added to their `.env`; `just init` never
@@ -172,13 +177,21 @@ configuration is still fatal, because that is a mistake rather than an outage.
 Two different gaps follow from that, and only one of them is about transport:
 
 - **The extractor was down.** `SubscribeEvents` does not replay history, so a
-  restart leaves a real hole that only a backfill can close. How much of it can
-  be closed is bounded by `BIP300_MONITOR_BACKFILL_MAX_BLOCKS`; past that the
-  extractor records a window ending at the tip and **warns** that the rest was
-  skipped, so a long outage is a decision to raise the bound rather than silent
-  data loss.
+  restart leaves a real hole that only a backfill can close. The extractor walks
+  the whole gap in bounded pages, stores each page and its cursor atomically,
+  and resumes after interruption. Historical pages bypass NATS.
 - **A live consumer missed a message.** Cosmetic, because the record already
   has it.
+
+`just status` reports start, cursor, target, page size and percentage per slot.
+The Compose limits are 512 MiB for the extractor and 1 GiB for Postgres so a bad
+response cannot turn into host-wide memory pressure.
+
+For the planned clean rebuild, `just reset-record alphanet` first creates a
+checksummed `pg_dump`, stops only the extractor and Postgres, moves the old
+cluster and acceptance marker into a timestamped recoverable backup, and creates
+an empty Postgres directory. It never removes the node or enforcer directories.
+Run `just monitor-up` afterwards to migrate and start the full import.
 
 ## Deploying a new monitor build
 

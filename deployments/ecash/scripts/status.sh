@@ -98,6 +98,15 @@ if ! service_is_running nats; then
     exit 0
 fi
 
+if service_is_running postgres; then
+    info "block history coverage"
+    if coverage="$(history_coverage_json 2>/dev/null)" && jq -e . <<<"${coverage}" >/dev/null; then
+        jq . <<<"${coverage}"
+    else
+        info "history coverage is not available yet"
+    fi
+fi
+
 info "Core NATS health"
 if health="$(nats_monitor /healthz 2>/dev/null)" &&
     jq -e '.status' <<<"${health}" >/dev/null; then

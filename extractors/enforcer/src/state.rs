@@ -43,9 +43,6 @@ pub(crate) async fn collect(client: &mut EnforcerClient, sidechains: &[u8]) -> R
 }
 
 /// Collect every mutable-state payload in a deterministic order.
-///
-/// The order is stable for a fixed slot list, which is what lets [`Tracker`]
-/// diff two collections positionally.
 pub(crate) async fn collect_payloads(
     client: &mut EnforcerClient,
     sidechains: &[u8],
@@ -83,28 +80,52 @@ impl Tracker {
     /// Return the payloads that differ from the last published value, and
     /// record the new values as published.
     ///
-    /// A length change means the collection itself was rebuilt differently, so
-    /// everything is republished rather than diffed against the wrong slot.
+    /// Payloads are matched by semantic identity instead of by position. This
+    /// lets a newly activated sidechain be added while the process is running
+    /// without comparing its CTIP to another slot's payload.
     pub(crate) fn take_changed(
         &mut self,
         current: Vec<events::EnforcerEvent>,
     ) -> Result<Vec<events::EnforcerEvent>> {
-        if current.len() != self.last.len() {
-            bail!(
-                "mutable state collection changed shape: expected {} payloads, got {}",
-                self.last.len(),
-                current.len()
-            );
+        let mut changed = Vec::new();
+        for payload in &current {
+            let key = payload_key(payload)?;
+            let previous = self
+                .last
+                .iter()
+                .find(|previous| payload_key(previous).is_ok_and(|candidate| candidate == key));
+            if previous != Some(payload) {
+                changed.push(payload.clone());
+            }
         }
-
-        let changed = current
-            .iter()
-            .zip(self.last.iter())
-            .filter(|(current, last)| current != last)
-            .map(|(current, _)| current.clone())
-            .collect();
         self.last = current;
         Ok(changed)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PayloadKey {
+    SidechainProposals,
+    ActiveSidechains,
+    Ctip(u32),
+    WithdrawalBundleProposals(u32),
+}
+
+fn payload_key(payload: &events::EnforcerEvent) -> Result<PayloadKey> {
+    match payload.event.as_ref() {
+        Some(events::enforcer_event::Event::SidechainProposals(_)) => {
+            Ok(PayloadKey::SidechainProposals)
+        }
+        Some(events::enforcer_event::Event::ActiveSidechains(_)) => {
+            Ok(PayloadKey::ActiveSidechains)
+        }
+        Some(events::enforcer_event::Event::Ctip(ctip)) => {
+            Ok(PayloadKey::Ctip(ctip.sidechain_number))
+        }
+        Some(events::enforcer_event::Event::WithdrawalBundleProposals(proposals)) => Ok(
+            PayloadKey::WithdrawalBundleProposals(proposals.sidechain_number),
+        ),
+        _ => bail!("mutable state collection contains an unexpected payload"),
     }
 }
 
@@ -123,6 +144,30 @@ pub(crate) fn active_slots(payload: &events::EnforcerEvent) -> Option<Vec<u8>> {
             // A slot is one byte on the wire. One that does not fit is not a
             // slot this monitor could ever subscribe to.
             .filter_map(|sidechain| u8::try_from(sidechain.sidechain_number).ok())
+            .collect(),
+    )
+}
+
+/// Active slot numbers paired with their exact activation heights.
+pub(crate) fn active_slot_activations(
+    payload: &events::EnforcerEvent,
+) -> Option<Result<Vec<(u8, u32)>>> {
+    let events::enforcer_event::Event::ActiveSidechains(snapshot) = payload.event.as_ref()? else {
+        return None;
+    };
+    Some(
+        snapshot
+            .sidechains
+            .iter()
+            .map(|sidechain| {
+                let slot = u8::try_from(sidechain.sidechain_number).with_context(|| {
+                    format!(
+                        "active sidechain slot {} does not fit in a u8",
+                        sidechain.sidechain_number
+                    )
+                })?;
+                Ok((slot, sidechain.activation_height))
+            })
             .collect(),
     )
 }
@@ -168,7 +213,7 @@ pub(crate) fn block_anchor(payload: &events::EnforcerEvent) -> Result<ObservedBl
 mod tests {
     use shared::protobuf::enforcer_extractor as events;
 
-    use super::{Tracker, block_anchor, tip_anchor};
+    use super::{Tracker, active_slot_activations, block_anchor, tip_anchor};
 
     fn ctip(sidechain_number: u32, value_sats: u64) -> events::EnforcerEvent {
         events::EnforcerEvent {
@@ -253,13 +298,13 @@ mod tests {
     }
 
     #[test]
-    fn a_shape_change_is_an_error_rather_than_a_wrong_diff() {
+    fn a_new_slot_is_matched_by_identity_and_published() {
         let mut tracker = Tracker::new(vec![ctip(9, 100), ctip(98, 200)]);
 
-        let error = tracker
-            .take_changed(vec![ctip(9, 100)])
-            .expect_err("a shorter collection must not be diffed positionally");
-        assert!(error.to_string().contains("changed shape"));
+        let changed = tracker
+            .take_changed(vec![ctip(9, 100), ctip(98, 200), ctip(130, 300)])
+            .expect("payload identities remain valid");
+        assert_eq!(changed, vec![ctip(130, 300)]);
     }
 
     #[test]
@@ -301,15 +346,12 @@ mod tests {
                     sidechains: vec![
                         events::ActiveSidechain {
                             sidechain_number: 9,
+                            activation_height: 987_402,
                             ..Default::default()
                         },
                         events::ActiveSidechain {
                             sidechain_number: 98,
-                            ..Default::default()
-                        },
-                        // Wider than a slot can be, so not a slot to subscribe to.
-                        events::ActiveSidechain {
-                            sidechain_number: 300,
+                            activation_height: 987_402,
                             ..Default::default()
                         },
                     ],
@@ -318,10 +360,36 @@ mod tests {
         };
 
         assert_eq!(super::active_slots(&snapshot), Some(vec![9, 98]));
+        assert_eq!(
+            active_slot_activations(&snapshot)
+                .expect("active snapshot")
+                .expect("valid slots"),
+            vec![(9, 987_402), (98, 987_402)]
+        );
         assert_eq!(super::active_slots(&ctip(9, 100)), None);
         assert_eq!(
             super::active_slots(&events::EnforcerEvent { event: None }),
             None
+        );
+    }
+
+    #[test]
+    fn active_sidechain_numbers_must_fit_in_a_slot() {
+        let snapshot = events::EnforcerEvent {
+            event: Some(events::enforcer_event::Event::ActiveSidechains(
+                events::ActiveSidechainsSnapshot {
+                    sidechains: vec![events::ActiveSidechain {
+                        sidechain_number: 300,
+                        ..Default::default()
+                    }],
+                },
+            )),
+        };
+
+        assert!(
+            active_slot_activations(&snapshot)
+                .expect("active snapshot")
+                .is_err()
         );
     }
 

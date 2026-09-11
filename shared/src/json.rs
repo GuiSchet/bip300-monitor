@@ -88,7 +88,9 @@ fn encode_bytes(value: &Value, field: &str) -> Result<Value> {
 mod tests {
     use std::collections::BTreeSet;
 
-    use super::BYTE_FIELDS;
+    use super::{BYTE_FIELDS, render};
+    use crate::protobuf::enforcer_extractor as events;
+    use crate::protobuf::event::{Event, event::MonitorEvent};
 
     #[test]
     fn hexadecimal_field_list_covers_every_proto_bytes_field() {
@@ -118,5 +120,30 @@ mod tests {
             .collect::<BTreeSet<_>>();
 
         assert_eq!(rendered_fields, proto_fields);
+    }
+
+    #[test]
+    fn active_sidechain_fields_have_a_stable_query_path() {
+        let event = Event {
+            timestamp: 1,
+            observed_at_block: None,
+            monitor_event: Some(MonitorEvent::Enforcer(events::EnforcerEvent {
+                event: Some(events::enforcer_event::Event::ActiveSidechains(
+                    events::ActiveSidechainsSnapshot {
+                        sidechains: vec![events::ActiveSidechain {
+                            sidechain_number: 9,
+                            activation_height: 987_401,
+                            ..Default::default()
+                        }],
+                    },
+                )),
+            })),
+        };
+
+        let value = render(&event).expect("render event");
+        let sidechain =
+            &value["monitor_event"]["Enforcer"]["event"]["ActiveSidechains"]["sidechains"][0];
+        assert_eq!(sidechain["sidechain_number"], 9);
+        assert_eq!(sidechain["activation_height"], 987_401);
     }
 }

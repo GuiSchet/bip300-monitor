@@ -207,6 +207,18 @@ load_deployment_env() {
         LIVE_BLOCK_WAIT_SECONDS "${LIVE_BLOCK_WAIT_SECONDS:-3600}"
     require_positive_integer \
         LIVE_EVENT_WAIT_SECONDS "${LIVE_EVENT_WAIT_SECONDS:-60}"
+    require_positive_integer \
+        HISTORY_WAIT_SECONDS "${HISTORY_WAIT_SECONDS:-43200}"
+    require_positive_integer \
+        BIP300_MONITOR_BACKFILL_PAGE_BLOCKS \
+        "${BIP300_MONITOR_BACKFILL_PAGE_BLOCKS:-128}"
+    ((${BIP300_MONITOR_BACKFILL_PAGE_BLOCKS:-128} <= 512)) ||
+        die "BIP300_MONITOR_BACKFILL_PAGE_BLOCKS must not exceed 512"
+    [[ "${BIP300_MONITOR_BACKFILL_PAGE_PAUSE_MS:-100}" =~ ^[0-9]+$ ]] ||
+        die "BIP300_MONITOR_BACKFILL_PAGE_PAUSE_MS must be numeric"
+    if [[ -n "${BIP300_MONITOR_BACKFILL_MAX_BLOCKS+x}" ]]; then
+        die "BIP300_MONITOR_BACKFILL_MAX_BLOCKS was removed; replace it with BIP300_MONITOR_BACKFILL_PAGE_BLOCKS"
+    fi
     TRUST_ASSUMEUTXO_SNAPSHOT="${TRUST_ASSUMEUTXO_SNAPSHOT:-false}"
     require_boolean TRUST_ASSUMEUTXO_SNAPSHOT "${TRUST_ASSUMEUTXO_SNAPSHOT}"
     export TRUST_ASSUMEUTXO_SNAPSHOT
@@ -272,6 +284,26 @@ enforcer_rpc() {
         --header 'Content-Type: application/json' \
         --data '{}' \
         "http://127.0.0.1:50051/cusf.mainchain.v1.ValidatorService/${method}"
+}
+
+# Active sidechains as `slot activation_height`, sorted by slot. The validator
+# is the authority for both values; a deployment-local list would go stale on
+# the next activation.
+active_sidechain_activations() {
+    local response
+    response="$(enforcer_rpc GetSidechains)" || return 1
+    jq -r '
+        if (.sidechains | type) != "array" then
+            error("GetSidechains response has no sidechains array")
+        else
+            [.sidechains[]
+             | {slot: (.sidechainNumber | tonumber),
+                height: (.activationHeight | tonumber)}]
+            | sort_by(.slot)
+            | unique_by(.slot)
+            | .[]
+            | "\(.slot) \(.height)"
+        end' <<<"${response}"
 }
 
 nats_monitor() {
@@ -392,12 +424,6 @@ logs_contain_live_event() {
     return 1
 }
 
-logs_contain_message() {
-    local logs="$1"
-    local message="$2"
-    [[ "${logs}" == *"${message}"* ]]
-}
-
 logs_contain_snapshot_completion() {
     local logs="$1"
     local sidechain_count="$2"
@@ -452,6 +478,35 @@ record_snapshot_anchor() {
           ORDER BY id DESC LIMIT 1"
 }
 
+record_snapshot_height() {
+    postgres_query \
+        "SELECT height FROM event
+          WHERE kind = 'chain_tip' AND block_hash IS NOT NULL AND height IS NOT NULL
+          ORDER BY id DESC LIMIT 1"
+}
+
+# Slots and activation heights encoded in the active-sidechains payload at one
+# semantic-snapshot anchor. This is deliberately distinct from asking the
+# enforcer for its current active set: a new slot may activate while the same
+# extractor instance is still running.
+record_snapshot_sidechain_activations() {
+    local block_hash="$1"
+
+    [[ "${block_hash}" =~ ^[[:xdigit:]]{64}$ ]] || return 1
+    postgres_query \
+        "SELECT (snapshot_sidechain.value->>'sidechain_number') || ' ' ||
+                       (snapshot_sidechain.value->>'activation_height')
+           FROM event
+          CROSS JOIN LATERAL jsonb_array_elements(
+              payload #> '{monitor_event,Enforcer,event,ActiveSidechains,sidechains}'
+          ) AS snapshot_sidechain(value)
+          WHERE source = 'enforcer'
+            AND kind = 'active_sidechains'
+            AND block_hash = decode(:'block_hash', 'hex')
+          ORDER BY (snapshot_sidechain.value->>'sidechain_number')::integer" \
+        --set=block_hash="${block_hash}"
+}
+
 # Rows of one kind the record holds at one block, for one slot when given.
 #
 # The record itself is the authoritative check: the log lines only show what
@@ -480,14 +535,6 @@ record_event_count_at() {
     postgres_query "SELECT count(*) FROM event WHERE ${predicate}" "${filters[@]}"
 }
 
-record_has_event_at() {
-    local count
-
-    count="$(record_event_count_at "$@")" || return 1
-    [[ "${count}" =~ ^[0-9]+$ ]] || return 1
-    ((count >= 1))
-}
-
 # Whether the record holds one specific block for one slot, by hash.
 record_has_block() {
     local kind="$1"
@@ -511,6 +558,76 @@ record_has_block() {
     )" || return 1
     [[ "${count}" =~ ^[0-9]+$ ]] || return 1
     ((count >= 1))
+}
+
+# Whether one slot has a proven, gap-free range from its activation through at
+# least the requested target height.
+record_block_history_is_complete() {
+    local sidechain="$1"
+    local activation_height="$2"
+    local minimum_target_height="$3"
+    local complete
+
+    [[ "${sidechain}" =~ ^[0-9]+$ ]] || return 1
+    [[ "${activation_height}" =~ ^[0-9]+$ ]] || return 1
+    [[ "${minimum_target_height}" =~ ^[0-9]+$ ]] || return 1
+    complete="$(
+        postgres_query \
+            "SELECT CASE WHEN EXISTS (
+                 SELECT 1 FROM history_coverage coverage
+                  WHERE coverage.source = 'enforcer'
+                    AND coverage.stream = 'block'
+                    AND coverage.sidechain = :'sidechain'::smallint
+                    AND coverage.status = 'complete'
+                    AND coverage.coverage_start_height = :'activation'::integer
+                    AND coverage.covered_tip_height = coverage.target_tip_height
+                    AND coverage.covered_tip_height >= :'minimum_target'::integer
+                    AND coverage.next_hash IS NULL
+                    AND (
+                        SELECT count(DISTINCT event.height)
+                          FROM event
+                         WHERE event.source = coverage.source
+                           AND event.kind = 'block_connected'
+                           AND event.sidechain = coverage.sidechain
+                           AND event.height BETWEEN coverage.coverage_start_height
+                                                AND coverage.covered_tip_height
+                    ) = coverage.covered_tip_height - coverage.coverage_start_height + 1
+             ) THEN 1 ELSE 0 END" \
+            --set=sidechain="${sidechain}" \
+            --set=activation="${activation_height}" \
+            --set=minimum_target="${minimum_target_height}"
+    )" || return 1
+    [[ "${complete}" == 1 ]]
+}
+
+history_coverage_json() {
+    postgres_query \
+        "SELECT COALESCE(jsonb_agg(row ORDER BY (row->>'sidechain')::integer), '[]'::jsonb)
+           FROM (
+             SELECT jsonb_build_object(
+                 'stream', stream,
+                 'sidechain', sidechain,
+                 'status', status,
+                 'start_height', coverage_start_height,
+                 'target_height', target_tip_height,
+                 'next_height', next_height,
+                 'covered_height', covered_tip_height,
+                 'rows_recorded', rows_recorded,
+                 'page_blocks', effective_page_blocks,
+                 'percent', CASE
+                     WHEN status = 'complete' THEN 100
+                     ELSE round(
+                         100.0 * (target_tip_height - next_height)
+                         / GREATEST(target_tip_height - coverage_start_height + 1, 1),
+                         2
+                     )
+                 END,
+                 'last_error', last_error,
+                 'updated_at', updated_at
+             ) AS row
+             FROM history_coverage
+             WHERE source = 'enforcer'
+           ) coverage_rows"
 }
 
 # The extractor republishes a snapshot kind whenever a block changes it, so a
@@ -781,8 +898,4 @@ require_node_monitoring_ready() {
     historical_blocks="$(jq -r '.chainstates[0].blocks // "unavailable"' <<<"${chainstates}")"
     active_blocks="$(jq -r '.chainstates[-1].blocks // "unavailable"' <<<"${chainstates}")"
     die "ecash-node is not ready for monitoring (chainstates=${chainstate_count}, historical_blocks=${historical_blocks}, active_blocks=${active_blocks}); require one fully validated chainstate or set TRUST_ASSUMEUTXO_SNAPSHOT=true and load the pinned snapshot at ${ECASH_ACTIVATION_BLOCK_HASH}"
-}
-
-require_node_history_ready() {
-    require_node_monitoring_ready
 }

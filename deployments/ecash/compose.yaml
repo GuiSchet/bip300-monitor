@@ -153,6 +153,9 @@ services:
     init: true
     restart: on-failure
     stop_grace_period: 1m
+    # Keep a historical import from competing with the node for all host RAM.
+    # Pages are only 128 rows, so this is ample for the authoritative record.
+    mem_limit: 1g
     user: ${PUID:-1000}:${PGID:-1000}
     environment:
       POSTGRES_DB: ${POSTGRES_DB:?POSTGRES_DB must be set by VERSIONS.lock}
@@ -241,6 +244,9 @@ services:
     init: true
     restart: on-failure
     stop_grace_period: 20s
+    # A bad upstream response is contained to this process instead of causing a
+    # host-wide OOM. The durable page cursor makes a restart safe.
+    mem_limit: 512m
     # Its own UID, but PGID as the group so it can read the group-readable
     # Postgres password without sharing an identity with any other service.
     user: 10001:${PGID:-1000}
@@ -256,15 +262,14 @@ services:
       BIP300_MONITOR_POSTGRES_USER: ${POSTGRES_USER:?POSTGRES_USER must be set by VERSIONS.lock}
       BIP300_MONITOR_POSTGRES_PASSWORD_FILE: /run/secrets/postgres-password
       BIP300_MONITOR_ENFORCER_ENDPOINT: http://enforcer:50051
-      BIP300_MONITOR_SIDECHAINS: ${BIP300_MONITOR_SIDECHAINS:-9,98}
       BIP300_MONITOR_LOG_LEVEL: ${BIP300_MONITOR_LOG_LEVEL:-info}
       BIP300_MONITOR_REQUEST_TIMEOUT_SECONDS: "10"
       BIP300_MONITOR_NATS_FLUSH_TIMEOUT_SECONDS: "10"
       BIP300_MONITOR_SHUTDOWN_TIMEOUT_SECONDS: "15"
-      # How much history one restart may recover. Past this the extractor
-      # records a window ending at the tip and warns that the rest was skipped,
-      # so raising it is how a long outage is closed rather than dropped.
-      BIP300_MONITOR_BACKFILL_MAX_BLOCKS: ${BIP300_MONITOR_BACKFILL_MAX_BLOCKS:-2000}
+      # Total history is always recovered. These values bound only one RPC,
+      # transaction and in-memory batch at a time.
+      BIP300_MONITOR_BACKFILL_PAGE_BLOCKS: ${BIP300_MONITOR_BACKFILL_PAGE_BLOCKS:-128}
+      BIP300_MONITOR_BACKFILL_PAGE_PAUSE_MS: ${BIP300_MONITOR_BACKFILL_PAGE_PAUSE_MS:-100}
       BIP300_MONITOR_TIP_POLL_INTERVAL_SECONDS: "30"
       BIP300_MONITOR_LIVENESS_FILE: /tmp/liveness
     depends_on:
@@ -291,8 +296,8 @@ services:
       interval: 30s
       timeout: 5s
       retries: 3
-      # The snapshot and the backfill both run before the first tip poll.
-      start_period: 180s
+      # Live workers and the tip heartbeat start without waiting for history.
+      start_period: 120s
     networks:
       ecash-internal:
     read_only: true

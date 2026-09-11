@@ -17,6 +17,19 @@ trap '[[ -z "${result_tmp}" ]] || rm -f -- "${result_tmp}"' EXIT
 
 "${DEPLOYMENT_ROOT}/scripts/verify.sh"
 
+declare -a sidechains=()
+active_activations="$(active_sidechain_activations)"
+while read -r sidechain _activation_height; do
+    [[ -n "${sidechain}" ]] || continue
+    [[ "${sidechain}" =~ ^[0-9]+$ ]] || die "enforcer returned an invalid sidechain slot"
+    ((10#${sidechain} <= 255)) || die "sidechain slot must fit in a u8: ${sidechain}"
+    sidechains+=("${sidechain}")
+done <<<"${active_activations}"
+observed_sidechains="$(
+    IFS=,
+    printf '%s' "${sidechains[*]}"
+)"
+
 block_wait_seconds="${LIVE_BLOCK_WAIT_SECONDS:-3600}"
 event_wait_seconds="${LIVE_EVENT_WAIT_SECONDS:-60}"
 started_at="$(date --utc +%Y-%m-%dT%H:%M:%SZ)"
@@ -36,15 +49,6 @@ while :; do
     ((SECONDS < block_deadline)) ||
         die "no new ${NETWORK_ID} block arrived within ${block_wait_seconds}s; live delivery was not exercised"
     sleep 10
-done
-
-configured_sidechains="${BIP300_MONITOR_SIDECHAINS:-9,98}"
-IFS=',' read -r -a sidechains <<<"${configured_sidechains}"
-((${#sidechains[@]} > 0)) || die "BIP300_MONITOR_SIDECHAINS must not be empty"
-for sidechain in "${sidechains[@]}"; do
-    [[ "${sidechain}" =~ ^[0-9]+$ ]] ||
-        die "invalid configured sidechain slot: ${sidechain}"
-    ((10#${sidechain} <= 255)) || die "sidechain slot must fit in a u8: ${sidechain}"
 done
 
 event_deadline="$((SECONDS + event_wait_seconds))"
@@ -78,20 +82,28 @@ while :; do
     done
 
     if [[ "${all_delivered}" == true ]]; then
+        final_active_activations="$(active_sidechain_activations)"
+        [[ "${final_active_activations}" == "${active_activations}" ]] ||
+            die "the active sidechain set changed during live verification; run 'just verify-live' again so the new slot is included"
         if [[ -n "${result_file}" ]]; then
             result_directory="$(dirname -- "${result_file}")"
             [[ -d "${result_directory}" ]] ||
                 die "live verification result directory does not exist: ${result_directory}"
             result_tmp="$(mktemp "${result_directory}/.verified-live.XXXXXX")"
+            slots_json="$(
+                printf '%s\n' "${sidechains[@]}" |
+                    jq -R -s 'split("\n") | map(select(length > 0) | tonumber)'
+            )"
             jq -n \
                 --argjson height "${live_height}" \
                 --arg hash "${live_hash}" \
-                '{height: $height, hash: $hash}' >"${result_tmp}"
+                --argjson slots "${slots_json}" \
+                '{height: $height, hash: $hash, slots: $slots}' >"${result_tmp}"
             chmod 0600 "${result_tmp}"
             mv -- "${result_tmp}" "${result_file}"
             result_tmp=""
         fi
-        info "live ${NETWORK_ID} event delivery passed (height=${live_height}, hash=${live_hash}, slots=${configured_sidechains})"
+        info "live ${NETWORK_ID} event delivery passed (height=${live_height}, hash=${live_hash}, slots=${observed_sidechains:-none})"
         exit 0
     fi
     ((SECONDS < event_deadline)) ||

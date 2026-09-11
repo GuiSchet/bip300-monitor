@@ -28,6 +28,7 @@ trap 'rm -f -- "${live_result}" "${marker_tmp}"' EXIT
 
 verified_live_height="$(jq -er '.height' "${live_result}")"
 verified_live_hash="$(jq -er '.hash' "${live_result}")"
+history_slots="$(jq -er '.slots | map(tostring) | join(",")' "${live_result}")"
 [[ "${verified_live_height}" =~ ^[0-9]+$ ]] ||
     die "live verification returned an invalid height"
 [[ "${verified_live_hash}" =~ ^[[:xdigit:]]{64}$ ]] ||
@@ -41,6 +42,11 @@ verified_live_hash="$(jq -er '.hash' "${live_result}")"
     printf 'enforcer_commit=%s\n' "${ENFORCER_COMMIT}"
     printf 'enforcer_image=%s\n' "${ENFORCER_IMAGE}"
     printf 'monitor_image_commit=%s\n' "${MONITOR_IMAGE_COMMIT}"
+    printf 'block_history_complete=true\n'
+    # The current upstream enforcer cannot expose historical mutable-state
+    # snapshots. Keep that distinction explicit until its Phase 2 API lands.
+    printf 'state_history_complete=false\n'
+    printf 'history_slots=%s\n' "${history_slots}"
     printf 'verified_live_height=%s\n' "${verified_live_height}"
     printf 'verified_live_hash=%s\n' "${verified_live_hash}"
 } >"${marker_tmp}"

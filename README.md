@@ -1,221 +1,109 @@
 # bip300-monitor
 
-Rust tooling to monitor BIP300/301 enforcers.
+Rust tooling for observing BIP300/301 enforcers. The project is an early pilot.
 
-## Status
-
-This project is an early pilot. The enforcer extractor consumes the enforcer's
-public read-only API, records normalized protobuf events in Postgres, and fans
-them out to Core NATS for live consumers.
-
-## Architecture
+## Overview
 
 ```text
-                                                    ┌──► Postgres  (the record)
-BIP300/301 enforcer ─ Connect/gRPC ─► enforcer-extractor
+                                                    ┌──► Postgres (record)
+BIP300/301 enforcer ── gRPC ──► enforcer-extractor
                                                     └──► NATS ──► event-logger
                                                          (live fan-out)
 ```
 
-Postgres is authoritative. The extractor commits there first and publishes to
-NATS afterwards, so a failed write is fatal while a failed publication is only a
-warning: the row is already durable, and a live consumer missing a message costs
-nothing but its own freshness.
+The extractor:
 
-- `shared` contains the event contract, the Postgres record, NATS, JSON
-  rendering, diagnostics, and lifecycle infrastructure.
-- `extractors/enforcer` contains the enforcer client and extraction runtime.
-- `tools/event-logger` decodes the events received from NATS and logs them.
+- records an initial enforcer state snapshot;
+- follows live block connections and disconnections;
+- discovers active sidechain slots, including slots activated while it runs;
+- stores normalized protobuf events in Postgres before publishing them to NATS;
+- recovers missing block history after startup or downtime.
 
-The enforcer extractor generates a standard gRPC client from a minimal vendored
-copy of the enforcer's public validator API. It does not link to the enforcer
-implementation.
+Postgres is authoritative. Core NATS is best-effort live delivery: historical
+pages go directly to Postgres and do not flood live consumers.
 
-## Event schema
+The workspace contains:
 
-The monitor publishes its own stable protobuf contract instead of forwarding
-the enforcer API responses directly. The top-level event envelope, normalized
-enforcer messages, byte-order rules, and snapshot semantics are documented in
-[`proto/README.md`](proto/README.md).
+- `shared`: event contract, Postgres store, NATS and lifecycle utilities;
+- `extractors/enforcer`: gRPC client, conversion and extraction runtime;
+- `tools/event-logger`: live event decoder and logger.
 
-Rust event types are generated in `shared`. Fallible conversions in the
-enforcer extractor reject missing fields, malformed hex, and incorrectly sized
-hashes before an event can be published.
+## Historical recovery
 
-## Continuous extraction
+For every active slot, the first backfill walks from the current tip through the
+slot's activation height. Later runs extend that proven range.
 
-The executable records an initial state snapshot and then follows live block
-events until it receives
-`SIGINT` or `SIGTERM`. A moving tip also makes it re-read the state that the tip
-changes — sidechain proposals, active sidechains, the CTIP of each slot, and the
-withdrawal bundles still being voted on — and republish only what actually
-changed.
+History is processed in bounded pages of 128 blocks by default. Every page is
+checked for exact size, height and hash continuity, then its events and next
+cursor are committed in one Postgres transaction. Interrupted work resumes from
+that cursor. Oversized or timed-out requests reduce the page size automatically,
+and a reorg can restart the affected slot from activation.
 
-That re-read is a poll, not a per-block query: these RPCs only answer "what is
-true right now", so a reading describes the tip it was read against. Under fast
-blocks two heights coalesce into one reading, which is why consecutive snapshots
-are consecutive observations rather than consecutive blocks. The full semantics
-are in [`proto/README.md`](proto/README.md).
+The historical block stream includes block headers, BMM commitments, deposits
+and withdrawal-bundle outcomes. The current enforcer API does not expose past
+CTIP, proposal or pending-bundle snapshots; those RPCs only return current
+state. `history_coverage.stream = 'block'` therefore proves complete block
+history, not complete historical state snapshots.
 
-The tip is also polled directly, every `--tip-poll-interval-seconds`. The live
-streams already report every block, so that poll usually only confirms what a
-slot worker just said. It exists for the two cases the streams cannot cover: no
-slot resolved, so there is no stream at all, and a stream that stops delivering
-without closing.
+## Event contract
 
-Sidechain slots can be configured explicitly, or discovered from the enforcer's
-active sidechains when `--sidechain` is omitted. A deployment that pins what it
-expects to observe should still set them: then a slot going missing is a failure
-rather than a silently smaller set. Discovering none is not an error — a network
-before any activation genuinely has none — and the extractor keeps recording
-chain state, warning once a sidechain activates into a slot it is not subscribed
-to.
+The monitor publishes a stable protobuf contract rather than forwarding raw
+enforcer responses. See [event schema and semantics](proto/README.md) for event
+variants, byte order, snapshot semantics, idempotency and reorg handling.
+
+## Run locally
+
+Start the extractor with automatic active-slot discovery:
 
 ```bash
 cargo run -p enforcer-extractor -- \
   --enforcer-endpoint http://127.0.0.1:50051 \
-  --nats-url nats://127.0.0.1:4222 \
-  --sidechain 9,98
+  --nats-url nats://127.0.0.1:4222
 ```
 
-Configuration can also be supplied with the `BIP300_MONITOR_*` environment
-variables shown by `--help`. NATS supports anonymous or username/password
-authentication. Logging defaults to `info`; use `--log-level` or `RUST_LOG` for
-more detail.
+Use `--sidechain 9,98` to monitor an explicit fixed set. All options also have
+`BIP300_MONITOR_*` environment-variable equivalents shown by `--help`.
 
-Subscriptions are opened before collecting the initial snapshot, so live
-events are buffered during startup. This avoids an unreported gap but can
-produce duplicates; consumers should deduplicate block events by type,
-sidechain slot, and block hash. Ordering is preserved within each slot, not
-across slots.
-
-HTTP/2 and TCP keepalives detect dead gRPC connections. A fatal stream,
-conversion, or record error stops all slot workers. `SIGINT` and `SIGTERM`
-trigger graceful shutdown; a second signal or the configured timeout forces
-termination.
-
-A restart also backfills. `SubscribeEvents` delivers from the moment of
-subscription and its request carries no cursor, so the blocks that passed while
-the extractor was down are a real hole. The record says where to resume: the
-checkpoint is `max(height)` over the recorded blocks of a slot, and because a
-row is committed before anything is published it can never name a block that was
-not stored. Three cases are handled explicitly, because each has a way of going
-wrong quietly:
-
-- **Within the bound.** `GetBlockInfo` walks back from the tip far enough to
-  reach the block after the checkpoint, and the recovered chain is checked
-  against the checkpoint before anything is recorded: the right number of
-  blocks, each following the one before it, ending at the checkpoint. A short or
-  unrelated answer is a failure, not a hole.
-- **Nothing recorded yet.** There is no checkpoint to walk from, so a first
-  sight takes a bounded window ending at the tip.
-- **A gap past `--backfill-max-blocks`, a checkpoint that is no longer an
-  ancestor of the tip, or a walk that did not come back whole.** All three fall
-  back to a bounded window and **warn**, because skipped history that is only
-  logged at debug reads later as "nothing happened".
-
-`GetTwoWayPegData` is the call this reads like it should use, and it is the wrong
-one: the enforcer omits every block whose contents are empty for the requested
-slot, which on a quiet slot is nearly all of them, while `SubscribeEvents`
-reports every block. Walking a range with it records a subset of the gap and
-leaves the checkpoint short of the tip, so the same gap is re-walked on every
-restart until it outgrows the bound and is dropped — reported, throughout, as a
-successful backfill.
-
-Detailed event semantics are documented in
-[`proto/README.md`](proto/README.md).
-
-## Inspecting events
-
-The event logger proves the consumer side of the pipeline by subscribing to
-`bip300.enforcer` and decoding the received protobuf envelopes:
+Inspect live events with:
 
 ```bash
 cargo run -p event-logger -- --nats-url nats://127.0.0.1:4222
 ```
 
-It prints one summary per event. Add `--full-events` to also print the complete
-normalized payload as one-line JSON with byte fields in hexadecimal. An
-individual undecodable, unknown, or invalid event is reported as a warning and
-discarded; loss of the NATS subscription remains fatal.
+Add `--full-events` to print complete normalized JSON payloads.
 
-## Container images
-
-CI publishes separate public `linux/amd64` images for the extractor and logger.
-See [container images](docs/container-images.md) for tags, reproducible pins,
-Docker Hub setup, and local builds.
-
-## Deployments
-
-Reproducible infrastructure lives under `deployments/`. The eCash target
-generates its node configuration and isolated runtime identity from a network
-lock, so the same topology can move between network generations. Its current
-lock targets Alphanet and includes a
-pinned node, validator enforcer, Postgres record, Core NATS, enforcer extractor,
-and event logger: [eCash deployment](deployments/ecash/README.md).
-
-## Build
+## Build and test
 
 ```bash
 cargo check --workspace --jobs 2
 cargo test --workspace --jobs 2
 ```
 
-The record integration tests need a server:
+Generating the gRPC client requires `protoc`. PostgreSQL and NATS integration
+tests are feature-gated because they require those services:
 
 ```bash
-docker run --rm -d -p 55432:5432 -e POSTGRES_PASSWORD=test \
-    --name bip300-test-postgres postgres:18.2-alpine
 BIP300_MONITOR_TEST_POSTGRES_URL='host=127.0.0.1 port=55432 user=postgres password=test dbname=postgres' \
-    cargo test -p shared --features postgres_integration_tests
-```
+  cargo test -p shared --features postgres_integration_tests
 
-Generating the client currently requires `protoc` to be installed. On
-Debian/Ubuntu it is provided by `protobuf-compiler`.
-
-The feature-gated Core NATS integration test requires a `nats-server` binary.
-Run it with:
-
-```bash
 NATS_SERVER_BINARY=/path/to/nats-server \
-  cargo test --workspace --all-features --jobs 2
+  cargo test -p enforcer-extractor --features nats_integration_tests --test nats
 ```
 
-Network gate: confirm that an idle enforcer remains subscribed beyond
-`--request-timeout-seconds 5`; that normal `SIGTERM` exits with code 0 before
-the 15-second shutdown timeout; that stopping NATS leaves the extractor
-recording and only warns; that **starting** with NATS already down also leaves it
-recording and only warns; that stopping Postgres terminates it; and that a run
-with no slot configured against an enforcer with no active sidechain keeps
-recording chain state instead of exiting.
+## Images and deployment
 
-To verify API compatibility against a running enforcer:
+CI publishes separate `linux/amd64` extractor and logger images. See
+[container images](docs/container-images.md) for tags and reproducible pins.
 
-```bash
-cargo run --example get_chain_info -- \
-  http://127.0.0.1:50051
-```
+The locked eCash Alphanet stack includes the node, enforcer, Postgres, Core
+NATS, extractor and logger. See the
+[eCash deployment runbook](deployments/ecash/README.md) for provisioning,
+verification, history status, resource limits and recovery.
 
-## Next
+## Scope
 
-The monitor's purpose is to answer two questions with reproducible evidence:
-what the BIP300 mechanism is actually doing on the target network, and whether
-the enforcer implements it as specified. Generic L1 observability is
-deliberately out of scope.
-
-Planned work, in order:
-
-1. **Re-subscribing without a restart.** Slots are resolved once, at startup, so
-   a sidechain that activates later is reported loudly but stays unobserved
-   until the extractor is restarted. Activation takes tens of thousands of
-   blocks of miner ACKs, so this is rare enough that spawning workers mid-flight
-   was not worth the restart loop a slot set flapping through a reorg would
-   cause — but it is still a gap.
-2. **An independent oracle.** The enforcer parses the BIP300 coinbase messages
-   but only publishes aggregates: per-block M2, M4 and M7 votes never leave it,
-   and BMM bid amounts appear in no API at all. Deriving that state from the raw
-   block and comparing it against what the enforcer reports turns the monitor
-   into a conformance check rather than a mirror.
+The monitor is designed to produce reproducible evidence about BIP300 behavior
+and enforcer conformance. Generic L1 observability is out of scope.
 
 ## License
 
