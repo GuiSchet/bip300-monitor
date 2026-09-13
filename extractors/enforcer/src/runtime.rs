@@ -1,6 +1,6 @@
 //! Continuous enforcer event extraction.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
@@ -17,6 +17,7 @@ use shared::protobuf::event::{Event, ObservedBlock};
 use shared::recorder::Recorder;
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinSet;
+use tokio::time::Instant;
 use tonic::{Status, Streaming};
 
 use crate::backfill;
@@ -174,6 +175,10 @@ pub async fn run(args: Args, mut shutdown_rx: watch::Receiver<bool>) -> Result<(
     // process with a success code and no work done.
     let snapshot_block = snapshot.anchor.hash.clone();
     let (block_tx, block_rx) = watch::channel(snapshot.anchor.hash.clone());
+    // This is deliberately separate from `block_tx`: a healthy slot stream can
+    // report a block before the poll sees it, but the poll must still notify
+    // every other slot so a silently wedged stream cannot hide behind it.
+    let (tip_tx, tip_rx) = watch::channel(snapshot.anchor.clone());
     let (sidechains_tx, sidechains_rx) = watch::channel(sidechains.clone());
     let (backfill_tx, backfill_rx) = mpsc::channel(256);
     for (sidechain, activation_height) in &activations {
@@ -197,6 +202,8 @@ pub async fn run(args: Args, mut shutdown_rx: watch::Receiver<bool>) -> Result<(
         backfill_tx,
         args.sidechains.is_empty(),
         args.tip_poll_interval(),
+        tip_rx.clone(),
+        args.request_timeout(),
         shutdown_rx.clone(),
     ));
     workers.spawn(monitor_tip(
@@ -204,6 +211,7 @@ pub async fn run(args: Args, mut shutdown_rx: watch::Receiver<bool>) -> Result<(
         args.tip_poll_interval(),
         Heartbeat::new(args.liveness_file.clone()),
         block_tx,
+        tip_tx,
         shutdown_rx.clone(),
     ));
     workers.spawn(monitor_state(
@@ -223,9 +231,12 @@ pub async fn run(args: Args, mut shutdown_rx: watch::Receiver<bool>) -> Result<(
         client,
         recorder,
         backfill_rx,
-        args.backfill_page_blocks,
-        args.backfill_page_pause(),
+        backfill::Settings {
+            page_blocks: args.backfill_page_blocks,
+            page_pause: args.backfill_page_pause(),
+        },
         args.tip_poll_interval(),
+        tip_rx,
         shutdown_rx,
     ));
 
@@ -260,35 +271,64 @@ async fn backfill_sidechains(
     mut client: EnforcerClient,
     recorder: Recorder,
     mut requests: mpsc::Receiver<BackfillRequest>,
-    page_blocks: u32,
-    page_pause: Duration,
+    settings: backfill::Settings,
     retry_interval: Duration,
+    mut tip_rx: watch::Receiver<ObservedBlock>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> Result<()> {
     let mut requests_open = true;
+    let mut tip_updates_open = true;
+    let mut activations = BTreeMap::<u8, u32>::new();
+    let mut pending = BTreeMap::<u8, BackfillRequest>::new();
+    let mut deferred = BTreeSet::<u8>::new();
     let mut retries = FuturesUnordered::<DeferredBackfill>::new();
 
     loop {
-        if !requests_open && retries.is_empty() {
+        if !requests_open && pending.is_empty() && retries.is_empty() {
             return Ok(());
         }
 
-        let (mut request, refresh_target) = tokio::select! {
-            biased;
-            () = wait_for_shutdown(&mut shutdown_rx) => return Ok(()),
-            request = requests.recv(), if requests_open => match request {
-                Some(request) => (request, false),
-                None => {
-                    requests_open = false;
+        let (mut request, refresh_target) = if let Some((_, request)) = pending.pop_first() {
+            (request, false)
+        } else {
+            tokio::select! {
+                biased;
+                () = wait_for_shutdown(&mut shutdown_rx) => return Ok(()),
+                request = requests.recv(), if requests_open => match request {
+                    Some(request) => (request, false),
+                    None => {
+                        requests_open = false;
+                        continue;
+                    }
+                },
+                request = retries.next(), if !retries.is_empty() => {
+                    (request.expect("a non-empty deferred backfill set yields a request"), true)
+                }
+                changed = tip_rx.changed(), if tip_updates_open => {
+                    if changed.is_err() {
+                        tip_updates_open = false;
+                        continue;
+                    }
+                    let target = tip_rx.borrow_and_update().clone();
+                    queue_tip_reconciliations(&activations, &mut pending, &target);
+                    tracing::debug!(
+                        target = %hex::encode(&target.hash),
+                        sidechain_count = pending.len(),
+                        "queued block-history reconciliation after a polled tip change"
+                    );
                     continue;
                 }
-            },
-            request = retries.next(), if !retries.is_empty() => {
-                (request.expect("a non-empty deferred backfill set yields a request"), true)
             }
         };
 
+        activations.insert(request.sidechain, request.activation_height);
+        // An explicit request or refreshed retry supersedes a queued target for
+        // the same slot. Its post-pass tip read will reconcile to the newest
+        // branch before this worker moves on.
+        pending.remove(&request.sidechain);
+
         if refresh_target {
+            deferred.remove(&request.sidechain);
             match snapshot::current_tip(&mut client).await {
                 Ok(current_tip) => request.target = current_tip,
                 Err(error) => {
@@ -297,7 +337,7 @@ async fn backfill_sidechains(
                         error = %format!("{error:#}"),
                         "could not refresh a deferred backfill target; retrying later"
                     );
-                    retries.push(defer_backfill(request, retry_interval));
+                    schedule_backfill_retry(&mut retries, &mut deferred, request, retry_interval);
                     continue;
                 }
             }
@@ -315,10 +355,7 @@ async fn backfill_sidechains(
                 sidechain,
                 activation_height,
                 &target,
-                backfill::Settings {
-                    page_blocks,
-                    page_pause,
-                },
+                settings,
                 shutdown_rx.clone(),
             )
             .await
@@ -337,14 +374,16 @@ async fn backfill_sidechains(
                         retry_seconds = retry_interval.as_secs(),
                         "block history is incomplete; scheduling a deferred retry"
                     );
-                    retries.push(defer_backfill(
+                    schedule_backfill_retry(
+                        &mut retries,
+                        &mut deferred,
                         BackfillRequest {
                             sidechain,
                             activation_height,
                             target,
                         },
                         retry_interval,
-                    ));
+                    );
                     break;
                 }
                 backfill::Outcome::UpToDate | backfill::Outcome::Completed { .. } => {}
@@ -364,6 +403,34 @@ async fn backfill_sidechains(
             );
             target = current_tip;
         }
+    }
+}
+
+fn schedule_backfill_retry(
+    retries: &mut FuturesUnordered<DeferredBackfill>,
+    deferred: &mut BTreeSet<u8>,
+    request: BackfillRequest,
+    retry_interval: Duration,
+) {
+    if deferred.insert(request.sidechain) {
+        retries.push(defer_backfill(request, retry_interval));
+    }
+}
+
+fn queue_tip_reconciliations(
+    activations: &BTreeMap<u8, u32>,
+    pending: &mut BTreeMap<u8, BackfillRequest>,
+    target: &ObservedBlock,
+) {
+    for (&sidechain, &activation_height) in activations {
+        pending.insert(
+            sidechain,
+            BackfillRequest {
+                sidechain,
+                activation_height,
+                target: target.clone(),
+            },
+        );
     }
 }
 
@@ -499,6 +566,8 @@ async fn monitor_sidechains(
     backfill_tx: mpsc::Sender<BackfillRequest>,
     discover_new_slots: bool,
     discovery_interval: Duration,
+    tip_rx: watch::Receiver<ObservedBlock>,
+    stream_stall_timeout: Duration,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> Result<()> {
     let mut observed = streams
@@ -512,6 +581,8 @@ async fn monitor_sidechains(
             recorder.clone(),
             sidechain,
             block_tx.clone(),
+            tip_rx.clone(),
+            stream_stall_timeout,
             shutdown_rx.clone(),
         ));
     }
@@ -578,6 +649,8 @@ async fn monitor_sidechains(
                 recorder.clone(),
                 sidechain,
                 block_tx.clone(),
+                tip_rx.clone(),
+                stream_stall_timeout,
                 shutdown_rx.clone(),
             ));
             observed.insert(sidechain);
@@ -617,27 +690,36 @@ async fn monitor_sidechain(
     recorder: Recorder,
     sidechain: u8,
     block_tx: watch::Sender<Vec<u8>>,
+    tip_rx: watch::Receiver<ObservedBlock>,
+    stream_stall_timeout: Duration,
     shutdown_rx: watch::Receiver<bool>,
 ) -> Result<()> {
     tracing::info!(sidechain, "started sidechain event worker");
 
-    forward_stream(sidechain, stream, shutdown_rx, move |event| {
-        let recorder = recorder.clone();
-        let block_tx = block_tx.clone();
-        async move {
-            log_published_event(sidechain, &event);
-            // Announced only after the record holds the event, so the block that
-            // triggers a refresh is always one the record already has. The
-            // refresh then anchors itself to the tip it reads, which under fast
-            // blocks can be a later one -- see `state::collect`.
-            recorder
-                .record(event.clone())
-                .await
-                .with_context(|| format!("recording a live event for sidechain {sidechain}"))?;
-            announce_block(&block_tx, sidechain, &event);
-            Ok(())
-        }
-    })
+    forward_stream(
+        sidechain,
+        stream,
+        tip_rx,
+        stream_stall_timeout,
+        shutdown_rx,
+        move |event| {
+            let recorder = recorder.clone();
+            let block_tx = block_tx.clone();
+            async move {
+                log_published_event(sidechain, &event);
+                // Announced only after the record holds the event, so the block that
+                // triggers a refresh is always one the record already has. The
+                // refresh then anchors itself to the tip it reads, which under fast
+                // blocks can be a later one -- see `state::collect`.
+                recorder
+                    .record(event.clone())
+                    .await
+                    .with_context(|| format!("recording a live event for sidechain {sidechain}"))?;
+                announce_block(&block_tx, sidechain, &event);
+                Ok(())
+            }
+        },
+    )
     .await?;
 
     tracing::info!(sidechain, "stopped sidechain event worker");
@@ -662,10 +744,10 @@ fn announce_block(block_tx: &watch::Sender<Vec<u8>>, sidechain: u8, event: &Even
 ///
 /// The live streams already report every block a slot sees, so on the usual path
 /// this only confirms what a slot worker just said and the state worker's own
-/// deduplication drops it. It earns its place in the two cases the streams
-/// cannot cover: no slot is resolved, so there is no stream to report anything;
-/// and a stream that stops delivering without closing, which would otherwise
-/// freeze the refresh with nothing in the log to say so.
+/// deduplication drops it. Its independent tip channel also reconciles every
+/// slot's historical coverage and arms the live-stream watchdog. It therefore
+/// covers both an empty observation set and a stream that stops delivering
+/// without closing.
 ///
 /// A failed read is not fatal. The record is untouched by a poll, and the state
 /// worker still has the slot workers: killing the extractor because one unary
@@ -675,6 +757,7 @@ async fn monitor_tip(
     interval: Duration,
     heartbeat: Heartbeat,
     block_tx: watch::Sender<Vec<u8>>,
+    tip_tx: watch::Sender<ObservedBlock>,
     shutdown_rx: watch::Receiver<bool>,
 ) -> Result<()> {
     tracing::info!(
@@ -683,7 +766,7 @@ async fn monitor_tip(
         "started mainchain tip worker"
     );
 
-    announce_tip_changes(client, interval, heartbeat, block_tx, shutdown_rx).await?;
+    announce_tip_changes(client, interval, heartbeat, block_tx, tip_tx, shutdown_rx).await?;
 
     tracing::info!("stopped mainchain tip worker");
     Ok(())
@@ -694,6 +777,7 @@ async fn announce_tip_changes<S>(
     interval: Duration,
     heartbeat: Heartbeat,
     block_tx: watch::Sender<Vec<u8>>,
+    tip_tx: watch::Sender<ObservedBlock>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> Result<()>
 where
@@ -717,6 +801,9 @@ where
                 // Only a move is reported. Re-announcing the same hash would
                 // still mark the channel changed, and the state worker would
                 // wake once per tick for nothing.
+                if tip_tx.borrow().hash != tip.hash {
+                    let _ = tip_tx.send(tip.clone());
+                }
                 if *block_tx.borrow() != tip.hash {
                     tracing::debug!(
                         block_hash = %hex::encode(&tip.hash),
@@ -849,6 +936,8 @@ where
 async fn forward_stream<S, P, F>(
     sidechain: u8,
     mut stream: S,
+    mut tip_rx: watch::Receiver<ObservedBlock>,
+    stall_timeout: Duration,
     mut shutdown_rx: watch::Receiver<bool>,
     mut publish: P,
 ) -> Result<()>
@@ -857,10 +946,45 @@ where
     P: FnMut(Event) -> F,
     F: Future<Output = Result<()>>,
 {
+    let mut live_events = 0_u64;
+    let mut checked_live_events = 0_u64;
+    let mut stalled_tip = None;
+    let mut stall_deadline = None;
+
     loop {
         let response = tokio::select! {
             biased;
             () = wait_for_shutdown(&mut shutdown_rx) => return Ok(()),
+            changed = tip_rx.changed() => {
+                if changed.is_err() {
+                    bail!("mainchain tip observer stopped while sidechain {sidechain} was running");
+                }
+
+                let tip = tip_rx.borrow_and_update().clone();
+                if live_events == checked_live_events {
+                    stalled_tip = Some(tip);
+                    stall_deadline.get_or_insert_with(|| Instant::now() + stall_timeout);
+                } else {
+                    // At least one durable live event arrived since the previous
+                    // polled tip. The independent historical reconciliation
+                    // verifies the complete range, so activity is enough here;
+                    // requiring a matching hash would falsely fail on a pure
+                    // disconnect, whose event does not name the resulting tip.
+                    stalled_tip = None;
+                    stall_deadline = None;
+                }
+                checked_live_events = live_events;
+                continue;
+            }
+            () = wait_for_stream_stall(stall_deadline) => {
+                let tip = stalled_tip
+                    .as_ref()
+                    .expect("a stream stall deadline has an observed tip");
+                bail!(
+                    "sidechain {sidechain} event stream delivered no event for {stall_timeout:?} after the mainchain tip advanced to {}",
+                    hex::encode(&tip.hash)
+                );
+            }
             response = stream.next() => {
                 match response {
                     Some(Ok(response)) => response,
@@ -884,6 +1008,16 @@ where
         publish(event)
             .await
             .with_context(|| format!("forwarding a live event for sidechain {sidechain}"))?;
+        live_events = live_events.saturating_add(1);
+        stalled_tip = None;
+        stall_deadline = None;
+    }
+}
+
+async fn wait_for_stream_stall(deadline: Option<Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline).await,
+        None => std::future::pending().await,
     }
 }
 
@@ -1011,7 +1145,7 @@ fn log_published_event(sidechain: u8, event: &Event) {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::VecDeque;
+    use std::collections::{BTreeMap, BTreeSet, VecDeque};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
@@ -1024,8 +1158,9 @@ mod tests {
     use tokio::time::timeout;
 
     use super::{
-        Heartbeat, SourceFuture, StartupSource, StateSource, TipSource, announce_tip_changes,
-        forward_stream, prepare_observation, refresh_on_new_blocks, snapshot_tips_are_consistent,
+        BackfillRequest, Heartbeat, SourceFuture, StartupSource, StateSource, TipSource,
+        announce_tip_changes, forward_stream, prepare_observation, queue_tip_reconciliations,
+        refresh_on_new_blocks, schedule_backfill_retry, snapshot_tips_are_consistent,
         supervise_workers, unobserved_activations,
     };
     use crate::proto::{common, mainchain};
@@ -1045,6 +1180,10 @@ mod tests {
         })
     }
 
+    fn observed_tip(byte: u8) -> ObservedBlock {
+        ObservedBlock::at_height(vec![byte; 32], 996_259)
+    }
+
     #[test]
     fn dynamic_discovery_returns_only_new_active_slots() {
         let observed = [9_u8, 98].into_iter().collect();
@@ -1052,6 +1191,44 @@ mod tests {
             unobserved_activations(&observed, vec![(9, 987_402), (98, 987_402), (130, 996_485)]),
             vec![(130, 996_485)]
         );
+    }
+
+    #[test]
+    fn a_tip_change_queues_the_latest_target_for_every_known_slot() {
+        let activations = BTreeMap::from([(9, 987_402), (98, 987_402)]);
+        let mut pending = BTreeMap::new();
+
+        queue_tip_reconciliations(&activations, &mut pending, &observed_tip(0x22));
+        queue_tip_reconciliations(&activations, &mut pending, &observed_tip(0x33));
+
+        assert_eq!(pending.len(), 2, "tip updates coalesce by sidechain");
+        for (sidechain, request) in pending {
+            assert_eq!(request.sidechain, sidechain);
+            assert_eq!(request.activation_height, 987_402);
+            assert_eq!(request.target, observed_tip(0x33));
+        }
+    }
+
+    #[test]
+    fn deferred_retries_are_deduplicated_by_sidechain() {
+        let mut retries = futures_util::stream::FuturesUnordered::new();
+        let mut deferred = BTreeSet::new();
+        let request = BackfillRequest {
+            sidechain: 9,
+            activation_height: 987_402,
+            target: observed_tip(0x22),
+        };
+
+        schedule_backfill_retry(
+            &mut retries,
+            &mut deferred,
+            request.clone(),
+            Duration::from_secs(1),
+        );
+        schedule_backfill_retry(&mut retries, &mut deferred, request, Duration::from_secs(1));
+
+        assert_eq!(retries.len(), 1);
+        assert_eq!(deferred, BTreeSet::from([9]));
     }
 
     fn disconnected(byte: u8) -> mainchain::SubscribeEventsResponse {
@@ -1280,24 +1457,32 @@ mod tests {
     #[tokio::test]
     async fn publishes_disconnect_then_connect_sequentially() {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (_tip_tx, tip_rx) = watch::channel(observed_tip(0x11));
         let published = Arc::new(Mutex::new(Vec::new()));
         let output = Arc::clone(&published);
         let publish_shutdown = shutdown_tx.clone();
         let stream = stream::iter([Ok(disconnected(0x77)), Ok(connected(0x88, 0x66, 501))])
             .chain(stream::pending());
 
-        forward_stream(9, stream, shutdown_rx, move |event| {
-            let output = Arc::clone(&output);
-            let publish_shutdown = publish_shutdown.clone();
-            async move {
-                let mut output = output.lock().expect("published event lock");
-                output.push(event);
-                if output.len() == 2 {
-                    publish_shutdown.send(true).expect("send shutdown");
+        forward_stream(
+            9,
+            stream,
+            tip_rx,
+            Duration::from_secs(1),
+            shutdown_rx,
+            move |event| {
+                let output = Arc::clone(&output);
+                let publish_shutdown = publish_shutdown.clone();
+                async move {
+                    let mut output = output.lock().expect("published event lock");
+                    output.push(event);
+                    if output.len() == 2 {
+                        publish_shutdown.send(true).expect("send shutdown");
+                    }
+                    Ok(())
                 }
-                Ok(())
-            }
-        })
+            },
+        )
         .await
         .expect("clean shutdown after both events");
 
@@ -1323,12 +1508,22 @@ mod tests {
     #[tokio::test]
     async fn shutdown_interrupts_an_already_waiting_idle_stream() {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (_tip_tx, tip_rx) = watch::channel(observed_tip(0x11));
         let stream = stream::pending::<Result<mainchain::SubscribeEventsResponse, tonic::Status>>();
-        let worker = tokio::spawn(forward_stream(9, stream, shutdown_rx, |_event| async {
-            Ok(())
-        }));
+        let worker = tokio::spawn(forward_stream(
+            9,
+            stream,
+            tip_rx,
+            Duration::from_millis(10),
+            shutdown_rx,
+            |_event| async { Ok(()) },
+        ));
 
-        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(
+            !worker.is_finished(),
+            "an idle stream on an unchanged tip is healthy"
+        );
         shutdown_tx.send(true).expect("send shutdown");
 
         timeout(Duration::from_secs(1), worker)
@@ -1339,13 +1534,79 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_silent_stream_fails_after_the_polled_tip_advances() {
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (tip_tx, tip_rx) = watch::channel(observed_tip(0x11));
+        let stream = stream::pending::<Result<mainchain::SubscribeEventsResponse, tonic::Status>>();
+        let worker = tokio::spawn(forward_stream(
+            9,
+            stream,
+            tip_rx,
+            Duration::from_millis(10),
+            shutdown_rx,
+            |_event| async { Ok(()) },
+        ));
+
+        tip_tx.send(observed_tip(0x22)).expect("advance tip");
+
+        let error = timeout(Duration::from_secs(1), worker)
+            .await
+            .expect("stalled stream is bounded")
+            .expect("join stream worker")
+            .expect_err("a stream silent after tip movement must fail");
+        let message = error.to_string();
+        assert!(message.contains("sidechain 9 event stream delivered no event"));
+        assert!(message.contains(&hex::encode([0x22; 32])));
+    }
+
+    #[tokio::test]
+    async fn live_activity_after_a_tip_change_cancels_the_stall_deadline() {
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (tip_tx, tip_rx) = watch::channel(observed_tip(0x11));
+        let stream = stream::once(async {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            Ok(disconnected(0x11))
+        })
+        .chain(stream::pending())
+        .boxed();
+        let mut worker = tokio::spawn(forward_stream(
+            9,
+            stream,
+            tip_rx,
+            Duration::from_millis(20),
+            shutdown_rx,
+            |_event| async { Ok(()) },
+        ));
+
+        tip_tx.send(observed_tip(0x22)).expect("advance tip");
+
+        timeout(Duration::from_millis(60), &mut worker)
+            .await
+            .expect_err("a stream that resumed must keep running");
+        shutdown_tx.send(true).expect("send shutdown");
+        timeout(Duration::from_secs(1), worker)
+            .await
+            .expect("worker reacts to shutdown")
+            .expect("join stream worker")
+            .expect("clean worker shutdown");
+    }
+
+    #[tokio::test]
     async fn a_stream_status_error_is_fatal() {
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (_tip_tx, tip_rx) = watch::channel(observed_tip(0x11));
         let stream = stream::iter([Err(tonic::Status::internal("upstream failed"))]);
 
-        let error = forward_stream(9, stream, shutdown_rx, |_event| async { Ok(()) })
-            .await
-            .expect_err("stream status must fail");
+        let error = forward_stream(
+            9,
+            stream,
+            tip_rx,
+            Duration::from_secs(1),
+            shutdown_rx,
+            |_event| async { Ok(()) },
+        )
+        .await
+        .expect_err("stream status must fail");
 
         assert!(format!("{error:#}").contains("upstream failed"));
     }
@@ -1353,11 +1614,17 @@ mod tests {
     #[tokio::test]
     async fn a_publish_error_is_fatal() {
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (_tip_tx, tip_rx) = watch::channel(observed_tip(0x11));
         let stream = stream::iter([Ok(disconnected(0x77))]).chain(stream::pending());
 
-        let error = forward_stream(9, stream, shutdown_rx, |_event| async {
-            Err(anyhow!("fake sink failed"))
-        })
+        let error = forward_stream(
+            9,
+            stream,
+            tip_rx,
+            Duration::from_secs(1),
+            shutdown_rx,
+            |_event| async { Err(anyhow!("fake sink failed")) },
+        )
         .await
         .expect_err("publish failure must fail");
 
@@ -1367,11 +1634,19 @@ mod tests {
     #[tokio::test]
     async fn an_ended_stream_is_fatal() {
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (_tip_tx, tip_rx) = watch::channel(observed_tip(0x11));
         let stream = stream::empty::<Result<mainchain::SubscribeEventsResponse, tonic::Status>>();
 
-        let error = forward_stream(9, stream, shutdown_rx, |_event| async { Ok(()) })
-            .await
-            .expect_err("unexpected stream end must fail");
+        let error = forward_stream(
+            9,
+            stream,
+            tip_rx,
+            Duration::from_secs(1),
+            shutdown_rx,
+            |_event| async { Ok(()) },
+        )
+        .await
+        .expect_err("unexpected stream end must fail");
 
         assert!(
             error
@@ -1639,6 +1914,7 @@ mod tests {
             vec![0x22; 32], // a move
         ]);
         let (block_tx, mut block_rx) = watch::channel(vec![0x11; 32]);
+        let (tip_tx, mut tip_rx) = watch::channel(observed_tip(0x11));
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
         let liveness = temporary_liveness_path("moved-tip");
@@ -1647,6 +1923,7 @@ mod tests {
             TEST_TIP_INTERVAL,
             Heartbeat::new(Some(liveness.clone())),
             block_tx,
+            tip_tx,
             shutdown_rx,
         ));
 
@@ -1655,6 +1932,11 @@ mod tests {
             .expect("the moved tip is announced")
             .expect("the channel stays open");
         assert_eq!(*block_rx.borrow_and_update(), vec![0x22; 32]);
+        timeout(Duration::from_secs(1), tip_rx.changed())
+            .await
+            .expect("the moved tip is announced for reconciliation")
+            .expect("the tip channel stays open");
+        assert_eq!(tip_rx.borrow_and_update().hash, vec![0x22; 32]);
 
         // The fake keeps answering 0x22 from here on. Every following tick must
         // be dropped, or the state worker would re-read the enforcer once per
@@ -1688,6 +1970,7 @@ mod tests {
         }
 
         let (block_tx, _block_rx) = watch::channel(vec![0x11; 32]);
+        let (tip_tx, _tip_rx) = watch::channel(observed_tip(0x11));
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let liveness = temporary_liveness_path("failed-tip");
         let mut worker = tokio::spawn(announce_tip_changes(
@@ -1695,6 +1978,7 @@ mod tests {
             TEST_TIP_INTERVAL,
             Heartbeat::new(Some(liveness.clone())),
             block_tx,
+            tip_tx,
             shutdown_rx,
         ));
 

@@ -176,10 +176,14 @@ configuration is still fatal, because that is a mistake rather than an outage.
 
 Two different gaps follow from that, and only one of them is about transport:
 
-- **The extractor was down.** `SubscribeEvents` does not replay history, so a
-  restart leaves a real hole that only a backfill can close. The extractor walks
-  the whole gap in bounded pages, stores each page and its cursor atomically,
-  and resumes after interruption. Historical pages bypass NATS.
+- **The extractor was down or a live stream stopped delivering.**
+  `SubscribeEvents` does not replay history, so only a backfill can close the
+  resulting hole. Every polled tip move queues reconciliation for all active
+  slots. A stream that stays silent after that move fails the process within the
+  request timeout, and the next start subscribes before snapshotting. The
+  extractor walks the whole gap in bounded pages, stores each page and its
+  cursor atomically, and resumes after interruption. Historical pages bypass
+  NATS. A quiet tip never arms the stream watchdog.
 - **A live consumer missed a message.** Cosmetic, because the record already
   has it.
 

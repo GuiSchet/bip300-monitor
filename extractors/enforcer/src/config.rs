@@ -100,7 +100,8 @@ pub struct Args {
     #[arg(long, env = "BIP300_MONITOR_LIVENESS_FILE")]
     pub liveness_file: Option<std::path::PathBuf>,
 
-    /// Timeout in seconds for connections, unary requests, and stream setup.
+    /// Timeout in seconds for connections, unary requests, stream setup, and
+    /// live-stream silence after the tip poll observes a new block.
     #[arg(
         long,
         env = "BIP300_MONITOR_REQUEST_TIMEOUT_SECONDS",

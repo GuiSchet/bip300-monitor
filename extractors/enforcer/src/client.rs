@@ -156,8 +156,10 @@ impl EnforcerClient {
     /// Subscribe to live block connect/disconnect events.
     ///
     /// No RPC deadline is attached to this request because it is intentionally
-    /// long-lived. Establishing the stream is bounded by the configured
-    /// request timeout.
+    /// long-lived and a quiet chain may legitimately produce nothing for an
+    /// arbitrary time. Establishing the stream is bounded by the configured
+    /// request timeout. The runtime separately bounds silence after its tip
+    /// poll has observed the chain advance.
     pub async fn subscribe_events(
         &mut self,
         sidechain_id: u8,
