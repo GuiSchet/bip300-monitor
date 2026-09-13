@@ -1,6 +1,6 @@
 //! Bounded, resumable recovery of blocks observed before the extractor started.
 //!
-//! `GetBlockInfo` is unary and returns every requested ancestor in one message.
+//! `GetBlockInfo` is unary and returns a bounded ancestor prefix in one message.
 //! A total-history request would therefore make both the enforcer and this
 //! process allocate the whole result. This module walks backwards in small
 //! pages, commits each page with its cursor, and never publishes historical
@@ -19,6 +19,7 @@ use tonic::Code;
 use crate::EnforcerClient;
 use crate::convert;
 use crate::event::envelope;
+use crate::proto::mainchain;
 use crate::state;
 
 const HISTORY_STREAM: &str = "block";
@@ -34,7 +35,13 @@ pub(crate) struct Settings {
 pub(crate) enum Outcome {
     UpToDate,
     Completed { blocks: usize, pages: usize },
+    Deferred { blocks: usize, pages: usize },
     Interrupted { blocks: usize, pages: usize },
+}
+
+enum PageFetch {
+    Found(mainchain::GetBlockInfoResponse),
+    Unavailable(Error),
 }
 
 /// Recover one slot from its activation height through `tip`.
@@ -84,38 +91,12 @@ pub(crate) async fn run(
         let requested = u32::try_from(remaining.min(u64::from(progress.effective_page_blocks)))
             .expect("a page size fits in a u32");
 
-        let response = match client
+        let fetch = match client
             .get_block_info(hex::encode(&cursor.hash), sidechain, Some(requested - 1))
             .await
         {
-            Ok(response) => response,
-            Err(error) if error_has_code(&error, Code::NotFound) => {
-                let current_tip = current_tip(client)
-                    .await
-                    .context("recovering from an unavailable historical cursor")?;
-                if current_tip.hash == progress.target_tip.hash {
-                    return fail(recorder, sidechain, error)
-                        .await
-                        .context("requesting a historical block page");
-                }
-                tracing::warn!(
-                    sidechain,
-                    unavailable_cursor = %hex::encode(&cursor.hash),
-                    previous_target = %hex::encode(&progress.target_tip.hash),
-                    current_target = %hex::encode(&current_tip.hash),
-                    "historical cursor left the available branch; restarting this slot from activation"
-                );
-                progress = begin_full_cycle(
-                    recorder,
-                    sidechain,
-                    activation_height,
-                    &current_tip,
-                    progress.effective_page_blocks,
-                )
-                .await?;
-                restarted_from_activation = true;
-                continue;
-            }
+            Ok(response) => classify_page_fetch(response, &cursor),
+            Err(error) if error_has_code(&error, Code::NotFound) => PageFetch::Unavailable(error),
             Err(error) if retryable_page_error(&error) && progress.effective_page_blocks > 1 => {
                 let reduced = (progress.effective_page_blocks / 2).max(1);
                 let message = format!("{error:#}");
@@ -141,6 +122,42 @@ pub(crate) async fn run(
             }
         };
 
+        let response = match fetch {
+            PageFetch::Found(response) => response,
+            PageFetch::Unavailable(error) => {
+                let current_tip = current_tip(client)
+                    .await
+                    .context("recovering from an unavailable historical cursor")?;
+                if current_tip.hash == progress.target_tip.hash {
+                    defer(recorder, sidechain, &error).await?;
+                    tracing::warn!(
+                        sidechain,
+                        unavailable_cursor = %hex::encode(&cursor.hash),
+                        target = %hex::encode(&progress.target_tip.hash),
+                        "historical cursor is unavailable at the unchanged target; deferring this slot"
+                    );
+                    return Ok(Outcome::Deferred { blocks, pages });
+                }
+                tracing::warn!(
+                    sidechain,
+                    unavailable_cursor = %hex::encode(&cursor.hash),
+                    previous_target = %hex::encode(&progress.target_tip.hash),
+                    current_target = %hex::encode(&current_tip.hash),
+                    "historical cursor left the available branch; restarting this slot from activation"
+                );
+                progress = begin_full_cycle(
+                    recorder,
+                    sidechain,
+                    activation_height,
+                    &current_tip,
+                    progress.effective_page_blocks,
+                )
+                .await?;
+                restarted_from_activation = true;
+                continue;
+            }
+        };
+
         let payloads = match convert::block_info(sidechain, response)
             .and_then(|payloads| verify_page(&payloads, &cursor, requested).map(|()| payloads))
         {
@@ -157,7 +174,8 @@ pub(crate) async fn run(
                 .last()
                 .context("a verified historical page is not empty")?,
         )?;
-        let completes_cycle = u64::from(requested) == remaining;
+        let returned = u32::try_from(payloads.len()).expect("a page length fits in a u32");
+        let completes_cycle = u64::from(returned) == remaining;
 
         // Extending a previous continuous range is valid only if this branch
         // actually reaches its covered tip. A mismatch is a reorg: replay the
@@ -233,6 +251,8 @@ pub(crate) async fn run(
             pages,
             blocks,
             inserted,
+            requested,
+            returned,
             cursor_height,
             target_height = ?progress.target_tip.height,
             "committed a historical block page"
@@ -260,6 +280,20 @@ pub(crate) async fn run(
                 () = tokio::time::sleep(settings.page_pause) => {}
             }
         }
+    }
+}
+
+fn classify_page_fetch(
+    response: mainchain::GetBlockInfoResponse,
+    cursor: &ObservedBlock,
+) -> PageFetch {
+    if response.infos.is_empty() {
+        PageFetch::Unavailable(anyhow::anyhow!(
+            "historical cursor {} was not found",
+            hex::encode(&cursor.hash)
+        ))
+    } else {
+        PageFetch::Found(response)
     }
 }
 
@@ -303,6 +337,18 @@ async fn prepare_cycle(
 
     match existing.status {
         HistoryStatus::Running => Ok(Some(existing)),
+        HistoryStatus::Error if existing.target_tip.hash != tip.hash => {
+            tracing::warn!(
+                sidechain,
+                failed_target = %hex::encode(&existing.target_tip.hash),
+                current_target = %hex::encode(&tip.hash),
+                "failed history target is stale; restarting this slot from activation"
+            );
+            let page_blocks = existing.effective_page_blocks.min(configured_page_blocks);
+            begin_full_cycle(recorder, sidechain, activation_height, tip, page_blocks)
+                .await
+                .map(Some)
+        }
         HistoryStatus::Error => {
             recorder
                 .store()
@@ -390,16 +436,22 @@ fn blocks_through_floor(cursor_height: u32, floor_height: Option<u32>) -> Result
     }
 }
 
-/// Validate an exact newest-first page before any of it is recorded.
+/// Validate a bounded newest-first page before any of it is recorded.
 pub(crate) fn verify_page(
     payloads: &[events::EnforcerEvent],
     cursor: &ObservedBlock,
     requested: u32,
 ) -> Result<()> {
-    let expected = requested as usize;
-    if payloads.len() != expected {
+    if requested == 0 {
+        bail!("a historical page must request at least one block");
+    }
+    if payloads.is_empty() {
+        bail!("a requested historical page cannot be empty");
+    }
+    let maximum = requested as usize;
+    if payloads.len() > maximum {
         bail!(
-            "historical page requested {expected} blocks but returned {}",
+            "historical page requested at most {maximum} blocks but returned {}",
             payloads.len()
         );
     }
@@ -407,7 +459,7 @@ pub(crate) fn verify_page(
     let newest = connected_header(
         payloads
             .first()
-            .context("a requested history page cannot be empty")?,
+            .expect("an empty historical page was rejected"),
     )?;
     if newest.hash != cursor.hash || newest.height != cursor_height {
         bail!(
@@ -432,8 +484,9 @@ pub(crate) fn verify_page(
     }
 
     let oldest = connected_header(payloads.last().expect("non-empty page"))?;
+    let returned = u32::try_from(payloads.len()).expect("a page length fits in a u32");
     let expected_oldest = cursor_height
-        .checked_sub(requested - 1)
+        .checked_sub(returned - 1)
         .context("history page underflows genesis")?;
     if oldest.height != expected_oldest {
         bail!(
@@ -498,6 +551,15 @@ async fn fail<T>(recorder: &Recorder, sidechain: u8, error: Error) -> Result<T> 
     Err(error)
 }
 
+async fn defer(recorder: &Recorder, sidechain: u8, error: &Error) -> Result<()> {
+    let message = format!("{error:#}");
+    recorder
+        .store()
+        .fail_history(HISTORY_STREAM, Some(sidechain), &message)
+        .await
+        .context("preserving the deferred history error in Postgres")
+}
+
 async fn wait_for_shutdown(shutdown_rx: &mut watch::Receiver<bool>) {
     loop {
         if *shutdown_rx.borrow() {
@@ -516,7 +578,11 @@ mod tests {
 
     use tonic::Code;
 
-    use super::{blocks_through_floor, error_has_code, retryable_page_error, verify_page};
+    use super::{
+        PageFetch, blocks_through_floor, classify_page_fetch, error_has_code, retryable_page_error,
+        verify_page,
+    };
+    use crate::proto::mainchain;
 
     fn recovered(hash: u8, previous_hash: u8, height: u32) -> events::EnforcerEvent {
         events::EnforcerEvent {
@@ -549,10 +615,32 @@ mod tests {
     }
 
     #[test]
-    fn short_or_broken_pages_are_rejected() {
+    fn an_empty_success_response_is_an_unavailable_cursor() {
+        let cursor = ObservedBlock::at_height(vec![0x14; 32], 104);
+        assert!(matches!(
+            classify_page_fetch(mainchain::GetBlockInfoResponse::default(), &cursor),
+            PageFetch::Unavailable(_)
+        ));
+
+        let response = mainchain::GetBlockInfoResponse {
+            infos: vec![mainchain::get_block_info_response::Info::default()],
+        };
+        assert!(matches!(
+            classify_page_fetch(response, &cursor),
+            PageFetch::Found(_)
+        ));
+    }
+
+    #[test]
+    fn short_pages_are_accepted_but_empty_oversized_or_broken_pages_are_rejected() {
         let cursor = ObservedBlock::at_height(vec![0x14; 32], 104);
         let short = vec![recovered(0x14, 0x13, 104)];
-        assert!(verify_page(&short, &cursor, 2).is_err());
+        verify_page(&short, &cursor, 2).expect("a short contiguous page is valid");
+
+        assert!(verify_page(&[], &cursor, 2).is_err());
+
+        let oversized = vec![recovered(0x14, 0x13, 104), recovered(0x13, 0x12, 103)];
+        assert!(verify_page(&oversized, &cursor, 1).is_err());
 
         let broken = vec![recovered(0x14, 0xaa, 104), recovered(0x13, 0x12, 103)];
         assert!(verify_page(&broken, &cursor, 2).is_err());

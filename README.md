@@ -33,11 +33,6 @@ The workspace contains:
 For every active slot, the first backfill walks from the current tip through the
 slot's activation height. Later runs extend that proven range.
 
-History is processed in bounded pages of 128 blocks by default. Every page is
-checked for exact size, height and hash continuity, then its events and next
-cursor are committed in one Postgres transaction. Interrupted work resumes from
-that cursor. Oversized or timed-out requests reduce the page size automatically,
-and a reorg can restart the affected slot from activation.
 
 The historical block stream includes block headers, BMM commitments, deposits
 and withdrawal-bundle outcomes. The current enforcer API does not expose past

@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use futures_util::future::try_join_all;
+use futures_util::stream::FuturesUnordered;
 use futures_util::{Stream, StreamExt};
 use shared::liveness::Heartbeat;
 use shared::nats_subjects::Subject;
@@ -28,6 +29,7 @@ use crate::{EnforcerClient, convert};
 
 type EventStream = Streaming<mainchain::SubscribeEventsResponse>;
 type SourceFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>>;
+type DeferredBackfill = Pin<Box<dyn Future<Output = BackfillRequest> + Send>>;
 const NATS_CLIENT_NAME: &str = "bip300-monitor-enforcer-extractor";
 /// Names the writer of every row this extractor records.
 const RECORD_SOURCE: &str = "enforcer";
@@ -223,6 +225,7 @@ pub async fn run(args: Args, mut shutdown_rx: watch::Receiver<bool>) -> Result<(
         backfill_rx,
         args.backfill_page_blocks,
         args.backfill_page_pause(),
+        args.tip_poll_interval(),
         shutdown_rx,
     ));
 
@@ -259,17 +262,47 @@ async fn backfill_sidechains(
     mut requests: mpsc::Receiver<BackfillRequest>,
     page_blocks: u32,
     page_pause: Duration,
+    retry_interval: Duration,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> Result<()> {
+    let mut requests_open = true;
+    let mut retries = FuturesUnordered::<DeferredBackfill>::new();
+
     loop {
-        let request = tokio::select! {
+        if !requests_open && retries.is_empty() {
+            return Ok(());
+        }
+
+        let (mut request, refresh_target) = tokio::select! {
             biased;
             () = wait_for_shutdown(&mut shutdown_rx) => return Ok(()),
-            request = requests.recv() => match request {
-                Some(request) => request,
-                None => return Ok(()),
+            request = requests.recv(), if requests_open => match request {
+                Some(request) => (request, false),
+                None => {
+                    requests_open = false;
+                    continue;
+                }
+            },
+            request = retries.next(), if !retries.is_empty() => {
+                (request.expect("a non-empty deferred backfill set yields a request"), true)
             }
         };
+
+        if refresh_target {
+            match snapshot::current_tip(&mut client).await {
+                Ok(current_tip) => request.target = current_tip,
+                Err(error) => {
+                    tracing::warn!(
+                        sidechain = request.sidechain,
+                        error = %format!("{error:#}"),
+                        "could not refresh a deferred backfill target; retrying later"
+                    );
+                    retries.push(defer_backfill(request, retry_interval));
+                    continue;
+                }
+            }
+        }
+
         let BackfillRequest {
             sidechain,
             activation_height,
@@ -290,12 +323,31 @@ async fn backfill_sidechains(
             )
             .await
             .with_context(|| format!("backfilling sidechain {sidechain}"))?;
-            if matches!(outcome, backfill::Outcome::Interrupted { .. }) {
-                tracing::info!(
-                    sidechain,
-                    "shutdown requested during block history backfill"
-                );
-                return Ok(());
+            match outcome {
+                backfill::Outcome::Interrupted { .. } => {
+                    tracing::info!(
+                        sidechain,
+                        "shutdown requested during block history backfill"
+                    );
+                    return Ok(());
+                }
+                backfill::Outcome::Deferred { .. } => {
+                    tracing::warn!(
+                        sidechain,
+                        retry_seconds = retry_interval.as_secs(),
+                        "block history is incomplete; scheduling a deferred retry"
+                    );
+                    retries.push(defer_backfill(
+                        BackfillRequest {
+                            sidechain,
+                            activation_height,
+                            target,
+                        },
+                        retry_interval,
+                    ));
+                    break;
+                }
+                backfill::Outcome::UpToDate | backfill::Outcome::Completed { .. } => {}
             }
 
             let current_tip = snapshot::current_tip(&mut client).await.with_context(|| {
@@ -313,6 +365,13 @@ async fn backfill_sidechains(
             target = current_tip;
         }
     }
+}
+
+fn defer_backfill(request: BackfillRequest, retry_interval: Duration) -> DeferredBackfill {
+    Box::pin(async move {
+        tokio::time::sleep(retry_interval).await;
+        request
+    })
 }
 
 /// Slots to observe: the configured list, or the enforcer's active sidechains
