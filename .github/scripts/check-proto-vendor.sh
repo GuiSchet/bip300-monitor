@@ -10,8 +10,10 @@ REPOSITORY_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 readonly REPOSITORY_ROOT
 readonly PROTO_ROOT="${REPOSITORY_ROOT}/proto/upstream"
 readonly PROTO_README="${PROTO_ROOT}/README.md"
+readonly OBSERVER_PATCH="${PROTO_ROOT}/validator-observer.patch"
 readonly VERSIONS_FILE="${REPOSITORY_ROOT}/deployments/ecash/VERSIONS.lock"
 readonly UPSTREAM_RAW_URL=https://raw.githubusercontent.com/LayerTwo-Labs/bip300301_enforcer
+readonly DEFAULT_OBSERVER_REPO="${REPOSITORY_ROOT}/../upstream/enforcer"
 
 die() {
     printf 'error: %s\n' "$*" >&2
@@ -36,24 +38,41 @@ done
 
 [[ -f "${PROTO_README}" ]] ||
     die "missing vendored proto provenance: ${PROTO_README}"
+[[ -f "${OBSERVER_PATCH}" ]] || die "missing ${OBSERVER_PATCH}"
 [[ -f "${VERSIONS_FILE}" ]] || die "missing ${VERSIONS_FILE}"
 
-vendored_commit="$(
-    grep -oE '^- Commit: `[[:xdigit:]]{40}`$' "${PROTO_README}" |
+base_commit="$(
+    grep -oE '^- Base commit: `[[:xdigit:]]{40}`$' "${PROTO_README}" |
         grep -oE '[[:xdigit:]]{40}' || true
 )"
-[[ "${vendored_commit}" =~ ^[[:xdigit:]]{40}$ ]] ||
-    die "could not read the vendored proto commit from ${PROTO_README}"
+[[ "${base_commit}" =~ ^[[:xdigit:]]{40}$ ]] ||
+    die "could not read the observer base commit from ${PROTO_README}"
 
-enforcer_commit="$(
-    grep -oE '^ENFORCER_COMMIT=[[:xdigit:]]{40}$' "${VERSIONS_FILE}" |
-        sed 's/^ENFORCER_COMMIT=//' || true
+observer_commit="$(
+    grep -oE '^- Observer commit: `[[:xdigit:]]{40}`$' "${PROTO_README}" |
+        grep -oE '[[:xdigit:]]{40}' || true
 )"
-[[ "${enforcer_commit}" =~ ^[[:xdigit:]]{40}$ ]] ||
-    die "could not read ENFORCER_COMMIT from ${VERSIONS_FILE}"
+[[ "${observer_commit}" =~ ^[[:xdigit:]]{40}$ ]] ||
+    die "could not read the observer commit from ${PROTO_README}"
 
-[[ "${vendored_commit}" == "${enforcer_commit}" ]] ||
-    die "proto/upstream is vendored from ${vendored_commit} but ${VERSIONS_FILE} deploys enforcer ${enforcer_commit}; re-vendor proto/upstream in the same change that promotes the enforcer"
+locked_base_commit="$(
+    grep -oE '^ENFORCER_BASE_COMMIT=[[:xdigit:]]{40}$' "${VERSIONS_FILE}" |
+        sed 's/^ENFORCER_BASE_COMMIT=//' || true
+)"
+[[ "${locked_base_commit}" =~ ^[[:xdigit:]]{40}$ ]] ||
+    die "could not read ENFORCER_BASE_COMMIT from ${VERSIONS_FILE}"
+
+locked_observer_commit="$(
+    grep -oE '^ENFORCER_OBSERVER_COMMIT=[[:xdigit:]]{40}$' "${VERSIONS_FILE}" |
+        sed 's/^ENFORCER_OBSERVER_COMMIT=//' || true
+)"
+[[ "${locked_observer_commit}" =~ ^[[:xdigit:]]{40}$ ]] ||
+    die "could not read ENFORCER_OBSERVER_COMMIT from ${VERSIONS_FILE}"
+
+[[ "${base_commit}" == "${locked_base_commit}" ]] ||
+    die "observer proto is based on ${base_commit} but ${VERSIONS_FILE} records ${locked_base_commit}"
+[[ "${observer_commit}" == "${locked_observer_commit}" ]] ||
+    die "proto/upstream is vendored from observer ${observer_commit} but ${VERSIONS_FILE} records ${locked_observer_commit}"
 
 # The fenced block in the provenance file is the recorded checksum list.
 recorded_checksums="$(
@@ -71,26 +90,53 @@ actual_count="$(find "${PROTO_ROOT}" -type f -name '*.proto' | grep -c '' || tru
 (cd "${PROTO_ROOT}" && sha256sum --check --quiet) <<<"${recorded_checksums}" ||
     die "vendored proto files do not match the checksums recorded in ${PROTO_README}"
 
-info "vendored proto matches its provenance and enforcer ${enforcer_commit}"
+info "vendored proto matches base ${base_commit} and observer ${observer_commit}"
 
 if [[ "${check_upstream}" == false ]]; then
     exit 0
 fi
 
-command -v curl >/dev/null 2>&1 || die "required command not found: curl"
+for command_name in curl git; do
+    command -v "${command_name}" >/dev/null 2>&1 ||
+        die "required command not found: ${command_name}"
+done
 upstream_dir="$(mktemp -d)"
 trap 'rm -rf -- "${upstream_dir}"' EXIT
 
 while read -r _ proto_path; do
-    destination="${upstream_dir}/${proto_path}"
+    destination="${upstream_dir}/proto/${proto_path}"
     mkdir -p -- "$(dirname -- "${destination}")"
     curl --fail --silent --show-error --location --max-time 30 \
         --output "${destination}" \
-        "${UPSTREAM_RAW_URL}/${enforcer_commit}/proto/${proto_path}" ||
-        die "could not download proto/${proto_path} at ${enforcer_commit}"
+        "${UPSTREAM_RAW_URL}/${base_commit}/proto/${proto_path}" ||
+        die "could not download proto/${proto_path} at ${base_commit}"
 done <<<"${recorded_checksums}"
 
-(cd "${upstream_dir}" && sha256sum --check --quiet) <<<"${recorded_checksums}" ||
-    die "proto/upstream no longer matches upstream ${enforcer_commit}; re-vendor the files and update ${PROTO_README}"
+(
+    cd "${upstream_dir}"
+    git apply --check "${OBSERVER_PATCH}"
+    git apply "${OBSERVER_PATCH}"
+) || die "observer patch no longer applies cleanly to official base ${base_commit}"
 
-info "vendored proto matches upstream ${enforcer_commit} byte for byte"
+(cd "${upstream_dir}/proto" && sha256sum --check --quiet) <<<"${recorded_checksums}" ||
+    die "official base plus observer patch does not reproduce proto/upstream; re-vendor the files, patch and provenance together"
+
+observer_repo="${ENFORCER_OBSERVER_REPO_PATH:-${DEFAULT_OBSERVER_REPO}}"
+if git -C "${observer_repo}" rev-parse --git-dir >/dev/null 2>&1; then
+    git -C "${observer_repo}" cat-file -e "${observer_commit}^{commit}" 2>/dev/null ||
+        die "observer commit ${observer_commit} is absent from ${observer_repo}"
+    observer_parent="$(git -C "${observer_repo}" rev-parse "${observer_commit}^")"
+    [[ "${observer_parent}" == "${base_commit}" ]] ||
+        die "observer ${observer_commit} has parent ${observer_parent}, expected official base ${base_commit}"
+    while read -r _ proto_path; do
+        cmp -s \
+            <(git -C "${observer_repo}" show "${observer_commit}:proto/${proto_path}") \
+            "${PROTO_ROOT}/${proto_path}" ||
+            die "vendored ${proto_path} differs from observer commit ${observer_commit}"
+    done <<<"${recorded_checksums}"
+    info "local observer commit and direct parent verified in ${observer_repo}"
+else
+    info "observer checkout not present; reproducibility verified from the checked-in patch"
+fi
+
+info "official base plus observer patch reproduces the vendored API byte for byte"

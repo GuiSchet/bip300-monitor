@@ -95,6 +95,41 @@ impl EnforcerClient {
             .map(tonic::Response::into_inner)
     }
 
+    /// Fetch a mainchain header and a bounded newest-first ancestor prefix.
+    pub async fn get_block_header_info(
+        &mut self,
+        block_hash: impl Into<String>,
+        max_ancestors: Option<u32>,
+    ) -> Result<mainchain::GetBlockHeaderInfoResponse> {
+        let request = mainchain::GetBlockHeaderInfoRequest {
+            block_hash: Some(reverse_hex(block_hash)),
+            max_ancestors,
+        };
+        self.inner
+            .get_block_header_info(self.unary_request(request))
+            .await
+            .context("calling ValidatorService.GetBlockHeaderInfo")
+            .map(tonic::Response::into_inner)
+    }
+
+    /// Fetch a lossless BIP300/301 delta for a mainchain block and a bounded
+    /// newest-first ancestor prefix. This is global rather than slot-scoped.
+    pub async fn get_bip300_block_delta(
+        &mut self,
+        block_hash: impl Into<String>,
+        max_ancestors: Option<u32>,
+    ) -> Result<mainchain::GetBip300BlockDeltaResponse> {
+        let request = mainchain::GetBip300BlockDeltaRequest {
+            block_hash: Some(reverse_hex(block_hash)),
+            max_ancestors,
+        };
+        self.inner
+            .get_bip300_block_delta(self.unary_request(request))
+            .await
+            .context("calling ValidatorService.GetBip300BlockDelta")
+            .map(tonic::Response::into_inner)
+    }
+
     /// Fetch all current, not-yet-activated sidechain proposals.
     pub async fn get_sidechain_proposals(
         &mut self,

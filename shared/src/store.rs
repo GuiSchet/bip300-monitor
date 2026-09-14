@@ -1,9 +1,10 @@
 //! The authoritative Postgres record of observed monitor events.
 //!
-//! The `envelope` column holds the raw protobuf bytes, so the record is also
-//! the reversibility guarantee: any other store can be rebuilt from
-//! `SELECT envelope FROM event ORDER BY id`. The `payload` column is the same
-//! event decoded, and exists only so the record can be queried.
+//! The `envelope` column holds normalized protobuf bytes. Rebuilds that need
+//! observation order use `event_observation JOIN event ORDER BY capture_seq`;
+//! the idempotent `event` rows alone deliberately do not represent replay or
+//! reorg occurrence order. The upstream wire response is not stored verbatim;
+//! raw consensus bytes needed for audit are explicit normalized fields.
 
 use std::fs;
 use std::path::PathBuf;
@@ -13,6 +14,8 @@ use std::time::{Duration, SystemTime};
 use anyhow::{Context, Result, bail};
 use clap::Args as ClapArgs;
 use prost::Message as _;
+use serde_json::Value as JsonValue;
+use sha2::{Digest as _, Sha256};
 use tokio::sync::Mutex;
 use tokio_postgres::{Client, NoTls, Row, Transaction};
 
@@ -30,6 +33,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../schema/0001_event.sql"),
     include_str!("../schema/0002_event_identity_nulls.sql"),
     include_str!("../schema/0003_history_coverage.sql"),
+    include_str!("../schema/0004_observation_provenance.sql"),
 ];
 
 /// Advisory-lock key that serializes the migration of one record.
@@ -213,6 +217,93 @@ fn facts(event: &Event) -> Result<Facts<'_>> {
 pub struct Store {
     client: Arc<Mutex<Client>>,
     source: &'static str,
+    dataset_id: String,
+    run_id: String,
+}
+
+/// Identity and build provenance of the record this extractor is extending.
+#[derive(Clone, Debug)]
+pub struct DatasetManifest {
+    pub network_id: String,
+    pub activation_height: u32,
+    pub activation_block_hash: String,
+    pub node_commit: String,
+    pub enforcer_commit: String,
+    pub monitor_commit: String,
+    pub event_contract_version: u32,
+    pub capabilities: JsonValue,
+    pub creation_reason: String,
+}
+
+impl Default for DatasetManifest {
+    fn default() -> Self {
+        Self {
+            network_id: "development".to_owned(),
+            activation_height: 0,
+            activation_block_hash: "unknown".to_owned(),
+            node_commit: "unknown".to_owned(),
+            enforcer_commit: "unknown".to_owned(),
+            monitor_commit: "unknown".to_owned(),
+            event_contract_version: 1,
+            capabilities: serde_json::json!([
+                "event_facts",
+                "event_observations",
+                "tip_observations",
+                "snapshot_consistency",
+                "extractor_status"
+            ]),
+            creation_reason: "development or test dataset".to_owned(),
+        }
+    }
+}
+
+/// How an extractor acquired an observation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CaptureMethod {
+    Startup,
+    Live,
+    Backfill,
+    Poll,
+    Reconcile,
+}
+
+/// Whether the mainchain tip stayed fixed around a grouped unary snapshot.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SnapshotConsistency {
+    Stable,
+    Changed,
+}
+
+impl SnapshotConsistency {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Stable => "stable",
+            Self::Changed => "changed",
+        }
+    }
+}
+
+/// Provenance shared by every event captured in one unary snapshot.
+#[derive(Clone, Debug)]
+pub struct SnapshotMetadata {
+    pub started_at: SystemTime,
+    pub finished_at: SystemTime,
+    pub tip_before: ObservedBlock,
+    pub tip_after: ObservedBlock,
+    pub consistency: SnapshotConsistency,
+    pub attempts: u32,
+}
+
+impl CaptureMethod {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Startup => "startup",
+            Self::Live => "live",
+            Self::Backfill => "backfill",
+            Self::Poll => "poll",
+            Self::Reconcile => "reconcile",
+        }
+    }
 }
 
 /// Durable state of one bounded historical import.
@@ -220,6 +311,7 @@ pub struct Store {
 pub struct HistoryCoverage {
     pub stream: String,
     pub sidechain: Option<u8>,
+    pub sidechain_instance_id: Option<String>,
     pub coverage_start_height: u32,
     pub covered_tip: Option<ObservedBlock>,
     pub target_tip: ObservedBlock,
@@ -265,6 +357,15 @@ impl Store {
     ///
     /// `source` names the extractor writing the rows.
     pub async fn connect(args: &PostgresArgs, source: &'static str) -> Result<Self> {
+        Self::connect_with_manifest(args, source, DatasetManifest::default()).await
+    }
+
+    /// Connect and bind this process to one durable dataset and extractor run.
+    pub async fn connect_with_manifest(
+        args: &PostgresArgs,
+        source: &'static str,
+        manifest: DatasetManifest,
+    ) -> Result<Self> {
         let (client, connection) = tokio_postgres::connect(&args.connection_string()?, NoTls)
             .await
             .with_context(|| {
@@ -288,9 +389,89 @@ impl Store {
         let store = Self {
             client: Arc::new(Mutex::new(client)),
             source,
+            dataset_id: String::new(),
+            run_id: String::new(),
         };
         store.migrate().await?;
-        Ok(store)
+        let (dataset_id, run_id) = store.initialize_identity(&manifest).await?;
+        Ok(Self {
+            dataset_id,
+            run_id,
+            ..store
+        })
+    }
+
+    async fn initialize_identity(&self, manifest: &DatasetManifest) -> Result<(String, String)> {
+        let activation_height = height_to_i32(manifest.activation_height)?;
+        let event_contract_version = i32::try_from(manifest.event_contract_version)
+            .context("event contract version does not fit in an i32")?;
+        let mut client = self.client.lock().await;
+        let transaction = client
+            .transaction()
+            .await
+            .context("opening the extractor identity transaction")?;
+        let dataset_id: String = transaction
+            .query_one(
+                "INSERT INTO dataset_manifest
+                    (network_id, activation_height, activation_block_hash,
+                     initial_node_commit, initial_enforcer_commit, initial_monitor_commit,
+                     event_contract_version, capabilities, creation_reason)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                 ON CONFLICT ON CONSTRAINT dataset_identity DO UPDATE SET
+                    network_id = EXCLUDED.network_id
+                 RETURNING dataset_id::text",
+                &[
+                    &manifest.network_id,
+                    &activation_height,
+                    &manifest.activation_block_hash,
+                    &manifest.node_commit,
+                    &manifest.enforcer_commit,
+                    &manifest.monitor_commit,
+                    &event_contract_version,
+                    &manifest.capabilities,
+                    &manifest.creation_reason,
+                ],
+            )
+            .await
+            .context("resolving the record dataset identity")?
+            .get(0);
+        let run_id: String = transaction
+            .query_one(
+                "INSERT INTO extractor_run
+                    (dataset_id, source, node_commit, enforcer_commit, monitor_commit,
+                     event_contract_version, capabilities)
+                 VALUES ($1::text::uuid, $2, $3, $4, $5, $6, $7)
+                 RETURNING run_id::text",
+                &[
+                    &dataset_id,
+                    &self.source,
+                    &manifest.node_commit,
+                    &manifest.enforcer_commit,
+                    &manifest.monitor_commit,
+                    &event_contract_version,
+                    &manifest.capabilities,
+                ],
+            )
+            .await
+            .context("starting an extractor run")?
+            .get(0);
+        transaction
+            .execute(
+                "INSERT INTO extractor_status (dataset_id, source, run_id)
+                 VALUES ($1::text::uuid, $2, $3::text::uuid)
+                 ON CONFLICT (dataset_id, source) DO UPDATE SET
+                    run_id = EXCLUDED.run_id,
+                    last_error = NULL,
+                    updated_at = now()",
+                &[&dataset_id, &self.source, &run_id],
+            )
+            .await
+            .context("initializing extractor status")?;
+        transaction
+            .commit()
+            .await
+            .context("committing extractor identity")?;
+        Ok((dataset_id, run_id))
     }
 
     async fn migrate(&self) -> Result<()> {
@@ -361,6 +542,11 @@ impl Store {
     /// Returns how many rows were inserted; a repeat of an already recorded
     /// observation is ignored rather than duplicated.
     pub async fn record(&self, events: &[Event]) -> Result<u64> {
+        self.record_with_method(events, CaptureMethod::Live).await
+    }
+
+    /// Record facts and their capture occurrences in one transaction.
+    pub async fn record_with_method(&self, events: &[Event], method: CaptureMethod) -> Result<u64> {
         if events.is_empty() {
             return Ok(0);
         }
@@ -372,7 +558,16 @@ impl Store {
             .context("opening a record transaction")?;
         let mut inserted = 0;
         for event in events {
-            inserted += insert(&mut transaction, self.source, event).await?;
+            inserted += insert(
+                &mut transaction,
+                self.source,
+                &self.dataset_id,
+                &self.run_id,
+                method,
+                None,
+                event,
+            )
+            .await?;
         }
         transaction
             .commit()
@@ -380,6 +575,185 @@ impl Store {
             .context("committing a record transaction")?;
 
         Ok(inserted)
+    }
+
+    /// Record one grouped unary snapshot with its consistency window.
+    pub async fn record_snapshot(
+        &self,
+        events: &[Event],
+        method: CaptureMethod,
+        metadata: &SnapshotMetadata,
+    ) -> Result<u64> {
+        if events.is_empty() {
+            return Ok(0);
+        }
+        require_hash(&metadata.tip_before.hash, "snapshot tip before")?;
+        require_hash(&metadata.tip_after.hash, "snapshot tip after")?;
+        let tip_before_height = height_to_i32(required_height(
+            &metadata.tip_before,
+            "snapshot tip before",
+        )?)?;
+        let tip_after_height =
+            height_to_i32(required_height(&metadata.tip_after, "snapshot tip after")?)?;
+        let attempts = i32::try_from(metadata.attempts).context("snapshot attempts overflow")?;
+        if attempts == 0 {
+            bail!("snapshot attempts must be positive");
+        }
+
+        let mut client = self.client.lock().await;
+        let mut transaction = client
+            .transaction()
+            .await
+            .context("opening a snapshot record transaction")?;
+        let snapshot_group_id: String = transaction
+            .query_one(
+                "INSERT INTO snapshot_group
+                    (dataset_id, run_id, capture_method, started_at, finished_at,
+                     tip_before_hash, tip_before_height, tip_after_hash,
+                     tip_after_height, consistency, attempts)
+                 VALUES ($1::text::uuid, $2::text::uuid, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+                 RETURNING snapshot_group_id::text",
+                &[
+                    &self.dataset_id,
+                    &self.run_id,
+                    &method.as_str(),
+                    &metadata.started_at,
+                    &metadata.finished_at,
+                    &metadata.tip_before.hash,
+                    &tip_before_height,
+                    &metadata.tip_after.hash,
+                    &tip_after_height,
+                    &metadata.consistency.as_str(),
+                    &attempts,
+                ],
+            )
+            .await
+            .context("recording snapshot consistency metadata")?
+            .get(0);
+        let mut inserted = 0_u64;
+        for event in events {
+            inserted += insert(
+                &mut transaction,
+                self.source,
+                &self.dataset_id,
+                &self.run_id,
+                method,
+                Some(&snapshot_group_id),
+                event,
+            )
+            .await?;
+        }
+        update_extractor_status(
+            &transaction,
+            &self.dataset_id,
+            self.source,
+            &self.run_id,
+            &metadata.tip_after,
+        )
+        .await?;
+        transaction
+            .commit()
+            .await
+            .context("committing a snapshot record transaction")?;
+        Ok(inserted)
+    }
+
+    /// Persist a mainchain-tip transition independently of deduplicated facts.
+    pub async fn record_tip_observation(
+        &self,
+        tip: &ObservedBlock,
+        previous: Option<&ObservedBlock>,
+        method: CaptureMethod,
+        observed_at: SystemTime,
+    ) -> Result<()> {
+        let tip_height = height_to_i32(required_height(tip, "observed tip")?)?;
+        require_hash(&tip.hash, "observed tip")?;
+        let (previous_hash, previous_height) = optional_block_parts(previous)?;
+        let mut client = self.client.lock().await;
+        let transaction = client
+            .transaction()
+            .await
+            .context("opening a tip observation transaction")?;
+        let capture_seq = next_capture_seq(&transaction, &self.run_id).await?;
+        transaction
+            .execute(
+                "INSERT INTO tip_observation
+                    (dataset_id, run_id, capture_seq, capture_method,
+                     tip_hash, tip_height, previous_observed_hash,
+                     previous_observed_height, observed_at)
+                 VALUES ($1::text::uuid, $2::text::uuid, $3, $4, $5, $6, $7, $8, $9)",
+                &[
+                    &self.dataset_id,
+                    &self.run_id,
+                    &capture_seq,
+                    &method.as_str(),
+                    &tip.hash,
+                    &tip_height,
+                    &previous_hash,
+                    &previous_height,
+                    &observed_at,
+                ],
+            )
+            .await
+            .context("recording a mainchain tip observation")?;
+        update_extractor_status(
+            &transaction,
+            &self.dataset_id,
+            self.source,
+            &self.run_id,
+            tip,
+        )
+        .await?;
+        transaction
+            .commit()
+            .await
+            .context("committing a mainchain tip observation")?;
+        Ok(())
+    }
+
+    /// Mark a successful unchanged tip read without adding a history row.
+    pub async fn record_tip_heartbeat(&self, tip: &ObservedBlock) -> Result<()> {
+        require_hash(&tip.hash, "heartbeat tip")?;
+        let tip_height = height_to_i32(required_height(tip, "heartbeat tip")?)?;
+        let client = self.client.lock().await;
+        client
+            .execute(
+                "UPDATE extractor_status
+                    SET last_tip_hash = $4,
+                        last_tip_height = $5,
+                        last_rpc_success_at = now(),
+                        last_error = NULL,
+                        updated_at = now()
+                  WHERE dataset_id = $1::text::uuid AND source = $2 AND run_id = $3::text::uuid",
+                &[
+                    &self.dataset_id,
+                    &self.source,
+                    &self.run_id,
+                    &tip.hash,
+                    &tip_height,
+                ],
+            )
+            .await
+            .context("updating extractor tip heartbeat")?;
+        Ok(())
+    }
+
+    /// Close a run cleanly; a row left `running` documents an unclean exit.
+    pub async fn finish_run(&self, status: &str, reason: Option<&str>) -> Result<()> {
+        if !matches!(status, "completed" | "failed") {
+            bail!("invalid terminal extractor run status `{status}`");
+        }
+        let client = self.client.lock().await;
+        client
+            .execute(
+                "UPDATE extractor_run
+                    SET status = $2, finished_at = now(), finish_reason = $3
+                  WHERE run_id = $1::text::uuid AND status = 'running'",
+                &[&self.run_id, &status, &reason],
+            )
+            .await
+            .context("finishing extractor run")?;
+        Ok(())
     }
 
     /// Read the durable cursor for one historical stream.
@@ -390,17 +764,26 @@ impl Store {
     ) -> Result<Option<HistoryCoverage>> {
         let sidechain = sidechain.map(i16::from);
         let client = self.client.lock().await;
+        let sidechain_instance_id =
+            current_sidechain_instance_client(&client, &self.dataset_id, sidechain).await?;
         let row = client
             .query_opt(
-                "SELECT stream, sidechain, coverage_start_height,
+                "SELECT stream, sidechain, sidechain_instance_id, coverage_start_height,
                         covered_tip_hash, covered_tip_height,
                         target_tip_hash, target_tip_height,
                         floor_hash, floor_height, next_hash, next_height,
                         status, rows_recorded, effective_page_blocks, last_error
                    FROM history_coverage
-                  WHERE source = $1 AND stream = $2
-                    AND sidechain IS NOT DISTINCT FROM $3",
-                &[&self.source, &stream, &sidechain],
+                  WHERE dataset_id = $1::text::uuid AND source = $2 AND stream = $3
+                    AND sidechain IS NOT DISTINCT FROM $4
+                    AND sidechain_instance_id IS NOT DISTINCT FROM $5",
+                &[
+                    &self.dataset_id,
+                    &self.source,
+                    &stream,
+                    &sidechain,
+                    &sidechain_instance_id,
+                ],
             )
             .await
             .with_context(|| format!("reading {stream} history coverage"))?;
@@ -431,18 +814,21 @@ impl Store {
         let page_blocks = height_to_i32(effective_page_blocks)?;
 
         let client = self.client.lock().await;
+        let sidechain_instance_id =
+            current_sidechain_instance_client(&client, &self.dataset_id, sidechain).await?;
         let row = client
             .query_one(
                 "INSERT INTO history_coverage
-                    (source, stream, sidechain, coverage_start_height,
+                    (dataset_id, source, stream, sidechain, sidechain_instance_id,
+                     coverage_start_height,
                      covered_tip_hash, covered_tip_height,
                      target_tip_hash, target_tip_height,
                      floor_hash, floor_height, next_hash, next_height,
                      status, effective_page_blocks, last_error,
                      started_at, updated_at, completed_at)
                  VALUES
-                    ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $7, $8,
-                     'running', $11, NULL, now(), now(), NULL)
+                    ($1::text::uuid, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $9, $10,
+                     'running', $13, NULL, now(), now(), NULL)
                  ON CONFLICT ON CONSTRAINT history_coverage_identity DO UPDATE SET
                     coverage_start_height = EXCLUDED.coverage_start_height,
                     covered_tip_hash = EXCLUDED.covered_tip_hash,
@@ -459,15 +845,17 @@ impl Store {
                     started_at = now(),
                     updated_at = now(),
                     completed_at = NULL
-                 RETURNING stream, sidechain, coverage_start_height,
+                 RETURNING stream, sidechain, sidechain_instance_id, coverage_start_height,
                            covered_tip_hash, covered_tip_height,
                            target_tip_hash, target_tip_height,
                            floor_hash, floor_height, next_hash, next_height,
                            status, rows_recorded, effective_page_blocks, last_error",
                 &[
+                    &self.dataset_id,
                     &self.source,
                     &stream,
                     &sidechain,
+                    &sidechain_instance_id,
                     &coverage_start_height,
                     &covered_tip_hash,
                     &covered_tip_height,
@@ -500,32 +888,45 @@ impl Store {
         let (next_hash, next_height) = optional_block_parts(page.next)?;
 
         let mut client = self.client.lock().await;
+        let sidechain_instance_id =
+            current_sidechain_instance_client(&client, &self.dataset_id, sidechain).await?;
         let mut transaction = client
             .transaction()
             .await
             .context("opening a historical page transaction")?;
         let mut inserted = 0;
         for event in events {
-            inserted += insert(&mut transaction, self.source, event).await?;
+            inserted += insert(
+                &mut transaction,
+                self.source,
+                &self.dataset_id,
+                &self.run_id,
+                CaptureMethod::Backfill,
+                None,
+                event,
+            )
+            .await?;
         }
         let inserted_i64 = i64::try_from(inserted).context("history page insert count overflow")?;
         let complete = page.next.is_none();
         let updated = transaction
             .execute(
                 "UPDATE history_coverage
-                    SET next_hash = $6,
-                        next_height = $7,
-                        status = CASE WHEN $8 THEN 'complete' ELSE 'running' END,
-                        covered_tip_hash = CASE WHEN $8 THEN target_tip_hash ELSE covered_tip_hash END,
-                        covered_tip_height = CASE WHEN $8 THEN target_tip_height ELSE covered_tip_height END,
-                        rows_recorded = rows_recorded + $9,
+                    SET next_hash = $7,
+                        next_height = $8,
+                        status = CASE WHEN $9 THEN 'complete' ELSE 'running' END,
+                        covered_tip_hash = CASE WHEN $9 THEN target_tip_hash ELSE covered_tip_hash END,
+                        covered_tip_height = CASE WHEN $9 THEN target_tip_height ELSE covered_tip_height END,
+                        rows_recorded = rows_recorded + $10,
                         last_error = NULL,
                         updated_at = now(),
-                        completed_at = CASE WHEN $8 THEN now() ELSE NULL END
-                  WHERE source = $1 AND stream = $2
-                    AND sidechain IS NOT DISTINCT FROM $3
-                    AND next_hash = $4 AND next_height = $5",
+                        completed_at = CASE WHEN $9 THEN now() ELSE NULL END
+                  WHERE dataset_id = $1::text::uuid AND source = $2 AND stream = $3
+                    AND sidechain IS NOT DISTINCT FROM $4
+                    AND sidechain_instance_id IS NOT DISTINCT FROM $11
+                    AND next_hash = $5 AND next_height = $6",
                 &[
+                    &self.dataset_id,
                     &self.source,
                     &page.stream,
                     &sidechain,
@@ -535,6 +936,7 @@ impl Store {
                     &next_height,
                     &complete,
                     &inserted_i64,
+                    &sidechain_instance_id,
                 ],
             )
             .await
@@ -563,14 +965,25 @@ impl Store {
         let sidechain = sidechain.map(i16::from);
         let page_blocks = height_to_i32(effective_page_blocks)?;
         let client = self.client.lock().await;
+        let sidechain_instance_id =
+            current_sidechain_instance_client(&client, &self.dataset_id, sidechain).await?;
         let updated = client
             .execute(
                 "UPDATE history_coverage
-                    SET effective_page_blocks = $4, last_error = $5, updated_at = now()
-                  WHERE source = $1 AND stream = $2
-                    AND sidechain IS NOT DISTINCT FROM $3
+                    SET effective_page_blocks = $5, last_error = $6, updated_at = now()
+                  WHERE dataset_id = $1::text::uuid AND source = $2 AND stream = $3
+                    AND sidechain IS NOT DISTINCT FROM $4
+                    AND sidechain_instance_id IS NOT DISTINCT FROM $7
                     AND status = 'running'",
-                &[&self.source, &stream, &sidechain, &page_blocks, &error],
+                &[
+                    &self.dataset_id,
+                    &self.source,
+                    &stream,
+                    &sidechain,
+                    &page_blocks,
+                    &error,
+                    &sidechain_instance_id,
+                ],
             )
             .await
             .with_context(|| format!("resizing {stream} history pages"))?;
@@ -584,14 +997,23 @@ impl Store {
     pub async fn resume_history(&self, stream: &str, sidechain: Option<u8>) -> Result<()> {
         let sidechain = sidechain.map(i16::from);
         let client = self.client.lock().await;
+        let sidechain_instance_id =
+            current_sidechain_instance_client(&client, &self.dataset_id, sidechain).await?;
         let updated = client
             .execute(
                 "UPDATE history_coverage
                     SET status = 'running', last_error = NULL, updated_at = now()
-                  WHERE source = $1 AND stream = $2
-                    AND sidechain IS NOT DISTINCT FROM $3
+                  WHERE dataset_id = $1::text::uuid AND source = $2 AND stream = $3
+                    AND sidechain IS NOT DISTINCT FROM $4
+                    AND sidechain_instance_id IS NOT DISTINCT FROM $5
                     AND status = 'error' AND next_hash IS NOT NULL",
-                &[&self.source, &stream, &sidechain],
+                &[
+                    &self.dataset_id,
+                    &self.source,
+                    &stream,
+                    &sidechain,
+                    &sidechain_instance_id,
+                ],
             )
             .await
             .with_context(|| format!("resuming {stream} history"))?;
@@ -610,14 +1032,24 @@ impl Store {
     ) -> Result<()> {
         let sidechain = sidechain.map(i16::from);
         let client = self.client.lock().await;
+        let sidechain_instance_id =
+            current_sidechain_instance_client(&client, &self.dataset_id, sidechain).await?;
         let updated = client
             .execute(
                 "UPDATE history_coverage
-                    SET status = 'error', last_error = $4, updated_at = now()
-                  WHERE source = $1 AND stream = $2
-                    AND sidechain IS NOT DISTINCT FROM $3
+                    SET status = 'error', last_error = $5, updated_at = now()
+                  WHERE dataset_id = $1::text::uuid AND source = $2 AND stream = $3
+                    AND sidechain IS NOT DISTINCT FROM $4
+                    AND sidechain_instance_id IS NOT DISTINCT FROM $6
                     AND status = 'running'",
-                &[&self.source, &stream, &sidechain, &error],
+                &[
+                    &self.dataset_id,
+                    &self.source,
+                    &stream,
+                    &sidechain,
+                    &error,
+                    &sidechain_instance_id,
+                ],
             )
             .await
             .with_context(|| format!("marking {stream} history as failed"))?;
@@ -638,14 +1070,23 @@ impl Store {
     ) -> Result<Option<(Vec<u8>, u32)>> {
         let sidechain = i16::from(sidechain);
         let client = self.client.lock().await;
+        let sidechain_instance_id =
+            current_sidechain_instance_client(&client, &self.dataset_id, Some(sidechain)).await?;
         let row = client
             .query_opt(
                 "SELECT block_hash, height FROM event
-                 WHERE source = $1 AND kind = $2 AND sidechain = $3
+                 WHERE dataset_id = $1::text::uuid AND source = $2 AND kind = $3 AND sidechain = $4
+                   AND sidechain_instance_id IS NOT DISTINCT FROM $5
                    AND block_hash IS NOT NULL AND height IS NOT NULL
                  ORDER BY height DESC
                  LIMIT 1",
-                &[&self.source, &kind, &sidechain],
+                &[
+                    &self.dataset_id,
+                    &self.source,
+                    &kind,
+                    &sidechain,
+                    &sidechain_instance_id,
+                ],
             )
             .await
             .with_context(|| {
@@ -670,11 +1111,20 @@ impl Store {
     pub async fn last_recorded_height(&self, kind: &str, sidechain: u8) -> Result<Option<u32>> {
         let sidechain = i16::from(sidechain);
         let client = self.client.lock().await;
+        let sidechain_instance_id =
+            current_sidechain_instance_client(&client, &self.dataset_id, Some(sidechain)).await?;
         let row = client
             .query_one(
                 "SELECT max(height) FROM event
-                 WHERE source = $1 AND kind = $2 AND sidechain = $3",
-                &[&self.source, &kind, &sidechain],
+                 WHERE dataset_id = $1::text::uuid AND source = $2 AND kind = $3 AND sidechain = $4
+                   AND sidechain_instance_id IS NOT DISTINCT FROM $5",
+                &[
+                    &self.dataset_id,
+                    &self.source,
+                    &kind,
+                    &sidechain,
+                    &sidechain_instance_id,
+                ],
             )
             .await
             .with_context(|| {
@@ -696,29 +1146,30 @@ fn history_coverage_from_row(row: Row) -> Result<HistoryCoverage> {
     let sidechain = sidechain
         .map(|slot| u8::try_from(slot).with_context(|| format!("invalid history sidechain {slot}")))
         .transpose()?;
-    let covered_tip_hash: Option<Vec<u8>> = row.get(3);
-    let covered_tip_height: Option<i32> = row.get(4);
+    let covered_tip_hash: Option<Vec<u8>> = row.get(4);
+    let covered_tip_height: Option<i32> = row.get(5);
     let covered_tip = block_from_parts(covered_tip_hash, covered_tip_height, "covered tip")?;
-    let target_tip_hash: Vec<u8> = row.get(5);
-    let target_tip_height: i32 = row.get(6);
+    let target_tip_hash: Vec<u8> = row.get(6);
+    let target_tip_height: i32 = row.get(7);
     let target_tip =
         block_from_parts(Some(target_tip_hash), Some(target_tip_height), "target tip")?
             .context("history target tip is missing")?;
-    let next_hash: Option<Vec<u8>> = row.get(9);
-    let next_height: Option<i32> = row.get(10);
-    let status: String = row.get(11);
-    let rows_recorded: i64 = row.get(12);
-    let effective_page_blocks: i32 = row.get(13);
+    let next_hash: Option<Vec<u8>> = row.get(10);
+    let next_height: Option<i32> = row.get(11);
+    let status: String = row.get(12);
+    let rows_recorded: i64 = row.get(13);
+    let effective_page_blocks: i32 = row.get(14);
 
     Ok(HistoryCoverage {
         stream: row.get(0),
         sidechain,
-        coverage_start_height: height_from_i32(row.get(2), "coverage start")?,
+        sidechain_instance_id: row.get(2),
+        coverage_start_height: height_from_i32(row.get(3), "coverage start")?,
         covered_tip,
         target_tip,
-        floor_hash: row.get(7),
+        floor_hash: row.get(8),
         floor_height: row
-            .get::<_, Option<i32>>(8)
+            .get::<_, Option<i32>>(9)
             .map(|height| height_from_i32(height, "history floor"))
             .transpose()?,
         next: block_from_parts(next_hash, next_height, "next history cursor")?,
@@ -726,7 +1177,7 @@ fn history_coverage_from_row(row: Row) -> Result<HistoryCoverage> {
         rows_recorded: u64::try_from(rows_recorded).context("history rows_recorded is negative")?,
         effective_page_blocks: u32::try_from(effective_page_blocks)
             .context("history page size is not positive")?,
-        last_error: row.get(14),
+        last_error: row.get(15),
     })
 }
 
@@ -772,20 +1223,34 @@ fn height_from_i32(height: i32, name: &str) -> Result<u32> {
 async fn insert(
     transaction: &mut Transaction<'_>,
     source: &'static str,
+    dataset_id: &str,
+    run_id: &str,
+    method: CaptureMethod,
+    snapshot_group_id: Option<&str>,
     event: &Event,
 ) -> Result<u64> {
     let facts = facts(event).context("describing an event for the record")?;
     let payload = json::render(event).context("rendering an event payload as JSON")?;
     let envelope = event.encode_to_vec();
+    let envelope_sha256 = Sha256::digest(&envelope).to_vec();
     let observed_at = SystemTime::UNIX_EPOCH + Duration::from_millis(event.timestamp);
+    update_sidechain_instances(transaction, dataset_id, event, observed_at).await?;
+    let sidechain_instance_id =
+        current_sidechain_instance(transaction, dataset_id, facts.sidechain).await?;
 
-    transaction
-        .execute(
+    let inserted = transaction
+        .query_opt(
             "INSERT INTO event
-                 (observed_at, source, kind, sidechain, block_hash, height, envelope, payload)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-             ON CONFLICT ON CONSTRAINT event_identity DO NOTHING",
+                 (dataset_id, observed_at, source, kind, sidechain, block_hash,
+                  height, envelope, payload, envelope_sha256, sidechain_instance_id,
+                  event_contract_version)
+             VALUES ($1::text::uuid, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
+                     (SELECT event_contract_version FROM extractor_run
+                       WHERE run_id = $12::text::uuid))
+             ON CONFLICT ON CONSTRAINT event_identity DO NOTHING
+             RETURNING id",
             &[
+                &dataset_id,
                 &observed_at,
                 &source,
                 &facts.kind,
@@ -794,10 +1259,230 @@ async fn insert(
                 &facts.height,
                 &envelope,
                 &payload,
+                &envelope_sha256,
+                &sidechain_instance_id,
+                &run_id,
             ],
         )
         .await
-        .with_context(|| format!("recording a {} event", facts.kind))
+        .with_context(|| format!("recording a {} event fact", facts.kind))?;
+    let (event_id, inserted_count) = match inserted {
+        Some(row) => (row.get::<_, i64>(0), 1_u64),
+        None => {
+            let row = transaction
+                .query_one(
+                    "SELECT id FROM event
+                      WHERE dataset_id = $1::text::uuid AND source = $2 AND kind = $3
+                        AND sidechain IS NOT DISTINCT FROM $4
+                        AND sidechain_instance_id IS NOT DISTINCT FROM $6
+                        AND block_hash IS NOT DISTINCT FROM $5
+                        AND event_contract_version =
+                            (SELECT event_contract_version FROM extractor_run
+                              WHERE run_id = $7::text::uuid)",
+                    &[
+                        &dataset_id,
+                        &source,
+                        &facts.kind,
+                        &facts.sidechain,
+                        &facts.block_hash,
+                        &sidechain_instance_id,
+                        &run_id,
+                    ],
+                )
+                .await
+                .with_context(|| format!("resolving an existing {} event fact", facts.kind))?;
+            (row.get::<_, i64>(0), 0_u64)
+        }
+    };
+    let capture_seq = next_capture_seq(transaction, run_id).await?;
+    transaction
+        .execute(
+            "INSERT INTO event_observation
+                (dataset_id, run_id, capture_seq, capture_method, event_id,
+                 snapshot_group_id, observed_at)
+             VALUES ($1::text::uuid, $2::text::uuid, $3, $4, $5, $6::text::uuid, $7)",
+            &[
+                &dataset_id,
+                &run_id,
+                &capture_seq,
+                &method.as_str(),
+                &event_id,
+                &snapshot_group_id,
+                &observed_at,
+            ],
+        )
+        .await
+        .with_context(|| format!("recording a {} event occurrence", facts.kind))?;
+    Ok(inserted_count)
+}
+
+async fn update_sidechain_instances(
+    transaction: &Transaction<'_>,
+    dataset_id: &str,
+    event: &Event,
+    observed_at: SystemTime,
+) -> Result<()> {
+    let Some(MonitorEvent::Enforcer(payload)) = event.monitor_event.as_ref() else {
+        return Ok(());
+    };
+    let Some(crate::protobuf::enforcer_extractor::enforcer_event::Event::ActiveSidechains(
+        snapshot,
+    )) = payload.event.as_ref()
+    else {
+        return Ok(());
+    };
+
+    transaction
+        .execute(
+            "DELETE FROM current_sidechain_instance WHERE dataset_id = $1::text::uuid",
+            &[&dataset_id],
+        )
+        .await
+        .context("resetting the current sidechain-instance map")?;
+    for sidechain in &snapshot.sidechains {
+        let slot = i16::try_from(sidechain.sidechain_number).with_context(|| {
+            format!(
+                "active sidechain slot {} does not fit in a smallint",
+                sidechain.sidechain_number
+            )
+        })?;
+        if !(0..=255).contains(&slot) {
+            bail!("active sidechain slot {slot} is outside 0..=255");
+        }
+        let proposal_height = height_to_i32(sidechain.proposal_height)?;
+        let activation_height = height_to_i32(sidechain.activation_height)?;
+        let first_hash = Sha256::digest(&sidechain.raw_description);
+        let description_sha256d = Sha256::digest(first_hash).to_vec();
+        let instance_id = format!(
+            "{}:{}:{}:{}",
+            slot,
+            sidechain.proposal_height,
+            sidechain.activation_height,
+            hex::encode(&description_sha256d)
+        );
+        transaction
+            .execute(
+                "INSERT INTO sidechain_instance
+                    (dataset_id, sidechain_instance_id, sidechain, raw_description,
+                     description_sha256d, proposal_height, activation_height,
+                     first_seen_at, last_seen_at)
+                 VALUES ($1::text::uuid, $2, $3, $4, $5, $6, $7, $8, $8)
+                 ON CONFLICT (dataset_id, sidechain_instance_id) DO UPDATE SET
+                    last_seen_at = EXCLUDED.last_seen_at",
+                &[
+                    &dataset_id,
+                    &instance_id,
+                    &slot,
+                    &sidechain.raw_description,
+                    &description_sha256d,
+                    &proposal_height,
+                    &activation_height,
+                    &observed_at,
+                ],
+            )
+            .await
+            .context("recording a sidechain instance")?;
+        transaction
+            .execute(
+                "INSERT INTO current_sidechain_instance
+                    (dataset_id, sidechain, sidechain_instance_id, observed_at)
+                 VALUES ($1::text::uuid, $2, $3, $4)",
+                &[&dataset_id, &slot, &instance_id, &observed_at],
+            )
+            .await
+            .context("recording the current sidechain instance")?;
+    }
+    Ok(())
+}
+
+async fn current_sidechain_instance(
+    transaction: &Transaction<'_>,
+    dataset_id: &str,
+    sidechain: Option<i16>,
+) -> Result<Option<String>> {
+    let Some(sidechain) = sidechain else {
+        return Ok(None);
+    };
+    transaction
+        .query_opt(
+            "SELECT sidechain_instance_id
+               FROM current_sidechain_instance
+              WHERE dataset_id = $1::text::uuid AND sidechain = $2",
+            &[&dataset_id, &sidechain],
+        )
+        .await
+        .context("resolving the current sidechain instance")?
+        .map(|row| row.get(0))
+        .with_context(|| format!("no active sidechain instance is registered for slot {sidechain}"))
+        .map(Some)
+}
+
+async fn current_sidechain_instance_client(
+    client: &Client,
+    dataset_id: &str,
+    sidechain: Option<i16>,
+) -> Result<Option<String>> {
+    let Some(sidechain) = sidechain else {
+        return Ok(None);
+    };
+    client
+        .query_opt(
+            "SELECT sidechain_instance_id
+               FROM current_sidechain_instance
+              WHERE dataset_id = $1::text::uuid AND sidechain = $2",
+            &[&dataset_id, &sidechain],
+        )
+        .await
+        .context("resolving the current sidechain instance")?
+        .map(|row| row.get(0))
+        .with_context(|| format!("no active sidechain instance is registered for slot {sidechain}"))
+        .map(Some)
+}
+
+async fn next_capture_seq(transaction: &Transaction<'_>, run_id: &str) -> Result<i64> {
+    let row = transaction
+        .query_opt(
+            "UPDATE extractor_run
+                SET last_capture_seq = last_capture_seq + 1
+              WHERE run_id = $1::text::uuid AND status = 'running'
+              RETURNING last_capture_seq",
+            &[&run_id],
+        )
+        .await
+        .context("allocating the next extractor capture sequence")?
+        .context("extractor run is not active")?;
+    Ok(row.get(0))
+}
+
+async fn update_extractor_status(
+    transaction: &Transaction<'_>,
+    dataset_id: &str,
+    source: &str,
+    run_id: &str,
+    tip: &ObservedBlock,
+) -> Result<()> {
+    let height = height_to_i32(required_height(tip, "extractor status tip")?)?;
+    transaction
+        .execute(
+            "UPDATE extractor_status
+                SET last_tip_hash = $4,
+                    last_tip_height = $5,
+                    last_rpc_success_at = now(),
+                    last_error = NULL,
+                    updated_at = now()
+              WHERE dataset_id = $1::text::uuid AND source = $2 AND run_id = $3::text::uuid",
+            &[&dataset_id, &source, &run_id, &tip.hash, &height],
+        )
+        .await
+        .context("updating extractor status")?;
+    Ok(())
+}
+
+fn require_hash(hash: &[u8], name: &str) -> Result<()> {
+    if hash.len() != 32 {
+        bail!("{name} hash is {} bytes instead of 32", hash.len());
+    }
+    Ok(())
 }
 
 #[cfg(test)]

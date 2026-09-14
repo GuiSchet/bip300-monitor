@@ -9,6 +9,8 @@
 use anyhow::{Context, Result, bail};
 use shared::protobuf::enforcer_extractor as events;
 use shared::protobuf::event::ObservedBlock;
+use shared::store::{SnapshotConsistency, SnapshotMetadata};
+use std::time::SystemTime;
 
 use crate::EnforcerClient;
 use crate::convert;
@@ -17,11 +19,13 @@ use crate::convert;
 const PAYLOADS_PER_SLOT: usize = 2;
 /// Number of mutable-state payloads that are not scoped to a slot.
 const GLOBAL_PAYLOADS: usize = 2;
+const SNAPSHOT_MAX_ATTEMPTS: u32 = 3;
 
 /// One reading of the mutable state, and the tip it is anchored to.
 pub(crate) struct Reading {
     pub(crate) anchor: ObservedBlock,
     pub(crate) payloads: Vec<events::EnforcerEvent>,
+    pub(crate) metadata: SnapshotMetadata,
 }
 
 /// Read the enforcer tip and then the mutable state anchored to it.
@@ -36,10 +40,36 @@ pub(crate) struct Reading {
 /// naming: that block may not have a `block_connected` row yet, because the slot
 /// worker that will record it has not seen it.
 pub(crate) async fn collect(client: &mut EnforcerClient, sidechains: &[u8]) -> Result<Reading> {
-    let anchor = tip_anchor(&convert::chain_tip(client.get_chain_tip().await?)?)?;
-    let payloads = collect_payloads(client, sidechains).await?;
-
-    Ok(Reading { anchor, payloads })
+    let started_at = SystemTime::now();
+    for attempts in 1..=SNAPSHOT_MAX_ATTEMPTS {
+        let tip_before = tip_anchor(&convert::chain_tip(client.get_chain_tip().await?)?)?;
+        let payloads = collect_payloads(client, sidechains).await?;
+        let tip_after = tip_anchor(&convert::chain_tip(client.get_chain_tip().await?)?)?;
+        let consistency = if tip_before.hash == tip_after.hash {
+            SnapshotConsistency::Stable
+        } else {
+            SnapshotConsistency::Changed
+        };
+        if consistency == SnapshotConsistency::Stable || attempts == SNAPSHOT_MAX_ATTEMPTS {
+            return Ok(Reading {
+                anchor: tip_after.clone(),
+                payloads,
+                metadata: SnapshotMetadata {
+                    started_at,
+                    finished_at: SystemTime::now(),
+                    tip_before,
+                    tip_after,
+                    consistency,
+                    attempts,
+                },
+            });
+        }
+        tracing::debug!(
+            attempts,
+            "mainchain tip moved during state snapshot; retrying"
+        );
+    }
+    unreachable!("the bounded state snapshot loop always returns")
 }
 
 /// Collect every mutable-state payload in a deterministic order.

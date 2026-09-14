@@ -13,6 +13,8 @@ message EnforcerEvent {
     BlockConnected block_connected = 6;
     BlockDisconnected block_disconnected = 7;
     WithdrawalBundleProposalsSnapshot withdrawal_bundle_proposals = 8;
+    MainchainBlock mainchain_block = 9;
+    Bip300BlockDelta bip300_block_delta = 10;
   }
 }
 
@@ -38,6 +40,8 @@ message Bip300Constants {
 message ChainInfo {
   Network network = 1;
   Bip300Constants bip300_constants = 2;
+  // Exact protobuf enum number reported upstream, including future values.
+  int32 raw_network = 3;
 }
 
 message BlockHeader {
@@ -54,6 +58,145 @@ message BlockHeader {
 
 message ChainTip {
   BlockHeader header = 1;
+}
+
+// One canonical mainchain header, independent of any active sidechain slot.
+message MainchainBlock {
+  BlockHeader header = 1;
+}
+
+// Lossless, observer-oriented BIP300/301 facts resolved by the enforcer for a
+// canonical mainchain block. This is global: one block can affect many slots.
+message Bip300BlockDelta {
+  BlockHeader header = 1;
+  // 32-byte coinbase transaction ID in conventional display order.
+  bytes coinbase_txid = 2;
+  repeated Bip300CoinbaseMessage coinbase_messages = 3;
+  repeated TreasuryTransition treasury_transitions = 4;
+  repeated ConfirmedBmmRequest confirmed_bmm_requests = 5;
+}
+
+message Bip300CoinbaseMessage {
+  uint32 vout = 1;
+  // Exact scriptPubKey bytes, including OP_RETURN and the push opcode.
+  bytes raw_script_pubkey = 2;
+  // True when the message produced the resolved effect represented here.
+  bool accepted = 3;
+
+  oneof message {
+    M1Delta m1 = 10;
+    M2Delta m2 = 11;
+    M3Delta m3 = 12;
+    M4Delta m4 = 13;
+    M7Delta m7 = 14;
+  }
+}
+
+message M1Delta {
+  uint32 sidechain_number = 1;
+  // Consensus-encoded description bytes exactly as returned upstream.
+  bytes description = 2;
+  // 32-byte SHA256d hash in conventional display order.
+  bytes description_hash = 3;
+}
+
+enum M2Effect {
+  M2_EFFECT_UNSPECIFIED = 0;
+  M2_EFFECT_NO_ACTIVATION = 1;
+  M2_EFFECT_SLOT_ACTIVATION = 2;
+  M2_EFFECT_REPLACE_ACTIVE = 3;
+  M2_EFFECT_REJECTED_OR_NOOP = 4;
+}
+
+message M2Delta {
+  uint32 sidechain_number = 1;
+  // 32-byte SHA256d hash in conventional display order.
+  bytes description_hash = 2;
+  // Kept as the raw protobuf number by prost when a future value is unknown.
+  M2Effect effect = 3;
+}
+
+message M3Delta {
+  uint32 sidechain_number = 1;
+  // Consensus-encoded M6 identifier bytes.
+  bytes m6id = 2;
+}
+
+enum M4Mode {
+  M4_MODE_UNSPECIFIED = 0;
+  M4_MODE_REPEAT_PREVIOUS = 1;
+  M4_MODE_ONE_BYTE = 2;
+  M4_MODE_TWO_BYTES = 3;
+  M4_MODE_LEADING_BY_50 = 4;
+}
+
+enum M4Action {
+  M4_ACTION_UNSPECIFIED = 0;
+  M4_ACTION_ALARM = 1;
+  M4_ACTION_UPVOTE = 2;
+}
+
+message M4Effect {
+  uint32 sidechain_number = 1;
+  M4Action action = 2;
+  optional bytes upvoted_m6id = 3;
+  repeated bytes downvoted_m6ids = 4;
+}
+
+message M4Delta {
+  M4Mode mode = 1;
+  // Decoded unsigned wire values; alarm/abstain sentinels are not rewritten.
+  repeated uint32 raw_votes = 2;
+  repeated M4Effect effects = 3;
+}
+
+message M7Delta {
+  uint32 sidechain_number = 1;
+  // Consensus-encoded h* bytes.
+  bytes hstar = 2;
+}
+
+message TreasuryCtip {
+  // 32-byte transaction ID in conventional display order.
+  bytes txid = 1;
+  uint32 vout = 2;
+  uint64 value_sats = 3;
+}
+
+enum TreasuryTransitionKind {
+  TREASURY_TRANSITION_KIND_UNSPECIFIED = 0;
+  TREASURY_TRANSITION_KIND_DEPOSIT = 1;
+  TREASURY_TRANSITION_KIND_WITHDRAWAL_SUCCEEDED = 2;
+  TREASURY_TRANSITION_KIND_WITHDRAWAL_FAILED = 3;
+}
+
+message TreasuryTransition {
+  TreasuryTransitionKind kind = 1;
+  uint32 sidechain_number = 2;
+  optional TreasuryCtip previous_ctip = 3;
+  optional TreasuryCtip new_ctip = 4;
+  optional uint64 sequence_number = 5;
+  optional uint64 delta_sats = 6;
+  optional uint64 payout_sats = 7;
+  optional uint64 fee_sats = 8;
+  optional bytes m6id = 9;
+  optional bytes sidechain_address = 10;
+  optional bytes transaction = 11;
+  optional uint32 proposal_height = 12;
+  optional uint32 terminal_height = 13;
+}
+
+message ConfirmedBmmRequest {
+  uint32 sidechain_number = 1;
+  // 32-byte transaction ID in conventional display order.
+  bytes txid = 2;
+  // Consensus-encoded transaction bytes.
+  bytes transaction = 3;
+  // Consensus-encoded h* bytes.
+  bytes hstar = 4;
+  // 32-byte block hash in conventional display order.
+  bytes previous_mainchain_block_hash = 5;
+  optional uint64 fee_sats = 6;
 }
 
 message SidechainDeclaration {

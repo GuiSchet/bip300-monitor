@@ -11,24 +11,35 @@ use crate::protobuf::event::Event;
 
 /// Every `bytes` field across the monitor's protobuf contract.
 ///
-/// Kept as a flat name list because the field names are unique across messages
-/// and a walk over the value tree has no type information to match on. The
-/// `hexadecimal_field_list_covers_every_proto_bytes_field` test keeps it
+/// Kept as a flat name list because a walk over the value tree has no protobuf
+/// type information to match on. `description` is the one intentional name
+/// collision: it is bytes in `Bip300M1` and text in
+/// `SidechainDeclarationV0`. Text values are therefore left untouched while
+/// byte arrays are encoded below. The
+/// `hexadecimal_field_list_covers_every_proto_bytes_field` test keeps the list
 /// complete.
 pub const BYTE_FIELDS: &[&str] = &[
     "address",
     "block_hash",
     "bmm_commitment",
     "chain_work",
+    "coinbase_txid",
+    "description",
     "description_hash",
+    "downvoted_m6ids",
     "hash",
     "hash_id_1",
     "hash_id_2",
+    "hstar",
     "m6id",
     "previous_hash",
+    "previous_mainchain_block_hash",
     "raw_description",
+    "raw_script_pubkey",
+    "sidechain_address",
     "transaction",
     "txid",
+    "upvoted_m6id",
 ];
 
 /// Render one event as JSON with every byte field in hexadecimal.
@@ -53,7 +64,13 @@ fn encode_byte_fields(value: &mut Value) -> Result<()> {
         Value::Object(entries) => {
             for (key, value) in entries.iter_mut() {
                 if BYTE_FIELDS.contains(&key.as_str()) {
-                    *value = encode_bytes(value, key)?;
+                    // `description` is also a string field in the decoded M1
+                    // sidechain declaration. Preserve that text representation
+                    // while encoding the consensus-byte form used by the block
+                    // delta contract.
+                    if key != "description" || !value.is_string() {
+                        *value = encode_bytes(value, key)?;
+                    }
                 } else {
                     encode_byte_fields(value)?;
                 }

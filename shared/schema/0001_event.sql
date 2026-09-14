@@ -1,8 +1,9 @@
 -- The authoritative record of observed monitor events.
 --
--- `envelope` is the raw protobuf and the source of truth: any other store can
--- be rebuilt from it. `payload` is the same event decoded, with byte fields in
--- hexadecimal, and exists only so the record can be queried.
+-- `envelope` is the monitor's normalized protobuf and the source of truth for
+-- that contract version; it is not the upstream enforcer wire response.
+-- `payload` is the same event decoded, with byte fields in hexadecimal, and
+-- exists only so the record can be queried.
 CREATE TABLE IF NOT EXISTS event (
     id          bigint      GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     -- When the monitor observed the event, not a block timestamp.

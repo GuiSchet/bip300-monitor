@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::pin::Pin;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result, bail};
 use futures_util::future::try_join_all;
@@ -15,6 +15,7 @@ use shared::protobuf::enforcer_extractor as events;
 use shared::protobuf::event::event::MonitorEvent;
 use shared::protobuf::event::{Event, ObservedBlock};
 use shared::recorder::Recorder;
+use shared::store::{CaptureMethod, SnapshotConsistency, SnapshotMetadata};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinSet;
 use tokio::time::Instant;
@@ -23,6 +24,7 @@ use tonic::{Status, Streaming};
 use crate::backfill;
 use crate::config::Args;
 use crate::event::envelope;
+use crate::header_backfill;
 use crate::proto::mainchain;
 use crate::snapshot::{self, InitialSnapshot, record_snapshot};
 use crate::state;
@@ -32,6 +34,7 @@ type EventStream = Streaming<mainchain::SubscribeEventsResponse>;
 type SourceFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>>;
 type DeferredBackfill = Pin<Box<dyn Future<Output = BackfillRequest> + Send>>;
 const NATS_CLIENT_NAME: &str = "bip300-monitor-enforcer-extractor";
+const SNAPSHOT_MAX_ATTEMPTS: u32 = 3;
 /// Names the writer of every row this extractor records.
 const RECORD_SOURCE: &str = "enforcer";
 
@@ -94,15 +97,13 @@ struct PreparedStartup {
     sidechains: Vec<u8>,
     streams: Vec<(u8, EventStream)>,
     snapshot: InitialSnapshot,
-    tip_before_snapshot: Vec<u8>,
-    tip_after_snapshot: Vec<u8>,
+    snapshot_metadata: SnapshotMetadata,
 }
 
 struct PreparedObservation<S> {
     streams: Vec<(u8, S)>,
     snapshot: InitialSnapshot,
-    tip_before_snapshot: Vec<u8>,
-    tip_after_snapshot: Vec<u8>,
+    snapshot_metadata: SnapshotMetadata,
 }
 
 #[derive(Clone)]
@@ -134,115 +135,207 @@ pub async fn run(args: Args, mut shutdown_rx: watch::Receiver<bool>) -> Result<(
         sidechains,
         streams,
         snapshot,
-        tip_before_snapshot,
-        tip_after_snapshot,
+        snapshot_metadata,
     } = prepared;
+    let terminal_recorder = recorder.clone();
+    let outcome: Result<()> = async {
+        if snapshot_metadata.consistency == SnapshotConsistency::Changed {
+            tracing::warn!(
+                attempts = snapshot_metadata.attempts,
+                tip_before = %hex::encode(&snapshot_metadata.tip_before.hash),
+                snapshot_tip = %hex::encode(&snapshot.anchor.hash),
+                tip_after = %hex::encode(&snapshot_metadata.tip_after.hash),
+                "mainchain tip changed during every initial snapshot attempt; \
+                 the stored snapshot is explicitly marked inconsistent"
+            );
+        }
 
-    if !snapshot_tips_are_consistent(
-        &tip_before_snapshot,
-        &snapshot.anchor.hash,
-        &tip_after_snapshot,
-    ) {
-        tracing::warn!(
-            tip_before = %hex::encode(&tip_before_snapshot),
-            snapshot_tip = %hex::encode(&snapshot.anchor.hash),
-            tip_after = %hex::encode(&tip_after_snapshot),
-            "mainchain tip changed while collecting the initial snapshot; \
-             buffered live events may duplicate snapshot state"
+        record_snapshot(&recorder, &snapshot, &snapshot_metadata)
+            .await
+            .context("recording the initial enforcer snapshot")?;
+        recorder
+            .record_tip_observation(
+                &snapshot.anchor,
+                None,
+                CaptureMethod::Startup,
+                SystemTime::now(),
+            )
+            .await
+            .context("recording the initial mainchain tip")?;
+        tracing::info!(
+            sidechain_count = sidechains.len(),
+            "published initial enforcer snapshot"
         );
+
+        if *shutdown_rx.borrow() {
+            tracing::info!("shutdown requested after the initial snapshot");
+            return Ok(());
+        }
+
+        let activations = activation_heights(&snapshot.state, &sidechains)?;
+
+        // Every slot worker reports the blocks it sees here, so one state worker can
+        // re-read the mutable enforcer state once per tip change instead of once per
+        // slot. A tip worker reports there too, and it is what keeps the channel
+        // open: with no slot resolved there is no slot worker, and a state worker
+        // whose senders are all gone stops on its own — which used to end the whole
+        // process with a success code and no work done.
+        let snapshot_block = snapshot.anchor.hash.clone();
+        let (block_tx, block_rx) = watch::channel(snapshot.anchor.hash.clone());
+        // This is deliberately separate from `block_tx`: a healthy slot stream can
+        // report a block before the poll sees it, but the poll must still notify
+        // every other slot so a silently wedged stream cannot hide behind it.
+        let (tip_tx, tip_rx) = watch::channel(snapshot.anchor.clone());
+        let (sidechains_tx, sidechains_rx) = watch::channel(sidechains.clone());
+        let (backfill_tx, backfill_rx) = mpsc::channel(256);
+        for (sidechain, activation_height) in &activations {
+            backfill_tx
+                .try_send(BackfillRequest {
+                    sidechain: *sidechain,
+                    activation_height: *activation_height,
+                    target: snapshot.anchor.clone(),
+                })
+                .expect("at most 256 sidechain slots fit in the initial backfill queue");
+        }
+        let tracker = state::Tracker::new(snapshot.state);
+
+        let mut workers = JoinSet::new();
+        workers.spawn(monitor_sidechains(
+            streams,
+            client.clone(),
+            recorder.clone(),
+            block_tx.clone(),
+            sidechains_tx,
+            backfill_tx,
+            args.sidechains.is_empty(),
+            args.tip_poll_interval(),
+            tip_rx.clone(),
+            args.request_timeout(),
+            shutdown_rx.clone(),
+        ));
+        workers.spawn(monitor_tip(
+            client.clone(),
+            recorder.clone(),
+            args.tip_poll_interval(),
+            Heartbeat::new(args.liveness_file.clone()),
+            block_tx,
+            tip_tx,
+            shutdown_rx.clone(),
+        ));
+        workers.spawn(monitor_state(
+            client.clone(),
+            recorder.clone(),
+            sidechains_rx,
+            tracker,
+            snapshot_block,
+            block_rx,
+            shutdown_rx.clone(),
+        ));
+        workers.spawn(backfill_bip300_history(
+            client.clone(),
+            recorder.clone(),
+            args.activation_height,
+            snapshot.anchor.clone(),
+            backfill::Settings {
+                page_blocks: args.backfill_page_blocks,
+                page_pause: args.backfill_page_pause(),
+            },
+            args.tip_poll_interval(),
+            tip_rx.clone(),
+            shutdown_rx.clone(),
+        ));
+        // Live workers are installed before this task. Historical pages are small,
+        // persisted without NATS fan-out, and use the same short Postgres critical
+        // section as live writes, so catch-up cannot build an unbounded stream
+        // buffer or monopolize the record.
+        workers.spawn(backfill_sidechains(
+            client,
+            recorder,
+            backfill_rx,
+            backfill::Settings {
+                page_blocks: args.backfill_page_blocks,
+                page_pause: args.backfill_page_pause(),
+            },
+            args.tip_poll_interval(),
+            tip_rx,
+            shutdown_rx,
+        ));
+
+        supervise_workers(workers).await?;
+        tracing::info!("enforcer extractor stopped");
+        Ok(())
     }
+    .await;
 
-    record_snapshot(&recorder, &snapshot)
-        .await
-        .context("recording the initial enforcer snapshot")?;
-    tracing::info!(
-        sidechain_count = sidechains.len(),
-        "published initial enforcer snapshot"
-    );
-
-    if *shutdown_rx.borrow() {
-        tracing::info!("shutdown requested after the initial snapshot");
-        return Ok(());
+    match outcome {
+        Ok(()) => {
+            terminal_recorder
+                .finish_run("completed", Some("graceful shutdown"))
+                .await
+                .context("closing the successful extractor run")?;
+            Ok(())
+        }
+        Err(error) => {
+            let reason = format!("{error:#}");
+            if let Err(finish_error) = terminal_recorder.finish_run("failed", Some(&reason)).await {
+                tracing::error!(
+                    error = %finish_error,
+                    "failed to mark the extractor run as failed"
+                );
+            }
+            Err(error)
+        }
     }
+}
 
-    let activations = activation_heights(&snapshot.state, &sidechains)?;
-
-    // Every slot worker reports the blocks it sees here, so one state worker can
-    // re-read the mutable enforcer state once per tip change instead of once per
-    // slot. A tip worker reports there too, and it is what keeps the channel
-    // open: with no slot resolved there is no slot worker, and a state worker
-    // whose senders are all gone stops on its own — which used to end the whole
-    // process with a success code and no work done.
-    let snapshot_block = snapshot.anchor.hash.clone();
-    let (block_tx, block_rx) = watch::channel(snapshot.anchor.hash.clone());
-    // This is deliberately separate from `block_tx`: a healthy slot stream can
-    // report a block before the poll sees it, but the poll must still notify
-    // every other slot so a silently wedged stream cannot hide behind it.
-    let (tip_tx, tip_rx) = watch::channel(snapshot.anchor.clone());
-    let (sidechains_tx, sidechains_rx) = watch::channel(sidechains.clone());
-    let (backfill_tx, backfill_rx) = mpsc::channel(256);
-    for (sidechain, activation_height) in &activations {
-        backfill_tx
-            .try_send(BackfillRequest {
-                sidechain: *sidechain,
-                activation_height: *activation_height,
-                target: snapshot.anchor.clone(),
-            })
-            .expect("at most 256 sidechain slots fit in the initial backfill queue");
+#[allow(clippy::too_many_arguments)]
+async fn backfill_bip300_history(
+    mut client: EnforcerClient,
+    recorder: Recorder,
+    activation_height: u32,
+    mut target: ObservedBlock,
+    settings: backfill::Settings,
+    retry_interval: Duration,
+    mut tip_rx: watch::Receiver<ObservedBlock>,
+    mut shutdown_rx: watch::Receiver<bool>,
+) -> Result<()> {
+    tracing::info!(activation_height, "started global BIP300 history worker");
+    loop {
+        match header_backfill::run(
+            &mut client,
+            &recorder,
+            activation_height,
+            &target,
+            settings,
+            shutdown_rx.clone(),
+        )
+        .await?
+        {
+            header_backfill::Outcome::Interrupted { .. } => return Ok(()),
+            header_backfill::Outcome::Deferred { .. } => {
+                tokio::select! {
+                    biased;
+                    () = wait_for_shutdown(&mut shutdown_rx) => return Ok(()),
+                    () = tokio::time::sleep(retry_interval) => {}
+                }
+                target = snapshot::current_tip(&mut client)
+                    .await
+                    .context("refreshing the deferred global BIP300-history target")?;
+            }
+            header_backfill::Outcome::UpToDate | header_backfill::Outcome::Completed { .. } => {
+                tokio::select! {
+                    biased;
+                    () = wait_for_shutdown(&mut shutdown_rx) => return Ok(()),
+                    changed = tip_rx.changed() => {
+                        if changed.is_err() {
+                            return Ok(());
+                        }
+                        target = tip_rx.borrow_and_update().clone();
+                    }
+                }
+            }
+        }
     }
-    let tracker = state::Tracker::new(snapshot.state);
-
-    let mut workers = JoinSet::new();
-    workers.spawn(monitor_sidechains(
-        streams,
-        client.clone(),
-        recorder.clone(),
-        block_tx.clone(),
-        sidechains_tx,
-        backfill_tx,
-        args.sidechains.is_empty(),
-        args.tip_poll_interval(),
-        tip_rx.clone(),
-        args.request_timeout(),
-        shutdown_rx.clone(),
-    ));
-    workers.spawn(monitor_tip(
-        client.clone(),
-        args.tip_poll_interval(),
-        Heartbeat::new(args.liveness_file.clone()),
-        block_tx,
-        tip_tx,
-        shutdown_rx.clone(),
-    ));
-    workers.spawn(monitor_state(
-        client.clone(),
-        recorder.clone(),
-        sidechains_rx,
-        tracker,
-        snapshot_block,
-        block_rx,
-        shutdown_rx.clone(),
-    ));
-    // Live workers are installed before this task. Historical pages are small,
-    // persisted without NATS fan-out, and use the same short Postgres critical
-    // section as live writes, so catch-up cannot build an unbounded stream
-    // buffer or monopolize the record.
-    workers.spawn(backfill_sidechains(
-        client,
-        recorder,
-        backfill_rx,
-        backfill::Settings {
-            page_blocks: args.backfill_page_blocks,
-            page_pause: args.backfill_page_pause(),
-        },
-        args.tip_poll_interval(),
-        tip_rx,
-        shutdown_rx,
-    ));
-
-    supervise_workers(workers).await?;
-    tracing::info!("enforcer extractor stopped");
-    Ok(())
 }
 
 fn activation_heights(
@@ -472,16 +565,6 @@ async fn resolve_sidechains(client: &mut EnforcerClient, configured: &[u8]) -> R
 }
 
 async fn prepare_startup(args: &Args) -> Result<PreparedStartup> {
-    let recorder = Recorder::connect(
-        &args.postgres,
-        &args.nats,
-        Subject::Enforcer,
-        RECORD_SOURCE,
-        NATS_CLIENT_NAME,
-    )
-    .await
-    .context("connecting the event recorder")?;
-
     let mut client = EnforcerClient::connect(&args.enforcer_endpoint, args.request_timeout())
         .await
         .context("connecting the enforcer client")?;
@@ -496,9 +579,21 @@ async fn prepare_startup(args: &Args) -> Result<PreparedStartup> {
     let PreparedObservation {
         streams,
         snapshot,
-        tip_before_snapshot,
-        tip_after_snapshot,
+        snapshot_metadata,
     } = observation;
+    // Opening the recorder creates an extractor_run. Do it only after every
+    // fallible, read-only startup probe has succeeded so a failed connection or
+    // subscription cannot leave a misleading forever-running run behind.
+    let recorder = Recorder::connect_with_manifest(
+        &args.postgres,
+        &args.nats,
+        Subject::Enforcer,
+        RECORD_SOURCE,
+        NATS_CLIENT_NAME,
+        args.dataset_manifest(),
+    )
+    .await
+    .context("connecting the event recorder")?;
 
     Ok(PreparedStartup {
         recorder,
@@ -506,8 +601,7 @@ async fn prepare_startup(args: &Args) -> Result<PreparedStartup> {
         sidechains,
         streams,
         snapshot,
-        tip_before_snapshot,
-        tip_after_snapshot,
+        snapshot_metadata,
     })
 }
 
@@ -533,27 +627,63 @@ where
         .await
         .context("opening all sidechain subscriptions")?;
 
-    let tip_before_snapshot = client
-        .current_tip()
-        .await
-        .context("reading the mainchain tip before collecting the snapshot")?
-        .hash;
-    let snapshot = client
-        .collect_snapshot(sidechains)
-        .await
-        .context("collecting the initial enforcer snapshot")?;
-    let tip_after_snapshot = client
-        .current_tip()
-        .await
-        .context("reading the mainchain tip after collecting the snapshot")?
-        .hash;
+    let started_at = SystemTime::now();
+    let (snapshot, snapshot_metadata) =
+        collect_initial_snapshot_attempts(client, sidechains, started_at).await?;
 
     Ok(PreparedObservation {
         streams,
         snapshot,
-        tip_before_snapshot,
-        tip_after_snapshot,
+        snapshot_metadata,
     })
+}
+
+async fn collect_initial_snapshot_attempts<C>(
+    client: &mut C,
+    sidechains: &[u8],
+    started_at: SystemTime,
+) -> Result<(InitialSnapshot, SnapshotMetadata)>
+where
+    C: StartupSource,
+{
+    for attempts in 1..=SNAPSHOT_MAX_ATTEMPTS {
+        let tip_before = client
+            .current_tip()
+            .await
+            .context("reading the mainchain tip before collecting the snapshot")?;
+        let snapshot = client
+            .collect_snapshot(sidechains)
+            .await
+            .context("collecting the initial enforcer snapshot")?;
+        let tip_after = client
+            .current_tip()
+            .await
+            .context("reading the mainchain tip after collecting the snapshot")?;
+        let consistency = if snapshot_tips_are_consistent(
+            &tip_before.hash,
+            &snapshot.anchor.hash,
+            &tip_after.hash,
+        ) {
+            SnapshotConsistency::Stable
+        } else {
+            SnapshotConsistency::Changed
+        };
+        if consistency == SnapshotConsistency::Stable || attempts == SNAPSHOT_MAX_ATTEMPTS {
+            return Ok((
+                snapshot,
+                SnapshotMetadata {
+                    started_at,
+                    finished_at: SystemTime::now(),
+                    tip_before,
+                    tip_after,
+                    consistency,
+                    attempts,
+                },
+            ));
+        }
+        tracing::debug!(attempts, "mainchain tip moved during snapshot; retrying");
+    }
+    unreachable!("the bounded snapshot loop always returns")
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -754,6 +884,7 @@ fn announce_block(block_tx: &watch::Sender<Vec<u8>>, sidechain: u8, event: &Even
 /// call timed out would be a worse trade than waiting for the next tick.
 async fn monitor_tip(
     client: EnforcerClient,
+    recorder: Recorder,
     interval: Duration,
     heartbeat: Heartbeat,
     block_tx: watch::Sender<Vec<u8>>,
@@ -766,22 +897,54 @@ async fn monitor_tip(
         "started mainchain tip worker"
     );
 
-    announce_tip_changes(client, interval, heartbeat, block_tx, tip_tx, shutdown_rx).await?;
+    announce_tip_changes(
+        client,
+        interval,
+        heartbeat,
+        block_tx,
+        tip_tx,
+        shutdown_rx,
+        move |tip, previous, moved| {
+            let recorder = recorder.clone();
+            async move {
+                if moved {
+                    recorder
+                        .record_tip_observation(
+                            &tip,
+                            previous.as_ref(),
+                            CaptureMethod::Poll,
+                            SystemTime::now(),
+                        )
+                        .await
+                        .context("recording a polled mainchain tip")
+                } else {
+                    recorder
+                        .record_tip_heartbeat(&tip)
+                        .await
+                        .context("recording a mainchain tip heartbeat")
+                }
+            }
+        },
+    )
+    .await?;
 
     tracing::info!("stopped mainchain tip worker");
     Ok(())
 }
 
-async fn announce_tip_changes<S>(
+async fn announce_tip_changes<S, O, F>(
     mut source: S,
     interval: Duration,
     heartbeat: Heartbeat,
     block_tx: watch::Sender<Vec<u8>>,
     tip_tx: watch::Sender<ObservedBlock>,
     mut shutdown_rx: watch::Receiver<bool>,
+    mut observe: O,
 ) -> Result<()>
 where
     S: TipSource,
+    O: FnMut(ObservedBlock, Option<ObservedBlock>, bool) -> F,
+    F: Future<Output = Result<()>>,
 {
     loop {
         tokio::select! {
@@ -792,6 +955,10 @@ where
 
         match source.read_tip().await {
             Ok(tip) => {
+                let previous = tip_tx.borrow().clone();
+                let moved = previous.hash != tip.hash;
+                observe(tip.clone(), moved.then_some(previous), moved).await?;
+
                 // A read that succeeded is the proof the healthcheck wants: the
                 // process is scheduling and the enforcer is answering. A tip
                 // that has not moved still counts, because a quiet chain is not
@@ -801,7 +968,7 @@ where
                 // Only a move is reported. Re-announcing the same hash would
                 // still mark the channel changed, and the state worker would
                 // wake once per tick for nothing.
-                if tip_tx.borrow().hash != tip.hash {
+                if moved {
                     let _ = tip_tx.send(tip.clone());
                 }
                 if *block_tx.borrow() != tip.hash {
@@ -843,7 +1010,9 @@ async fn monitor_state(
         snapshot_block,
         block_rx,
         shutdown_rx,
-        move |anchor: ObservedBlock, payloads: Vec<events::EnforcerEvent>| {
+        move |anchor: ObservedBlock,
+              payloads: Vec<events::EnforcerEvent>,
+              metadata: SnapshotMetadata| {
             let recorder = recorder.clone();
             async move {
                 let published = payloads.len();
@@ -855,7 +1024,7 @@ async fn monitor_state(
                     })
                     .collect::<Result<Vec<_>>>()?;
                 recorder
-                    .record_batch(events)
+                    .record_snapshot_batch(events, CaptureMethod::Poll, &metadata)
                     .await
                     .context("recording refreshed enforcer state")?;
                 tracing::info!(published, "published refreshed enforcer state");
@@ -880,7 +1049,7 @@ async fn refresh_on_new_blocks<S, P, F>(
 ) -> Result<()>
 where
     S: StateSource,
-    P: FnMut(ObservedBlock, Vec<events::EnforcerEvent>) -> F,
+    P: FnMut(ObservedBlock, Vec<events::EnforcerEvent>, SnapshotMetadata) -> F,
     F: Future<Output = Result<()>>,
 {
     // The block the initial snapshot describes. It is taken as an argument
@@ -923,11 +1092,13 @@ where
         })?;
         refreshed_at = block;
 
+        let metadata = reading.metadata;
+        let anchor = reading.anchor;
         let changed = tracker.take_changed(reading.payloads)?;
         if changed.is_empty() {
             continue;
         }
-        publish(reading.anchor, changed)
+        publish(anchor, changed, metadata)
             .await
             .context("publishing refreshed enforcer state")?;
     }
@@ -1148,12 +1319,13 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet, VecDeque};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
-    use std::time::Duration;
+    use std::time::{Duration, SystemTime};
 
     use anyhow::{Context as _, anyhow};
     use futures_util::{StreamExt, stream};
     use shared::protobuf::enforcer_extractor as events;
     use shared::protobuf::event::event::MonitorEvent;
+    use shared::store::{SnapshotConsistency, SnapshotMetadata};
     use tokio::sync::{Notify, watch};
     use tokio::time::timeout;
 
@@ -1388,11 +1560,20 @@ mod tests {
                     .expect("state collection lock")
                     .pop_front();
                 collected.notify_one();
+                let anchor = ObservedBlock::at_height(vec![call as u8; 32], 996_259 + call as u32);
                 Ok(state::Reading {
                     // A distinct anchor per refresh, so a test can tell which
                     // reading a published batch came from.
-                    anchor: ObservedBlock::at_height(vec![call as u8; 32], 996_259 + call as u32),
+                    anchor: anchor.clone(),
                     payloads: collection.context("configured fake state collection")?,
+                    metadata: SnapshotMetadata {
+                        started_at: SystemTime::now(),
+                        finished_at: SystemTime::now(),
+                        tip_before: anchor.clone(),
+                        tip_after: anchor,
+                        consistency: SnapshotConsistency::Stable,
+                        attempts: 1,
+                    },
                 })
             })
         }
@@ -1677,7 +1858,7 @@ mod tests {
             snapshot_tip,
             block_rx,
             shutdown_rx,
-            |_anchor, _payloads| async { Ok(()) },
+            |_anchor, _payloads, _metadata| async { Ok(()) },
         ));
 
         // Both sends happen with no await between them, so the worker cannot be
@@ -1727,7 +1908,9 @@ mod tests {
             snapshot_tip.clone(),
             block_rx,
             shutdown_rx,
-            move |anchor: ObservedBlock, payloads: Vec<events::EnforcerEvent>| {
+            move |anchor: ObservedBlock,
+                  payloads: Vec<events::EnforcerEvent>,
+                  _metadata: SnapshotMetadata| {
                 let output = Arc::clone(&output);
                 let publish_shutdown = publish_shutdown.clone();
                 async move {
@@ -1788,7 +1971,7 @@ mod tests {
             vec![0x11; 32],
             block_rx,
             shutdown_rx,
-            |_anchor, _payloads| async { Ok(()) },
+            |_anchor, _payloads, _metadata| async { Ok(()) },
         ));
 
         tokio::task::yield_now().await;
@@ -1814,7 +1997,7 @@ mod tests {
             vec![0x11; 32],
             block_rx,
             shutdown_rx,
-            |_anchor, _payloads| async { Ok(()) },
+            |_anchor, _payloads, _metadata| async { Ok(()) },
         ));
 
         block_tx.send(vec![0x22; 32]).expect("new block");
@@ -1925,6 +2108,7 @@ mod tests {
             block_tx,
             tip_tx,
             shutdown_rx,
+            |_tip, _previous, _moved| async { Ok(()) },
         ));
 
         timeout(Duration::from_secs(5), block_rx.changed())
@@ -1980,6 +2164,7 @@ mod tests {
             block_tx,
             tip_tx,
             shutdown_rx,
+            |_tip, _previous, _moved| async { Ok(()) },
         ));
 
         // A poll is not a record write, so a failure waits for the next tick
@@ -2016,7 +2201,7 @@ mod tests {
             vec![0x11; 32],
             block_rx,
             shutdown_rx,
-            |_anchor, _payloads| async { Ok(()) },
+            |_anchor, _payloads, _metadata| async { Ok(()) },
         ));
 
         tokio::task::yield_now().await;

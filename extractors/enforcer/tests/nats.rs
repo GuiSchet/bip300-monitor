@@ -90,6 +90,7 @@ async fn publishes_and_decodes_the_monitor_envelope() {
     let payload = EnforcerEvent {
         event: Some(enforcer_event::Event::ChainInfo(ChainInfo {
             network: Network::Regtest as i32,
+            raw_network: Network::Regtest as i32,
             bip300_constants: Some(Bip300Constants {
                 activation_height: 100,
                 ..Bip300Constants::default()
@@ -144,6 +145,7 @@ async fn subscriber_reports_an_invalid_payload_and_continues() {
         MonitorEvent::Enforcer(EnforcerEvent {
             event: Some(enforcer_event::Event::ChainInfo(ChainInfo {
                 network: Network::Regtest as i32,
+                raw_network: Network::Regtest as i32,
                 bip300_constants: Some(Bip300Constants::default()),
             })),
         }),
@@ -194,6 +196,7 @@ async fn detected_server_loss_makes_publish_and_flush_time_out() {
     let payload = EnforcerEvent {
         event: Some(enforcer_event::Event::ChainInfo(ChainInfo {
             network: Network::Regtest as i32,
+            raw_network: Network::Regtest as i32,
             bip300_constants: None,
         })),
     };

@@ -123,6 +123,10 @@ render_node_config() {
         printf '# network_id=%s magic=%s\n' "${NETWORK_ID}" "${ECASH_NETWORK_MAGIC}"
         printf 'port=%s\n' "${ECASH_NODE_P2P_PORT}"
         printf 'rpcport=%s\n' "${ECASH_NODE_RPC_PORT}"
+        # The enforcer requires historical block data from its last persisted
+        # cursor. Make the non-pruned requirement explicit instead of relying
+        # on the node default, which could change or be overridden unnoticed.
+        printf 'prune=0\n'
         printf 'zmqpubsequence=tcp://0.0.0.0:%s\n' "${ECASH_NODE_ZMQ_PORT}"
         while IFS= read -r peer; do
             printf 'addnode=%s\n' "${peer}"
@@ -503,6 +507,13 @@ record_snapshot_sidechain_activations() {
           WHERE source = 'enforcer'
             AND kind = 'active_sidechains'
             AND block_hash = decode(:'block_hash', 'hex')
+            AND event_contract_version = (
+                SELECT max(latest.event_contract_version)
+                  FROM event latest
+                 WHERE latest.source = 'enforcer'
+                   AND latest.kind = 'active_sidechains'
+                   AND latest.block_hash = decode(:'block_hash', 'hex')
+            )
           ORDER BY (snapshot_sidechain.value->>'sidechain_number')::integer" \
         --set=block_hash="${block_hash}"
 }
@@ -522,7 +533,13 @@ record_event_count_at() {
     local block_hash="$2"
     local sidechain="${3:-}"
     local -a filters=(--set=kind="${kind}" --set=block_hash="${block_hash}")
-    local predicate="kind = :'kind' AND block_hash = decode(:'block_hash', 'hex')"
+    local predicate="kind = :'kind' AND block_hash = decode(:'block_hash', 'hex')
+        AND event_contract_version = (
+            SELECT max(latest.event_contract_version)
+              FROM event latest
+             WHERE latest.kind = :'kind'
+               AND latest.block_hash = decode(:'block_hash', 'hex')
+        )"
 
     [[ "${kind}" =~ ^[a-z_]+$ ]] || return 1
     [[ "${block_hash}" =~ ^[[:xdigit:]]{64}$ ]] || return 1
@@ -558,6 +575,64 @@ record_has_block() {
     )" || return 1
     [[ "${count}" =~ ^[0-9]+$ ]] || return 1
     ((count >= 1))
+}
+
+# Whether the record holds one global (slot-less) event for a block hash.
+record_has_global_block() {
+    local kind="$1"
+    local block_hash="$2"
+    local count
+
+    [[ "${kind}" =~ ^[a-z_]+$ ]] || return 1
+    [[ "${block_hash}" =~ ^[[:xdigit:]]{64}$ ]] || return 1
+    count="$(
+        postgres_query \
+            "SELECT count(*) FROM event
+             WHERE kind = :'kind'
+               AND sidechain IS NULL
+               AND block_hash = decode(:'block_hash', 'hex')" \
+            --set=kind="${kind}" \
+            --set=block_hash="${block_hash}"
+    )" || return 1
+    [[ "${count}" =~ ^[0-9]+$ ]] || return 1
+    ((count >= 1))
+}
+
+# Whether the observer RPC has supplied a gap-free global BIP300/301 range
+# from network activation through at least the requested target height.
+record_bip300_history_is_complete() {
+    local activation_height="$1"
+    local minimum_target_height="$2"
+    local complete
+
+    [[ "${activation_height}" =~ ^[0-9]+$ ]] || return 1
+    [[ "${minimum_target_height}" =~ ^[0-9]+$ ]] || return 1
+    complete="$(
+        postgres_query \
+            "SELECT CASE WHEN EXISTS (
+                 SELECT 1 FROM history_coverage coverage
+                  WHERE coverage.source = 'enforcer'
+                    AND coverage.stream = 'bip300_delta'
+                    AND coverage.sidechain IS NULL
+                    AND coverage.status = 'complete'
+                    AND coverage.coverage_start_height = :'activation'::integer
+                    AND coverage.covered_tip_height = coverage.target_tip_height
+                    AND coverage.covered_tip_height >= :'minimum_target'::integer
+                    AND coverage.next_hash IS NULL
+                    AND (
+                        SELECT count(DISTINCT event.height)
+                          FROM event
+                         WHERE event.source = coverage.source
+                           AND event.kind = 'bip300_block_delta'
+                           AND event.sidechain IS NULL
+                           AND event.height BETWEEN coverage.coverage_start_height
+                                                AND coverage.covered_tip_height
+                    ) = coverage.covered_tip_height - coverage.coverage_start_height + 1
+             ) THEN 1 ELSE 0 END" \
+            --set=activation="${activation_height}" \
+            --set=minimum_target="${minimum_target_height}"
+    )" || return 1
+    [[ "${complete}" == 1 ]]
 }
 
 # Whether one slot has a proven, gap-free range from its activation through at
@@ -805,6 +880,8 @@ require_node_ready() {
     jq -e --arg chain "${ECASH_NODE_CHAIN}" '.chain == $chain' \
         <<<"${blockchain_info}" >/dev/null ||
         die "ecash-node is not using the expected ${NETWORK_ID} chain"
+    jq -e '.pruned == false' <<<"${blockchain_info}" >/dev/null ||
+        die "ecash-node has pruning enabled; the enforcer requires complete historical block data"
     jq -e --argjson height "${ECASH_ACTIVATION_HEIGHT}" \
         '.blocks >= $height and .headers >= $height' \
         <<<"${blockchain_info}" >/dev/null ||

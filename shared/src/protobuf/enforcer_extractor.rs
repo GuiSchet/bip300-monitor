@@ -17,13 +17,18 @@ impl enforcer_event::Event {
             Self::BlockConnected(_) => "block_connected",
             Self::BlockDisconnected(_) => "block_disconnected",
             Self::WithdrawalBundleProposals(_) => "withdrawal_bundle_proposals",
+            Self::MainchainBlock(_) => "mainchain_block",
+            Self::Bip300BlockDelta(_) => "bip300_block_delta",
         }
     }
 
     /// The sidechain slot this event is scoped to, if any.
     pub const fn sidechain_number(&self) -> Option<u32> {
         match self {
-            Self::ChainInfo(_) | Self::ChainTip(_) => None,
+            Self::ChainInfo(_)
+            | Self::ChainTip(_)
+            | Self::MainchainBlock(_)
+            | Self::Bip300BlockDelta(_) => None,
             Self::SidechainProposals(_) | Self::ActiveSidechains(_) => None,
             Self::Ctip(snapshot) => Some(snapshot.sidechain_number),
             Self::BlockConnected(block) => Some(block.sidechain_number),
@@ -55,6 +60,8 @@ mod kind_tests {
                 super::WithdrawalBundleProposalsSnapshot::default(),
             )
             .kind(),
+            enforcer_event::Event::MainchainBlock(super::MainchainBlock::default()).kind(),
+            enforcer_event::Event::Bip300BlockDelta(super::Bip300BlockDelta::default()).kind(),
         ];
 
         let unique = kinds.iter().collect::<std::collections::BTreeSet<_>>();

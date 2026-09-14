@@ -10,6 +10,12 @@ future Beta or Mainnet transition does not require another deployment copy.
 
 Alphanet is experimental. Use a dedicated data directory and no real funds.
 
+The lock distinguishes the latest official enforcer runtime from the reviewed
+observer fork that adds `GetBip300BlockDelta`. Until the fork image is
+published and `ENFORCER_COMMIT`/`ENFORCER_IMAGE` are promoted together,
+`just verify` intentionally cannot certify global BIP300 history. This is a
+pre-Pulse safety gate, not a reason to relabel the official image as the fork.
+
 ## Requirements
 
 - Ubuntu 24.04 on `x86_64`.
@@ -64,6 +70,10 @@ therefore report `Connected ... pre-activation block(s) from stored headers`
 before the validator processes blocks at and above the locked activation
 height.
 
+The generated node configuration sets `prune=0` explicitly. Runtime readiness
+rejects `getblockchaininfo.pruned = true`, because the observer RPC needs raw
+historical blocks to preserve exact scripts and transactions.
+
 The default `.env.example` deliberately sets
 `TRUST_ASSUMEUTXO_SNAPSHOT=true`. With that policy, `just enforcer-up` accepts
 either a fully validated chainstate or exactly two chainstates whose active one
@@ -93,11 +103,11 @@ just verify
 ```
 
 Verification asks the record, not the logs. It reads the block the newest
-recorded snapshot is anchored to, then requires **exactly one** row at that block
-for each snapshot kind, plus one CTIP and one withdrawal-bundle proposals row per
-configured slot. Exactly one, not at least one: a second row at the same block
-would mean the identity constraint stopped collapsing a republished snapshot,
-which is the shape of a table that grows on every restart.
+recorded snapshot is anchored to, selects the newest event-contract version at
+that block, and requires **exactly one fact** per expected snapshot kind and
+slot. It also requires complete per-instance `block` coverage and global
+`bip300_delta` coverage even when there are zero active slots. Repeated captures
+belong in `event_observation`, not as duplicate facts.
 
 Rows outlive a container, and the block is what scopes them — a previous run's
 rows are anchored at a previous block. Scoping by time instead would be wrong in

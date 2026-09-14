@@ -162,6 +162,10 @@ history_wait_seconds="${HISTORY_WAIT_SECONDS:-43200}"
 history_deadline="$((SECONDS + history_wait_seconds))"
 while :; do
     history_complete=true
+    if ! record_bip300_history_is_complete \
+        "${ECASH_ACTIVATION_HEIGHT}" "${snapshot_height}"; then
+        history_complete=false
+    fi
     for sidechain in "${active_sidechains[@]}"; do
         if ! record_block_history_is_complete \
             "${sidechain}" "${activation_heights[${sidechain}]}" "${snapshot_height}"; then
@@ -183,4 +187,4 @@ final_active_activations="$(active_sidechain_activations)"
 [[ "${final_active_activations}" == "${active_activations}" ]] ||
     die "the active sidechain set changed during verification; run 'just verify' again so the new slot is included"
 
-info "${NETWORK_ID} observation pipeline verification passed (snapshot live, block history complete, slots=${observed_sidechains:-none})"
+info "${NETWORK_ID} observation pipeline verification passed (snapshot live, global BIP300 and slot histories complete, slots=${observed_sidechains:-none})"

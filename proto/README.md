@@ -32,6 +32,13 @@ variant in the first pilot.
   values and stored as 32 bytes in conventional display order.
 - Fields documented as consensus-encoded preserve the byte order and any
   length prefix supplied by the enforcer's `ConsensusHex` value.
+- `Bip300BlockDelta` is global, one fact per mainchain block. It preserves each
+  exact matching coinbase `scriptPubKey`, its `vout`, parsed fields and whether
+  the enforcer accepted it. Resolved effects and treasury transitions come
+  from the enforcer's persisted block diff, not from monitor-side inference.
+- Unknown protobuf enum numbers remain their raw `i32` values in the normalized
+  event. Consumers must not collapse a future number into today's
+  `UNSPECIFIED` meaning.
 - Proposal, active-sidechain, CTIP, and withdrawal-bundle-proposal messages are
   snapshots, not deltas. They are published once at startup and then again
   whenever a connected or disconnected block changed their value, so a consumer
@@ -48,14 +55,16 @@ variant in the first pilot.
 - A snapshot's `observed_at_block` is the tip it was read against, which under a
   moving chain can be a later block than the one whose arrival triggered the
   read — and can therefore be a block with no `BlockConnected` of its own yet.
+- PostgreSQL wraps every unary snapshot in a `snapshot_group` containing
+  `tip_before`, `tip_after`, the read interval, attempt count and either
+  `stable` or `changed`. Three bounded attempts are made; a moving chain is
+  persisted explicitly as `changed`, never mislabeled stable.
 - Reorgs are recorded, not repaired. `BlockDisconnected` says a block left the
-  chain; the `BlockConnected` that preceded it stays in the record, unmarked,
-  because the envelope is a log of observations rather than a view of the current
-  chain. Reconstructing the surviving chain is the consumer's job. Two
-  consequences follow: a block that is disconnected and then connected again
-  produces no second `BlockConnected`, since it is the same observation of the
-  same block; and the backfill checkpoint, being the highest recorded height,
-  can name an orphan until a later block outgrows it.
+  chain; the preceding `BlockConnected` fact remains because this is an
+  observation log, not a mutable current-chain view. The fact is idempotent,
+  while `event_observation` retains every repeated capture and
+  `tip_observation` retains transitions such as `A -> B -> A` in `capture_seq`
+  order. Reconstructing the surviving chain is the consumer's job.
 - `WithdrawalBundleProposalsSnapshot` carries the bundles still being voted on.
   Its `vote_count` is read against
   `Bip300Constants.withdrawal_bundle_inclusion_threshold` and its
@@ -69,9 +78,10 @@ variant in the first pilot.
   mainchain block is published once per configured slot with that slot's
   filtered data.
 - An absent `CtipSnapshot.ctip` means that the sidechain has no current CTIP.
-- Startup can publish a block in both the snapshot and the buffered live
-  stream. Consumers should treat block event type, sidechain slot, and block
-  hash as an idempotency key.
+- Startup can capture a block in both backfill and the buffered live stream.
+  Consumers that need unique facts use `event`; consumers that need delivery,
+  replay or reorg order join `event_observation` to `event` and order by
+  `(run_id, capture_seq)`.
 
 Conversions reject missing required input fields, malformed hex, and hashes
 that are not exactly 32 bytes. This prevents incomplete upstream responses from
@@ -82,6 +92,10 @@ flush confirms that its transport write buffer was emptied; it does not confirm
 that the server processed the bytes or that any consumer received or persisted
 the event. The protobuf schema therefore defines observation data, not an
 exactly-once delivery protocol.
+
+The stored `event.envelope` is this normalized monitor protobuf, not the
+upstream wire response. Raw consensus-relevant fields are included explicitly;
+the envelope cannot recreate fields the input API never exposed.
 
 When evolving the schema, add new fields with new numbers. Never change the
 meaning of an existing field number or reuse a removed number.
