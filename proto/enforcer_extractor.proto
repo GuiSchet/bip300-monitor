@@ -4,6 +4,9 @@ package enforcer_extractor;
 
 // A normalized event produced from the enforcer's read-only validator API.
 message EnforcerEvent {
+  reserved 9;
+  reserved "mainchain_block";
+
   oneof event {
     ChainInfo chain_info = 1;
     ChainTip chain_tip = 2;
@@ -13,7 +16,6 @@ message EnforcerEvent {
     BlockConnected block_connected = 6;
     BlockDisconnected block_disconnected = 7;
     WithdrawalBundleProposalsSnapshot withdrawal_bundle_proposals = 8;
-    MainchainBlock mainchain_block = 9;
     Bip300BlockDelta bip300_block_delta = 10;
   }
 }
@@ -57,11 +59,6 @@ message BlockHeader {
 }
 
 message ChainTip {
-  BlockHeader header = 1;
-}
-
-// One canonical mainchain header, independent of any active sidechain slot.
-message MainchainBlock {
   BlockHeader header = 1;
 }
 

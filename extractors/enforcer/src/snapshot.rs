@@ -34,7 +34,7 @@ pub(crate) async fn collect_snapshot(
         chain_tip,
     ];
 
-    let state = state::collect_payloads(client, sidechains).await?;
+    let state = state::collect_payloads(client, sidechains, false).await?;
 
     Ok(InitialSnapshot {
         constants,

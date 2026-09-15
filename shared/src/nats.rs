@@ -271,7 +271,7 @@ impl FanOut {
 #[derive(Debug)]
 pub enum ReceivedEvent {
     /// A valid protobuf event envelope.
-    Decoded(Event),
+    Decoded(Box<Event>),
     /// A message that could not be decoded as the expected protobuf envelope.
     Invalid {
         /// Protobuf decoding failure.
@@ -331,7 +331,7 @@ impl EventSubscriber {
 
         let payload_len = message.payload.len();
         Ok(match Event::decode(message.payload) {
-            Ok(event) => ReceivedEvent::Decoded(event),
+            Ok(event) => ReceivedEvent::Decoded(Box::new(event)),
             Err(error) => ReceivedEvent::Invalid { error, payload_len },
         })
     }

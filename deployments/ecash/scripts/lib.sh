@@ -182,6 +182,8 @@ deployment_env_file() {
 load_deployment_env() {
     local env_file
     local resolved_data_base
+    local stream_stall_timeout_seconds
+    local tip_poll_interval_seconds
     env_file="$(deployment_env_file)"
     [[ -f "${env_file}" ]] || die "missing ${env_file}; run 'just init' first"
     reject_version_overrides "${env_file}"
@@ -220,6 +222,16 @@ load_deployment_env() {
         die "BIP300_MONITOR_BACKFILL_PAGE_BLOCKS must not exceed 512"
     [[ "${BIP300_MONITOR_BACKFILL_PAGE_PAUSE_MS:-100}" =~ ^[0-9]+$ ]] ||
         die "BIP300_MONITOR_BACKFILL_PAGE_PAUSE_MS must be numeric"
+    tip_poll_interval_seconds="${BIP300_MONITOR_TIP_POLL_INTERVAL_SECONDS:-30}"
+    stream_stall_timeout_seconds="${BIP300_MONITOR_STREAM_STALL_TIMEOUT_SECONDS:-60}"
+    require_positive_integer \
+        BIP300_MONITOR_TIP_POLL_INTERVAL_SECONDS \
+        "${tip_poll_interval_seconds}"
+    require_positive_integer \
+        BIP300_MONITOR_STREAM_STALL_TIMEOUT_SECONDS \
+        "${stream_stall_timeout_seconds}"
+    ((stream_stall_timeout_seconds >= tip_poll_interval_seconds)) ||
+        die "BIP300_MONITOR_STREAM_STALL_TIMEOUT_SECONDS must be at least BIP300_MONITOR_TIP_POLL_INTERVAL_SECONDS"
     if [[ -n "${BIP300_MONITOR_BACKFILL_MAX_BLOCKS+x}" ]]; then
         die "BIP300_MONITOR_BACKFILL_MAX_BLOCKS was removed; replace it with BIP300_MONITOR_BACKFILL_PAGE_BLOCKS"
     fi
@@ -610,10 +622,18 @@ record_bip300_history_is_complete() {
     complete="$(
         postgres_query \
             "SELECT CASE WHEN EXISTS (
-                 SELECT 1 FROM history_coverage coverage
+                 SELECT 1
+                   FROM history_coverage coverage
+                   JOIN extractor_status extractor
+                     ON extractor.dataset_id = coverage.dataset_id
+                    AND extractor.source = coverage.source
+                   JOIN extractor_run run
+                     ON run.run_id = extractor.run_id
                   WHERE coverage.source = 'enforcer'
                     AND coverage.stream = 'bip300_delta'
                     AND coverage.sidechain IS NULL
+                    AND coverage.sidechain_instance_id IS NULL
+                    AND coverage.event_contract_version = run.event_contract_version
                     AND coverage.status = 'complete'
                     AND coverage.coverage_start_height = :'activation'::integer
                     AND coverage.covered_tip_height = coverage.target_tip_height
@@ -623,8 +643,11 @@ record_bip300_history_is_complete() {
                         SELECT count(DISTINCT event.height)
                           FROM event
                          WHERE event.source = coverage.source
+                           AND event.dataset_id = coverage.dataset_id
+                           AND event.event_contract_version = coverage.event_contract_version
                            AND event.kind = 'bip300_block_delta'
                            AND event.sidechain IS NULL
+                           AND event.sidechain_instance_id IS NULL
                            AND event.height BETWEEN coverage.coverage_start_height
                                                 AND coverage.covered_tip_height
                     ) = coverage.covered_tip_height - coverage.coverage_start_height + 1
@@ -649,10 +672,21 @@ record_block_history_is_complete() {
     complete="$(
         postgres_query \
             "SELECT CASE WHEN EXISTS (
-                 SELECT 1 FROM history_coverage coverage
+                 SELECT 1
+                   FROM history_coverage coverage
+                   JOIN extractor_status extractor
+                     ON extractor.dataset_id = coverage.dataset_id
+                    AND extractor.source = coverage.source
+                   JOIN extractor_run run
+                     ON run.run_id = extractor.run_id
+                   JOIN current_sidechain_instance current_instance
+                     ON current_instance.dataset_id = coverage.dataset_id
+                    AND current_instance.sidechain = coverage.sidechain
+                    AND current_instance.sidechain_instance_id = coverage.sidechain_instance_id
                   WHERE coverage.source = 'enforcer'
                     AND coverage.stream = 'block'
                     AND coverage.sidechain = :'sidechain'::smallint
+                    AND coverage.event_contract_version = run.event_contract_version
                     AND coverage.status = 'complete'
                     AND coverage.coverage_start_height = :'activation'::integer
                     AND coverage.covered_tip_height = coverage.target_tip_height
@@ -662,8 +696,11 @@ record_block_history_is_complete() {
                         SELECT count(DISTINCT event.height)
                           FROM event
                          WHERE event.source = coverage.source
+                           AND event.dataset_id = coverage.dataset_id
+                           AND event.event_contract_version = coverage.event_contract_version
                            AND event.kind = 'block_connected'
                            AND event.sidechain = coverage.sidechain
+                           AND event.sidechain_instance_id = coverage.sidechain_instance_id
                            AND event.height BETWEEN coverage.coverage_start_height
                                                 AND coverage.covered_tip_height
                     ) = coverage.covered_tip_height - coverage.coverage_start_height + 1
@@ -680,28 +717,39 @@ history_coverage_json() {
         "SELECT COALESCE(jsonb_agg(row ORDER BY (row->>'sidechain')::integer), '[]'::jsonb)
            FROM (
              SELECT jsonb_build_object(
-                 'stream', stream,
-                 'sidechain', sidechain,
-                 'status', status,
-                 'start_height', coverage_start_height,
-                 'target_height', target_tip_height,
-                 'next_height', next_height,
-                 'covered_height', covered_tip_height,
-                 'rows_recorded', rows_recorded,
-                 'page_blocks', effective_page_blocks,
+                 'stream', coverage.stream,
+                 'sidechain', coverage.sidechain,
+                 'sidechain_instance_id', coverage.sidechain_instance_id,
+                 'event_contract_version', coverage.event_contract_version,
+                 'status', coverage.status,
+                 'start_height', coverage.coverage_start_height,
+                 'target_height', coverage.target_tip_height,
+                 'next_height', coverage.next_height,
+                 'covered_height', coverage.covered_tip_height,
+                 'rows_recorded', coverage.rows_recorded,
+                 'page_blocks', coverage.effective_page_blocks,
                  'percent', CASE
-                     WHEN status = 'complete' THEN 100
+                     WHEN coverage.status = 'complete' THEN 100
                      ELSE round(
-                         100.0 * (target_tip_height - next_height)
-                         / GREATEST(target_tip_height - coverage_start_height + 1, 1),
+                         100.0 * (coverage.target_tip_height - coverage.next_height)
+                         / GREATEST(
+                             coverage.target_tip_height - coverage.coverage_start_height + 1,
+                             1
+                         ),
                          2
                      )
                  END,
-                 'last_error', last_error,
-                 'updated_at', updated_at
+                 'last_error', coverage.last_error,
+                 'updated_at', coverage.updated_at
              ) AS row
-             FROM history_coverage
-             WHERE source = 'enforcer'
+               FROM history_coverage coverage
+               JOIN extractor_status extractor
+                 ON extractor.dataset_id = coverage.dataset_id
+                AND extractor.source = coverage.source
+               JOIN extractor_run run
+                 ON run.run_id = extractor.run_id
+              WHERE coverage.source = 'enforcer'
+                AND coverage.event_contract_version = run.event_contract_version
            ) coverage_rows"
 }
 

@@ -14,14 +14,14 @@ CREATE TABLE IF NOT EXISTS dataset_manifest (
     initial_node_commit     text        NOT NULL,
     initial_enforcer_commit text        NOT NULL,
     initial_monitor_commit  text        NOT NULL,
-    event_contract_version  integer     NOT NULL,
+    initial_event_contract_version integer NOT NULL,
     capabilities            jsonb       NOT NULL DEFAULT '[]'::jsonb,
     creation_reason         text        NOT NULL,
     created_at              timestamptz NOT NULL DEFAULT now(),
 
     CONSTRAINT dataset_network_not_empty CHECK (network_id <> ''),
     CONSTRAINT dataset_activation_height CHECK (activation_height >= 0),
-    CONSTRAINT dataset_contract_version CHECK (event_contract_version > 0),
+    CONSTRAINT dataset_contract_version CHECK (initial_event_contract_version > 0),
     CONSTRAINT dataset_creation_reason_not_empty CHECK (creation_reason <> ''),
     CONSTRAINT dataset_identity UNIQUE
         (network_id, activation_height, activation_block_hash)
@@ -30,7 +30,7 @@ CREATE TABLE IF NOT EXISTS dataset_manifest (
 INSERT INTO dataset_manifest
     (dataset_id, network_id, activation_height, activation_block_hash,
      initial_node_commit, initial_enforcer_commit, initial_monitor_commit,
-     event_contract_version, capabilities, creation_reason)
+     initial_event_contract_version, capabilities, creation_reason)
 VALUES
     ('00000000-0000-0000-0000-000000000001', 'legacy-unknown', 0, 'unknown',
      'unknown', 'unknown', 'unknown', 1, '[]'::jsonb,
@@ -213,7 +213,6 @@ CREATE TABLE IF NOT EXISTS extractor_status (
     run_id                uuid        NOT NULL REFERENCES extractor_run(run_id),
     last_tip_hash         bytea,
     last_tip_height       integer,
-    last_rpc_success_at   timestamptz,
     last_error            text,
     updated_at            timestamptz NOT NULL DEFAULT now(),
 
@@ -228,17 +227,33 @@ CREATE TABLE IF NOT EXISTS extractor_status (
 
 ALTER TABLE history_coverage ADD COLUMN IF NOT EXISTS dataset_id uuid;
 ALTER TABLE history_coverage ADD COLUMN IF NOT EXISTS sidechain_instance_id text;
+ALTER TABLE history_coverage ADD COLUMN IF NOT EXISTS event_contract_version integer;
 UPDATE history_coverage
    SET dataset_id = '00000000-0000-0000-0000-000000000001'
  WHERE dataset_id IS NULL;
+-- Pre-v4 facts belong to normalized contract v1. Their sidechain-instance
+-- provenance cannot be reconstructed safely, so it deliberately remains NULL
+-- in the isolated legacy dataset. A real dataset starts fresh coverage under
+-- its explicit contract version and instance identity.
+UPDATE history_coverage
+   SET event_contract_version = 1
+ WHERE event_contract_version IS NULL;
 ALTER TABLE history_coverage ALTER COLUMN dataset_id SET NOT NULL;
+ALTER TABLE history_coverage ALTER COLUMN event_contract_version SET NOT NULL;
 ALTER TABLE history_coverage DROP CONSTRAINT IF EXISTS history_coverage_dataset;
 ALTER TABLE history_coverage ADD CONSTRAINT history_coverage_dataset
     FOREIGN KEY (dataset_id) REFERENCES dataset_manifest(dataset_id);
+ALTER TABLE history_coverage DROP CONSTRAINT IF EXISTS history_coverage_contract_version_positive;
+ALTER TABLE history_coverage ADD CONSTRAINT history_coverage_contract_version_positive
+    CHECK (event_contract_version > 0);
+ALTER TABLE history_coverage DROP CONSTRAINT IF EXISTS history_coverage_status;
+ALTER TABLE history_coverage ADD CONSTRAINT history_coverage_status
+    CHECK (status IN ('running', 'complete', 'error', 'superseded'));
 ALTER TABLE history_coverage DROP CONSTRAINT IF EXISTS history_coverage_identity;
 ALTER TABLE history_coverage ADD CONSTRAINT history_coverage_identity
     UNIQUE NULLS NOT DISTINCT
-        (dataset_id, source, stream, sidechain, sidechain_instance_id);
+        (dataset_id, event_contract_version, source, stream, sidechain,
+         sidechain_instance_id);
 ALTER TABLE history_coverage DROP CONSTRAINT IF EXISTS history_coverage_sidechain_instance;
 ALTER TABLE history_coverage ADD CONSTRAINT history_coverage_sidechain_instance
     FOREIGN KEY (dataset_id, sidechain_instance_id)
@@ -247,6 +262,7 @@ ALTER TABLE history_coverage ADD CONSTRAINT history_coverage_sidechain_instance
 CREATE TABLE IF NOT EXISTS history_coverage_revision (
     revision_id bigint      GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     dataset_id  uuid        NOT NULL REFERENCES dataset_manifest(dataset_id),
+    event_contract_version integer NOT NULL,
     source      text        NOT NULL,
     stream      text        NOT NULL,
     sidechain   smallint,
@@ -264,11 +280,11 @@ LANGUAGE plpgsql
 AS $$
 BEGIN
     INSERT INTO history_coverage_revision
-        (dataset_id, source, stream, sidechain, sidechain_instance_id,
-         operation, row_data)
+        (dataset_id, event_contract_version, source, stream, sidechain,
+         sidechain_instance_id, operation, row_data)
     VALUES
-        (NEW.dataset_id, NEW.source, NEW.stream, NEW.sidechain,
-         NEW.sidechain_instance_id, TG_OP, to_jsonb(NEW));
+        (NEW.dataset_id, NEW.event_contract_version, NEW.source, NEW.stream,
+         NEW.sidechain, NEW.sidechain_instance_id, TG_OP, to_jsonb(NEW));
     RETURN NEW;
 END;
 $$;

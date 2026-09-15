@@ -123,6 +123,18 @@ pub struct Args {
     )]
     pub tip_poll_interval_seconds: u64,
 
+    /// Maximum time a live event stream may remain silent after the tip moves.
+    ///
+    /// This is deliberately separate from the unary RPC timeout: historical
+    /// requests and HTTP/2 scheduling can legitimately delay stream frames.
+    #[arg(
+        long,
+        env = "BIP300_MONITOR_STREAM_STALL_TIMEOUT_SECONDS",
+        default_value_t = 60,
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
+    pub stream_stall_timeout_seconds: u64,
+
     /// File whose modification time is refreshed on every successful tip read.
     ///
     /// The extractor exposes no port, so a container healthcheck has nothing to
@@ -132,8 +144,7 @@ pub struct Args {
     #[arg(long, env = "BIP300_MONITOR_LIVENESS_FILE")]
     pub liveness_file: Option<std::path::PathBuf>,
 
-    /// Timeout in seconds for connections, unary requests, stream setup, and
-    /// live-stream silence after the tip poll observes a new block.
+    /// Timeout in seconds for connections, unary requests, and stream setup.
     #[arg(
         long,
         env = "BIP300_MONITOR_REQUEST_TIMEOUT_SECONDS",
@@ -169,6 +180,13 @@ impl Args {
                 self.nats.nats_flush_timeout_seconds
             );
         }
+        if self.stream_stall_timeout_seconds < self.tip_poll_interval_seconds {
+            bail!(
+                "stream stall timeout ({}s) must be at least the tip poll interval ({}s)",
+                self.stream_stall_timeout_seconds,
+                self.tip_poll_interval_seconds
+            );
+        }
 
         let mut unique = HashSet::with_capacity(self.sidechains.len());
         for sidechain in &self.sidechains {
@@ -190,6 +208,11 @@ impl Args {
         Duration::from_secs(self.tip_poll_interval_seconds)
     }
 
+    /// Return the live event-stream stall timeout.
+    pub const fn stream_stall_timeout(&self) -> Duration {
+        Duration::from_secs(self.stream_stall_timeout_seconds)
+    }
+
     /// Return the configured pause between historical pages.
     pub const fn backfill_page_pause(&self) -> Duration {
         Duration::from_millis(self.backfill_page_pause_ms)
@@ -209,7 +232,7 @@ impl Args {
             node_commit: self.node_commit.clone(),
             enforcer_commit: self.enforcer_commit.clone(),
             monitor_commit: self.monitor_commit.clone(),
-            event_contract_version: 3,
+            event_contract_version: shared::protobuf::enforcer_extractor::EVENT_CONTRACT_VERSION,
             capabilities: serde_json::json!([
                 "event_facts",
                 "event_observations",
@@ -281,6 +304,7 @@ mod tests {
         assert_eq!(args.nats.nats_url, "nats://nats:4222");
         assert_eq!(args.log_level, LogLevel::Info);
         assert_eq!(args.request_timeout_seconds, 10);
+        assert_eq!(args.stream_stall_timeout_seconds, 60);
         assert_eq!(args.backfill_page_blocks, 128);
         assert_eq!(args.backfill_page_pause_ms, 100);
         assert_eq!(args.nats.nats_flush_timeout_seconds, 10);
@@ -322,6 +346,20 @@ mod tests {
                     .contains("must be greater than the NATS flush timeout")
             );
         }
+    }
+
+    #[test]
+    fn validates_the_stream_stall_and_tip_poll_relationship() {
+        let invalid = Args::try_parse_from([
+            "enforcer-extractor",
+            "--tip-poll-interval-seconds",
+            "30",
+            "--stream-stall-timeout-seconds",
+            "29",
+        ])
+        .expect("syntactically valid arguments");
+
+        assert!(invalid.validate().is_err());
     }
 
     #[test]

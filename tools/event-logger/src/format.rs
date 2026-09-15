@@ -78,19 +78,6 @@ fn summarize(payload: &events::enforcer_event::Event) -> Result<String> {
                 hex::encode(&header.hash)
             ))
         }
-        events::enforcer_event::Event::MainchainBlock(block) => {
-            let header = block
-                .header
-                .as_ref()
-                .context("mainchain block is missing its block header")?;
-            validate_header(header)?;
-            Ok(format!(
-                "height={} block_hash={} previous_hash={}",
-                header.height,
-                hex::encode(&header.hash),
-                hex::encode(&header.previous_hash)
-            ))
-        }
         events::enforcer_event::Event::Bip300BlockDelta(delta) => {
             validate_bip300_delta(delta)?;
             let header = delta
@@ -386,12 +373,6 @@ mod tests {
                     header: Some(header(1)),
                 }),
                 "chain_tip",
-            ),
-            (
-                events::enforcer_event::Event::MainchainBlock(events::MainchainBlock {
-                    header: Some(header(2)),
-                }),
-                "mainchain_block",
             ),
             (
                 events::enforcer_event::Event::Bip300BlockDelta(events::Bip300BlockDelta {

@@ -63,28 +63,6 @@ pub fn block_info(
         .collect()
 }
 
-/// Convert `GetBlockHeaderInfo` results, preserving newest-first order.
-pub fn block_headers(
-    response: mainchain::GetBlockHeaderInfoResponse,
-) -> Result<Vec<events::EnforcerEvent>> {
-    response
-        .header_infos
-        .into_iter()
-        .enumerate()
-        .map(|(index, header)| {
-            block_header(header)
-                .map(|header| {
-                    enforcer_event(events::enforcer_event::Event::MainchainBlock(
-                        events::MainchainBlock {
-                            header: Some(header),
-                        },
-                    ))
-                })
-                .with_context(|| format!("converting block header at index {index}"))
-        })
-        .collect()
-}
-
 /// Convert observer-oriented BIP300/301 block deltas, preserving the
 /// upstream newest-first order and every raw enum number.
 pub fn bip300_block_deltas(

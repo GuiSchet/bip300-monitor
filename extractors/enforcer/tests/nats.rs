@@ -116,7 +116,7 @@ async fn publishes_and_decodes_the_monitor_envelope() {
     let ReceivedEvent::Decoded(received) = received else {
         panic!("expected a decoded event");
     };
-    assert_eq!(received, expected);
+    assert_eq!(*received, expected);
     subscriber.close().await.expect("subscriber shutdown");
 }
 
@@ -177,7 +177,7 @@ async fn subscriber_reports_an_invalid_payload_and_continues() {
     let ReceivedEvent::Decoded(received) = received else {
         panic!("expected a decoded event");
     };
-    assert_eq!(received, expected);
+    assert_eq!(*received, expected);
 }
 
 #[tokio::test]

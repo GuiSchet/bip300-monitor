@@ -15,7 +15,7 @@ use shared::protobuf::enforcer_extractor as events;
 use shared::protobuf::event::event::MonitorEvent;
 use shared::protobuf::event::{Event, ObservedBlock};
 use shared::recorder::Recorder;
-use shared::store::{CaptureMethod, SnapshotConsistency, SnapshotMetadata};
+use shared::store::{CaptureMethod, SidechainInstanceRef, SnapshotConsistency, SnapshotMetadata};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinSet;
 use tokio::time::Instant;
@@ -41,6 +41,7 @@ const RECORD_SOURCE: &str = "enforcer";
 trait StartupSource: Clone + Send {
     type Stream: Send;
 
+    fn active_instances(&mut self) -> SourceFuture<'_, Vec<SidechainInstanceRef>>;
     fn subscribe_events(&mut self, sidechain: u8) -> SourceFuture<'_, Self::Stream>;
     fn current_tip(&mut self) -> SourceFuture<'_, ObservedBlock>;
     fn collect_snapshot<'a>(
@@ -51,6 +52,14 @@ trait StartupSource: Clone + Send {
 
 impl StartupSource for EnforcerClient {
     type Stream = EventStream;
+
+    fn active_instances(&mut self) -> SourceFuture<'_, Vec<SidechainInstanceRef>> {
+        Box::pin(async move {
+            let payload = convert::active_sidechains(self.get_sidechains().await?)?;
+            state::active_instances(&payload)
+                .context("expected an active-sidechains payload while preparing subscriptions")?
+        })
+    }
 
     fn subscribe_events(&mut self, sidechain: u8) -> SourceFuture<'_, Self::Stream> {
         Box::pin(EnforcerClient::subscribe_events(self, sidechain))
@@ -81,19 +90,28 @@ impl TipSource for EnforcerClient {
 
 /// Source of the enforcer state that has to be re-read as the tip advances.
 trait StateSource: Send {
-    fn collect_state<'a>(&'a mut self, sidechains: &'a [u8]) -> SourceFuture<'a, state::Reading>;
+    fn collect_state<'a>(
+        &'a mut self,
+        sidechains: &'a [u8],
+        discover_new_slots: bool,
+    ) -> SourceFuture<'a, state::Reading>;
 }
 
 impl StateSource for EnforcerClient {
-    fn collect_state<'a>(&'a mut self, sidechains: &'a [u8]) -> SourceFuture<'a, state::Reading> {
-        Box::pin(state::collect(self, sidechains))
+    fn collect_state<'a>(
+        &'a mut self,
+        sidechains: &'a [u8],
+        discover_new_slots: bool,
+    ) -> SourceFuture<'a, state::Reading> {
+        Box::pin(state::collect(self, sidechains, discover_new_slots))
     }
 }
 
 struct PreparedStartup {
     recorder: Recorder,
     client: EnforcerClient,
-    /// Resolved slots, which may have been discovered rather than configured.
+    /// Desired slots: either explicitly configured (including currently inactive
+    /// ones) or discovered from the active startup snapshot.
     sidechains: Vec<u8>,
     streams: Vec<(u8, EventStream)>,
     snapshot: InitialSnapshot,
@@ -108,8 +126,7 @@ struct PreparedObservation<S> {
 
 #[derive(Clone)]
 struct BackfillRequest {
-    sidechain: u8,
-    activation_height: u32,
+    instance: SidechainInstanceRef,
     target: ObservedBlock,
 }
 
@@ -163,7 +180,7 @@ pub async fn run(args: Args, mut shutdown_rx: watch::Receiver<bool>) -> Result<(
             .await
             .context("recording the initial mainchain tip")?;
         tracing::info!(
-            sidechain_count = sidechains.len(),
+            desired_sidechain_count = sidechains.len(),
             "published initial enforcer snapshot"
         );
 
@@ -172,7 +189,7 @@ pub async fn run(args: Args, mut shutdown_rx: watch::Receiver<bool>) -> Result<(
             return Ok(());
         }
 
-        let activations = activation_heights(&snapshot.state, &sidechains)?;
+        let instances = active_instances_for_slots(&snapshot.state, &sidechains)?;
 
         // Every slot worker reports the blocks it sees here, so one state worker can
         // re-read the mutable enforcer state once per tip change instead of once per
@@ -186,13 +203,15 @@ pub async fn run(args: Args, mut shutdown_rx: watch::Receiver<bool>) -> Result<(
         // report a block before the poll sees it, but the poll must still notify
         // every other slot so a silently wedged stream cannot hide behind it.
         let (tip_tx, tip_rx) = watch::channel(snapshot.anchor.clone());
-        let (sidechains_tx, sidechains_rx) = watch::channel(sidechains.clone());
+        // Lifecycle changes are announced only after the active-sidechains
+        // snapshot is durable. The monitor then reads the exact current instances
+        // back from Postgres instead of racing a second RPC-derived truth.
+        let (sidechain_state_tx, sidechain_state_rx) = watch::channel(0_u64);
         let (backfill_tx, backfill_rx) = mpsc::channel(256);
-        for (sidechain, activation_height) in &activations {
+        for instance in &instances {
             backfill_tx
                 .try_send(BackfillRequest {
-                    sidechain: *sidechain,
-                    activation_height: *activation_height,
+                    instance: instance.clone(),
                     target: snapshot.anchor.clone(),
                 })
                 .expect("at most 256 sidechain slots fit in the initial backfill queue");
@@ -202,15 +221,16 @@ pub async fn run(args: Args, mut shutdown_rx: watch::Receiver<bool>) -> Result<(
         let mut workers = JoinSet::new();
         workers.spawn(monitor_sidechains(
             streams,
+            instances,
             client.clone(),
             recorder.clone(),
             block_tx.clone(),
-            sidechains_tx,
             backfill_tx,
+            sidechains.clone(),
             args.sidechains.is_empty(),
-            args.tip_poll_interval(),
+            sidechain_state_rx,
             tip_rx.clone(),
-            args.request_timeout(),
+            args.stream_stall_timeout(),
             shutdown_rx.clone(),
         ));
         workers.spawn(monitor_tip(
@@ -225,10 +245,12 @@ pub async fn run(args: Args, mut shutdown_rx: watch::Receiver<bool>) -> Result<(
         workers.spawn(monitor_state(
             client.clone(),
             recorder.clone(),
-            sidechains_rx,
+            sidechains,
+            args.sidechains.is_empty(),
             tracker,
             snapshot_block,
             block_rx,
+            sidechain_state_tx,
             shutdown_rx.clone(),
         ));
         workers.spawn(backfill_bip300_history(
@@ -301,6 +323,7 @@ async fn backfill_bip300_history(
 ) -> Result<()> {
     tracing::info!(activation_height, "started global BIP300 history worker");
     loop {
+        let requested_target = target.clone();
         match header_backfill::run(
             &mut client,
             &recorder,
@@ -312,17 +335,42 @@ async fn backfill_bip300_history(
         .await?
         {
             header_backfill::Outcome::Interrupted { .. } => return Ok(()),
-            header_backfill::Outcome::Deferred { .. } => {
+            header_backfill::Outcome::Superseded { .. } => {
+                bail!("global BIP300 history was unexpectedly superseded")
+            }
+            header_backfill::Outcome::Deferred {
+                target: deferred_target,
+                ..
+            } => {
+                target = deferred_target;
                 tokio::select! {
                     biased;
                     () = wait_for_shutdown(&mut shutdown_rx) => return Ok(()),
                     () = tokio::time::sleep(retry_interval) => {}
                 }
-                target = snapshot::current_tip(&mut client)
-                    .await
-                    .context("refreshing the deferred global BIP300-history target")?;
             }
-            header_backfill::Outcome::UpToDate | header_backfill::Outcome::Completed { .. } => {
+            header_backfill::Outcome::UpToDate {
+                target: reached_target,
+            }
+            | header_backfill::Outcome::Completed {
+                target: reached_target,
+                ..
+            } => {
+                if reached_target.hash != requested_target.hash {
+                    tracing::info!(
+                        reached_target = %hex::encode(&reached_target.hash),
+                        requested_target = %hex::encode(&requested_target.hash),
+                        "completed the persisted global-history target; reconciling from the reached branch"
+                    );
+                }
+                target = reached_target;
+                let current_tip = snapshot::current_tip(&mut client)
+                    .await
+                    .context("reconciling global BIP300 history with the tip")?;
+                if current_tip.hash != target.hash {
+                    target = current_tip;
+                    continue;
+                }
                 tokio::select! {
                     biased;
                     () = wait_for_shutdown(&mut shutdown_rx) => return Ok(()),
@@ -338,26 +386,20 @@ async fn backfill_bip300_history(
     }
 }
 
-fn activation_heights(
+fn active_instances_for_slots(
     snapshot_state: &[events::EnforcerEvent],
     sidechains: &[u8],
-) -> Result<Vec<(u8, u32)>> {
-    let discovered = snapshot_state
+) -> Result<Vec<SidechainInstanceRef>> {
+    select_active_instances(active_instances_from_state(snapshot_state)?, sidechains)
+}
+
+fn active_instances_from_state(
+    snapshot_state: &[events::EnforcerEvent],
+) -> Result<Vec<SidechainInstanceRef>> {
+    snapshot_state
         .iter()
-        .find_map(state::active_slot_activations)
-        .context("initial snapshot has no active-sidechains payload")??;
-    sidechains
-        .iter()
-        .map(|slot| {
-            discovered
-                .iter()
-                .find(|(candidate, _)| candidate == slot)
-                .copied()
-                .with_context(|| {
-                    format!("configured sidechain {slot} is not active at the snapshot tip")
-                })
-        })
-        .collect()
+        .find_map(state::active_instances)
+        .context("initial snapshot has no active-sidechains payload")?
 }
 
 async fn backfill_sidechains(
@@ -371,9 +413,9 @@ async fn backfill_sidechains(
 ) -> Result<()> {
     let mut requests_open = true;
     let mut tip_updates_open = true;
-    let mut activations = BTreeMap::<u8, u32>::new();
+    let mut activations = BTreeMap::<u8, SidechainInstanceRef>::new();
     let mut pending = BTreeMap::<u8, BackfillRequest>::new();
-    let mut deferred = BTreeSet::<u8>::new();
+    let mut deferred = BTreeSet::<String>::new();
     let mut retries = FuturesUnordered::<DeferredBackfill>::new();
 
     loop {
@@ -381,7 +423,7 @@ async fn backfill_sidechains(
             return Ok(());
         }
 
-        let (mut request, refresh_target) = if let Some((_, request)) = pending.pop_first() {
+        let (request, deferred_retry) = if let Some((_, request)) = pending.pop_first() {
             (request, false)
         } else {
             tokio::select! {
@@ -414,39 +456,50 @@ async fn backfill_sidechains(
             }
         };
 
-        activations.insert(request.sidechain, request.activation_height);
-        // An explicit request or refreshed retry supersedes a queued target for
-        // the same slot. Its post-pass tip read will reconcile to the newest
-        // branch before this worker moves on.
-        pending.remove(&request.sidechain);
+        let sidechain = request.instance.sidechain;
+        let instance_id = request.instance.sidechain_instance_id.clone();
+        if deferred_retry {
+            deferred.remove(&instance_id);
+        }
 
-        if refresh_target {
-            deferred.remove(&request.sidechain);
-            match snapshot::current_tip(&mut client).await {
-                Ok(current_tip) => request.target = current_tip,
-                Err(error) => {
-                    tracing::warn!(
-                        sidechain = request.sidechain,
-                        error = %format!("{error:#}"),
-                        "could not refresh a deferred backfill target; retrying later"
-                    );
-                    schedule_backfill_retry(&mut retries, &mut deferred, request, retry_interval);
-                    continue;
-                }
+        let current_instance = recorder
+            .store()
+            .current_sidechain_instance_id(sidechain)
+            .await
+            .with_context(|| format!("checking active history instance for slot {sidechain}"))?;
+        if current_instance.as_deref() != Some(instance_id.as_str()) {
+            if activations.get(&sidechain) == Some(&request.instance) {
+                activations.remove(&sidechain);
             }
+            tracing::info!(
+                sidechain,
+                instance = %instance_id,
+                "discarded history work for an inactive sidechain instance"
+            );
+            continue;
+        }
+
+        activations.insert(sidechain, request.instance.clone());
+        // A request for the active instance subsumes another queued target for
+        // that same instance: its post-pass tip read reconciles to the newest
+        // branch. Never discard a queued replacement-instance request.
+        if pending
+            .get(&sidechain)
+            .is_some_and(|queued| queued.instance == request.instance)
+        {
+            pending.remove(&sidechain);
         }
 
         let BackfillRequest {
-            sidechain,
-            activation_height,
+            instance,
             mut target,
         } = request;
         loop {
+            let requested_target = target.clone();
             let outcome = backfill::run(
                 &mut client,
                 &recorder,
-                sidechain,
-                activation_height,
+                &instance,
                 &target,
                 settings,
                 shutdown_rx.clone(),
@@ -461,7 +514,14 @@ async fn backfill_sidechains(
                     );
                     return Ok(());
                 }
-                backfill::Outcome::Deferred { .. } => {
+                backfill::Outcome::Superseded { .. } => {
+                    activations.remove(&sidechain);
+                    break;
+                }
+                backfill::Outcome::Deferred {
+                    target: deferred_target,
+                    ..
+                } => {
                     tracing::warn!(
                         sidechain,
                         retry_seconds = retry_interval.as_secs(),
@@ -471,15 +531,42 @@ async fn backfill_sidechains(
                         &mut retries,
                         &mut deferred,
                         BackfillRequest {
-                            sidechain,
-                            activation_height,
-                            target,
+                            instance: instance.clone(),
+                            target: deferred_target,
                         },
                         retry_interval,
                     );
                     break;
                 }
-                backfill::Outcome::UpToDate | backfill::Outcome::Completed { .. } => {}
+                backfill::Outcome::UpToDate {
+                    target: reached_target,
+                }
+                | backfill::Outcome::Completed {
+                    target: reached_target,
+                    ..
+                } => {
+                    if reached_target.hash != requested_target.hash {
+                        tracing::info!(
+                            sidechain,
+                            reached_target = %hex::encode(&reached_target.hash),
+                            requested_target = %hex::encode(&requested_target.hash),
+                            "completed a persisted history target; reconciling from the reached branch"
+                        );
+                    }
+                    target = reached_target;
+                }
+            }
+
+            let current_instance = recorder
+                .store()
+                .current_sidechain_instance_id(sidechain)
+                .await
+                .with_context(|| {
+                    format!("rechecking active history instance for slot {sidechain}")
+                })?;
+            if current_instance.as_deref() != Some(instance.sidechain_instance_id.as_str()) {
+                activations.remove(&sidechain);
+                break;
             }
 
             let current_tip = snapshot::current_tip(&mut client).await.with_context(|| {
@@ -501,26 +588,25 @@ async fn backfill_sidechains(
 
 fn schedule_backfill_retry(
     retries: &mut FuturesUnordered<DeferredBackfill>,
-    deferred: &mut BTreeSet<u8>,
+    deferred: &mut BTreeSet<String>,
     request: BackfillRequest,
     retry_interval: Duration,
 ) {
-    if deferred.insert(request.sidechain) {
+    if deferred.insert(request.instance.sidechain_instance_id.clone()) {
         retries.push(defer_backfill(request, retry_interval));
     }
 }
 
 fn queue_tip_reconciliations(
-    activations: &BTreeMap<u8, u32>,
+    activations: &BTreeMap<u8, SidechainInstanceRef>,
     pending: &mut BTreeMap<u8, BackfillRequest>,
     target: &ObservedBlock,
 ) {
-    for (&sidechain, &activation_height) in activations {
+    for (&sidechain, instance) in activations {
         pending.insert(
             sidechain,
             BackfillRequest {
-                sidechain,
-                activation_height,
+                instance: instance.clone(),
                 target: target.clone(),
             },
         );
@@ -534,34 +620,70 @@ fn defer_backfill(request: BackfillRequest, retry_interval: Duration) -> Deferre
     })
 }
 
-/// Slots to observe: the configured list, or the enforcer's active sidechains
-/// when none was configured.
-async fn resolve_sidechains(client: &mut EnforcerClient, configured: &[u8]) -> Result<Vec<u8>> {
-    if !configured.is_empty() {
-        return Ok(configured.to_vec());
+fn select_active_instances(
+    active: Vec<SidechainInstanceRef>,
+    configured: &[u8],
+) -> Result<Vec<SidechainInstanceRef>> {
+    let mut selected = BTreeMap::new();
+    for instance in active
+        .into_iter()
+        .filter(|instance| configured.is_empty() || configured.contains(&instance.sidechain))
+    {
+        if selected.insert(instance.sidechain, instance).is_some() {
+            bail!("active-sidechains snapshot contains a duplicate slot");
+        }
     }
+    Ok(selected.into_values().collect())
+}
 
-    let payload = convert::active_sidechains(client.get_sidechains().await?)?;
-    let mut discovered = state::active_slots(&payload)
-        .context("expected an active-sidechains snapshot while discovering slots")?;
-    discovered.sort_unstable();
-    discovered.dedup();
-
-    if discovered.is_empty() {
-        // Not an error: a network before any activation genuinely has none. It
-        // is still worth saying plainly, because the alternative reading is
-        // that the monitor is broken.
-        tracing::warn!(
-            "no sidechain is active and no slot was configured; \
-             recording chain state only"
-        );
-    } else {
-        tracing::info!(
-            sidechains = ?discovered,
-            "discovered the active sidechain slots"
+async fn prepare_stable_observation<C>(
+    client: &mut C,
+    configured: &[u8],
+) -> Result<(Vec<u8>, PreparedObservation<C::Stream>)>
+where
+    C: StartupSource,
+{
+    for lifecycle_attempt in 1..=SNAPSHOT_MAX_ATTEMPTS {
+        let expected = select_active_instances(
+            client
+                .active_instances()
+                .await
+                .context("reading active sidechains before opening subscriptions")?,
+            configured,
+        )?;
+        let sidechains = if configured.is_empty() {
+            expected.iter().map(|instance| instance.sidechain).collect()
+        } else {
+            configured.to_vec()
+        };
+        let subscription_slots = expected
+            .iter()
+            .map(|instance| instance.sidechain)
+            .collect::<Vec<_>>();
+        let observation = prepare_observation(client, &subscription_slots, &sidechains).await?;
+        let actual = select_active_instances(
+            active_instances_from_state(&observation.snapshot.state)?,
+            configured,
+        )?;
+        if actual == expected {
+            if sidechains.is_empty() {
+                tracing::warn!(
+                    "no sidechain is active and no slot was configured; recording chain state only"
+                );
+            } else if configured.is_empty() {
+                tracing::info!(
+                    sidechains = ?sidechains,
+                    "discovered the active sidechain slots"
+                );
+            }
+            return Ok((sidechains, observation));
+        }
+        tracing::debug!(
+            lifecycle_attempt,
+            "active sidechain identities changed while preparing subscriptions; retrying"
         );
     }
-    Ok(discovered)
+    bail!("active sidechain identities changed during every startup attempt")
 }
 
 async fn prepare_startup(args: &Args) -> Result<PreparedStartup> {
@@ -569,11 +691,7 @@ async fn prepare_startup(args: &Args) -> Result<PreparedStartup> {
         .await
         .context("connecting the enforcer client")?;
 
-    let sidechains = resolve_sidechains(&mut client, &args.sidechains)
-        .await
-        .context("resolving the sidechain slots to observe")?;
-
-    let observation = prepare_observation(&mut client, &sidechains)
+    let (sidechains, observation) = prepare_stable_observation(&mut client, &args.sidechains)
         .await
         .context("preparing enforcer subscriptions and initial snapshot")?;
     let PreparedObservation {
@@ -607,12 +725,13 @@ async fn prepare_startup(args: &Args) -> Result<PreparedStartup> {
 
 async fn prepare_observation<C>(
     client: &mut C,
+    subscription_slots: &[u8],
     sidechains: &[u8],
 ) -> Result<PreparedObservation<C::Stream>>
 where
     C: StartupSource,
 {
-    let subscriptions = sidechains.iter().copied().map(|sidechain| {
+    let subscriptions = subscription_slots.iter().copied().map(|sidechain| {
         let mut subscription_client = client.clone();
         async move {
             let stream = subscription_client
@@ -689,36 +808,56 @@ where
 #[allow(clippy::too_many_arguments)]
 async fn monitor_sidechains(
     streams: Vec<(u8, EventStream)>,
+    initial_instances: Vec<SidechainInstanceRef>,
     mut client: EnforcerClient,
     recorder: Recorder,
     block_tx: watch::Sender<Vec<u8>>,
-    sidechains_tx: watch::Sender<Vec<u8>>,
     backfill_tx: mpsc::Sender<BackfillRequest>,
+    configured_sidechains: Vec<u8>,
     discover_new_slots: bool,
-    discovery_interval: Duration,
+    mut sidechain_state_rx: watch::Receiver<u64>,
     tip_rx: watch::Receiver<ObservedBlock>,
     stream_stall_timeout: Duration,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> Result<()> {
-    let mut observed = streams
-        .iter()
-        .map(|(sidechain, _)| *sidechain)
-        .collect::<BTreeSet<_>>();
-    let mut workers = JoinSet::new();
-    for (sidechain, stream) in streams {
-        workers.spawn(monitor_sidechain(
-            stream,
-            recorder.clone(),
-            sidechain,
-            block_tx.clone(),
-            tip_rx.clone(),
-            stream_stall_timeout,
-            shutdown_rx.clone(),
-        ));
+    struct ManagedWorker {
+        instance: SidechainInstanceRef,
+        stop_tx: watch::Sender<bool>,
     }
 
-    if !discover_new_slots {
-        return supervise_workers(workers).await;
+    let configured = configured_sidechains.into_iter().collect::<BTreeSet<_>>();
+    let initial_instances = initial_instances
+        .into_iter()
+        .map(|instance| (instance.sidechain, instance))
+        .collect::<BTreeMap<_, _>>();
+    let mut managed = BTreeMap::<u8, ManagedWorker>::new();
+    let mut workers = JoinSet::new();
+    for (sidechain, stream) in streams {
+        let instance = initial_instances
+            .get(&sidechain)
+            .with_context(|| format!("initial stream for sidechain {sidechain} has no instance"))?
+            .clone();
+        let (stop_tx, stop_rx) = watch::channel(false);
+        let worker_instance = instance.clone();
+        let worker_recorder = recorder.clone();
+        let worker_block_tx = block_tx.clone();
+        let worker_tip_rx = current_tip_receiver(tip_rx.clone());
+        let worker_shutdown_rx = shutdown_rx.clone();
+        workers.spawn(async move {
+            let result = monitor_sidechain(
+                stream,
+                worker_recorder,
+                worker_instance.clone(),
+                worker_block_tx,
+                worker_tip_rx,
+                stream_stall_timeout,
+                stop_rx,
+                worker_shutdown_rx,
+            )
+            .await;
+            (worker_instance, result)
+        });
+        managed.insert(sidechain, ManagedWorker { instance, stop_tx });
     }
 
     loop {
@@ -730,12 +869,43 @@ async fn monitor_sidechains(
             }
             result = workers.join_next(), if !workers.is_empty() => {
                 match result {
-                    Some(Ok(Ok(()))) if *shutdown_rx.borrow() => continue,
-                    Some(Ok(Ok(()))) => {
-                        abort_and_drain(&mut workers).await;
-                        bail!("a sidechain event worker stopped unexpectedly");
+                    Some(Ok((instance, Ok(StreamExit::Stopped)))) => {
+                        if managed
+                            .get(&instance.sidechain)
+                            .is_some_and(|worker| worker.instance == instance)
+                        {
+                            managed.remove(&instance.sidechain);
+                        }
                     }
-                    Some(Ok(Err(error))) => {
+                    Some(Ok((_, Ok(StreamExit::Shutdown)))) if *shutdown_rx.borrow() => continue,
+                    Some(Ok((instance, Ok(StreamExit::Shutdown)))) => {
+                        if managed
+                            .get(&instance.sidechain)
+                            .is_none_or(|worker| worker.instance != instance)
+                        {
+                            tracing::debug!(
+                                sidechain = instance.sidechain,
+                                instance = %instance.sidechain_instance_id,
+                                "ignored shutdown from a retired sidechain worker"
+                            );
+                            continue;
+                        }
+                        abort_and_drain(&mut workers).await;
+                        bail!("sidechain {} event worker stopped unexpectedly", instance.sidechain);
+                    }
+                    Some(Ok((instance, Err(error)))) => {
+                        if managed
+                            .get(&instance.sidechain)
+                            .is_none_or(|worker| worker.instance != instance)
+                        {
+                            tracing::warn!(
+                                sidechain = instance.sidechain,
+                                instance = %instance.sidechain_instance_id,
+                                error = %format!("{error:#}"),
+                                "ignored failure from a retired sidechain worker"
+                            );
+                            continue;
+                        }
                         abort_and_drain(&mut workers).await;
                         return Err(error);
                     }
@@ -746,25 +916,48 @@ async fn monitor_sidechains(
                     None => {}
                 }
             }
-            () = tokio::time::sleep(discovery_interval) => {}
+            changed = sidechain_state_rx.changed() => {
+                if changed.is_err() {
+                    abort_and_drain(&mut workers).await;
+                    bail!("durable sidechain-state observer stopped unexpectedly");
+                }
+                sidechain_state_rx.borrow_and_update();
+            }
         }
 
-        let active = match client.get_sidechains().await.and_then(|response| {
-            let payload = convert::active_sidechains(response)?;
-            state::active_slot_activations(&payload)
-                .context("expected active-sidechains payload during slot discovery")?
-        }) {
-            Ok(active) => active,
-            Err(error) => {
-                tracing::warn!(
-                    error = %format!("{error:#}"),
-                    "could not refresh active sidechains; retrying discovery"
-                );
-                continue;
-            }
-        };
+        let active_instances = recorder
+            .store()
+            .current_sidechain_instances()
+            .await
+            .context("reading the durable active sidechain snapshot")?;
 
-        for (sidechain, activation_height) in unobserved_activations(&observed, active) {
+        let active = active_instances
+            .into_iter()
+            .filter(|instance| discover_new_slots || configured.contains(&instance.sidechain))
+            .map(|instance| (instance.sidechain, instance))
+            .collect::<BTreeMap<_, _>>();
+
+        let retired = managed
+            .iter()
+            .filter(|(slot, worker)| active.get(slot) != Some(&worker.instance))
+            .map(|(slot, worker)| (*slot, worker.instance.clone(), worker.stop_tx.clone()))
+            .collect::<Vec<_>>();
+        for (sidechain, instance, stop_tx) in retired {
+            let _ = stop_tx.send(true);
+            managed.remove(&sidechain);
+            tracing::info!(
+                sidechain,
+                instance = %instance.sidechain_instance_id,
+                "stopped observation for an inactive sidechain instance"
+            );
+        }
+
+        let additions = active
+            .into_values()
+            .filter(|instance| !managed.contains_key(&instance.sidechain))
+            .collect::<Vec<_>>();
+        for instance in additions {
+            let sidechain = instance.sidechain;
             // Subscribe before fixing the backfill target. Any later block is
             // either delivered live or included by the final reconciliation.
             let stream = client
@@ -774,59 +967,85 @@ async fn monitor_sidechains(
             let target = snapshot::current_tip(&mut client)
                 .await
                 .with_context(|| format!("anchoring newly active sidechain {sidechain}"))?;
-            workers.spawn(monitor_sidechain(
-                stream,
-                recorder.clone(),
+            let (stop_tx, stop_rx) = watch::channel(false);
+            let worker_instance = instance.clone();
+            let worker_recorder = recorder.clone();
+            let worker_block_tx = block_tx.clone();
+            let worker_tip_rx = current_tip_receiver(tip_rx.clone());
+            let worker_shutdown_rx = shutdown_rx.clone();
+            workers.spawn(async move {
+                let result = monitor_sidechain(
+                    stream,
+                    worker_recorder,
+                    worker_instance.clone(),
+                    worker_block_tx,
+                    worker_tip_rx,
+                    stream_stall_timeout,
+                    stop_rx,
+                    worker_shutdown_rx,
+                )
+                .await;
+                (worker_instance, result)
+            });
+            managed.insert(
                 sidechain,
-                block_tx.clone(),
-                tip_rx.clone(),
-                stream_stall_timeout,
-                shutdown_rx.clone(),
-            ));
-            observed.insert(sidechain);
-            let all_observed = observed.iter().copied().collect::<Vec<_>>();
-            let _ = sidechains_tx.send(all_observed);
+                ManagedWorker {
+                    instance: instance.clone(),
+                    stop_tx,
+                },
+            );
             backfill_tx
                 .send(BackfillRequest {
-                    sidechain,
-                    activation_height,
+                    instance: instance.clone(),
                     target: target.clone(),
                 })
                 .await
                 .context("queueing a newly active sidechain backfill")?;
-            let _ = block_tx.send(target.hash);
             tracing::info!(
                 sidechain,
-                activation_height,
+                activation_height = instance.activation_height,
+                instance = %instance.sidechain_instance_id,
                 "started observation and queued full history for a newly active sidechain"
             );
         }
     }
 }
 
-fn unobserved_activations(observed: &BTreeSet<u8>, active: Vec<(u8, u32)>) -> Vec<(u8, u32)> {
-    active
-        .into_iter()
-        .filter(|(sidechain, _)| !observed.contains(sidechain))
-        .collect()
-}
-
 fn snapshot_tips_are_consistent(tip_before: &[u8], snapshot_tip: &[u8], tip_after: &[u8]) -> bool {
     tip_before == snapshot_tip && snapshot_tip == tip_after
 }
 
+fn current_tip_receiver(
+    mut tip_rx: watch::Receiver<ObservedBlock>,
+) -> watch::Receiver<ObservedBlock> {
+    // Receiver::clone copies the parent's last-seen version. A slot discovered
+    // minutes later must not inherit tip movements from before its stream was
+    // subscribed.
+    tip_rx.borrow_and_update();
+    tip_rx
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StreamExit {
+    Shutdown,
+    Stopped,
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn monitor_sidechain(
     stream: EventStream,
     recorder: Recorder,
-    sidechain: u8,
+    instance: SidechainInstanceRef,
     block_tx: watch::Sender<Vec<u8>>,
     tip_rx: watch::Receiver<ObservedBlock>,
     stream_stall_timeout: Duration,
+    mut stop_rx: watch::Receiver<bool>,
     shutdown_rx: watch::Receiver<bool>,
-) -> Result<()> {
+) -> Result<StreamExit> {
+    let sidechain = instance.sidechain;
     tracing::info!(sidechain, "started sidechain event worker");
 
-    forward_stream(
+    let forwarding = forward_stream(
         sidechain,
         stream,
         tip_rx,
@@ -835,6 +1054,7 @@ async fn monitor_sidechain(
         move |event| {
             let recorder = recorder.clone();
             let block_tx = block_tx.clone();
+            let instance = instance.clone();
             async move {
                 log_published_event(sidechain, &event);
                 // Announced only after the record holds the event, so the block that
@@ -842,18 +1062,26 @@ async fn monitor_sidechain(
                 // refresh then anchors itself to the tip it reads, which under fast
                 // blocks can be a later one -- see `state::collect`.
                 recorder
-                    .record(event.clone())
+                    .record_for_instance(event.clone(), &instance)
                     .await
                     .with_context(|| format!("recording a live event for sidechain {sidechain}"))?;
                 announce_block(&block_tx, sidechain, &event);
                 Ok(())
             }
         },
-    )
-    .await?;
+    );
+    tokio::pin!(forwarding);
+    tokio::select! {
+        biased;
+        () = wait_for_shutdown(&mut stop_rx) => {
+            tracing::info!(sidechain, "stopped inactive sidechain event worker");
+            return Ok(StreamExit::Stopped);
+        }
+        result = &mut forwarding => result?,
+    }
 
     tracing::info!(sidechain, "stopped sidechain event worker");
-    Ok(())
+    Ok(StreamExit::Shutdown)
 }
 
 /// Report the block a published live event refers to, so the state worker can
@@ -897,6 +1125,8 @@ async fn monitor_tip(
         "started mainchain tip worker"
     );
 
+    let observation_recorder = recorder.clone();
+    let error_recorder = recorder;
     announce_tip_changes(
         client,
         interval,
@@ -904,8 +1134,8 @@ async fn monitor_tip(
         block_tx,
         tip_tx,
         shutdown_rx,
-        move |tip, previous, moved| {
-            let recorder = recorder.clone();
+        move |tip, previous, moved, recovered| {
+            let recorder = observation_recorder.clone();
             async move {
                 if moved {
                     recorder
@@ -917,11 +1147,27 @@ async fn monitor_tip(
                         )
                         .await
                         .context("recording a polled mainchain tip")
+                } else if recovered {
+                    if let Err(error) = recorder.clear_extractor_error().await {
+                        tracing::warn!(
+                            error = %format!("{error:#}"),
+                            "could not clear recovered extractor status"
+                        );
+                    }
+                    Ok(())
                 } else {
-                    recorder
-                        .record_tip_heartbeat(&tip)
-                        .await
-                        .context("recording a mainchain tip heartbeat")
+                    Ok(())
+                }
+            }
+        },
+        move |message| {
+            let recorder = error_recorder.clone();
+            async move {
+                if let Err(error) = recorder.record_extractor_error(&message).await {
+                    tracing::warn!(
+                        error = %format!("{error:#}"),
+                        "could not persist the tip-read error in extractor status"
+                    );
                 }
             }
         },
@@ -932,7 +1178,8 @@ async fn monitor_tip(
     Ok(())
 }
 
-async fn announce_tip_changes<S, O, F>(
+#[allow(clippy::too_many_arguments)]
+async fn announce_tip_changes<S, O, F, E, EF>(
     mut source: S,
     interval: Duration,
     heartbeat: Heartbeat,
@@ -940,12 +1187,16 @@ async fn announce_tip_changes<S, O, F>(
     tip_tx: watch::Sender<ObservedBlock>,
     mut shutdown_rx: watch::Receiver<bool>,
     mut observe: O,
+    mut report_error: E,
 ) -> Result<()>
 where
     S: TipSource,
-    O: FnMut(ObservedBlock, Option<ObservedBlock>, bool) -> F,
+    O: FnMut(ObservedBlock, Option<ObservedBlock>, bool, bool) -> F,
     F: Future<Output = Result<()>>,
+    E: FnMut(String) -> EF,
+    EF: Future<Output = ()>,
 {
+    let mut read_failed = false;
     loop {
         tokio::select! {
             biased;
@@ -957,7 +1208,8 @@ where
             Ok(tip) => {
                 let previous = tip_tx.borrow().clone();
                 let moved = previous.hash != tip.hash;
-                observe(tip.clone(), moved.then_some(previous), moved).await?;
+                let recovered = std::mem::take(&mut read_failed);
+                observe(tip.clone(), moved.then_some(previous), moved, recovered).await?;
 
                 // A read that succeeded is the proof the healthcheck wants: the
                 // process is scheduling and the enforcer is answering. A tip
@@ -982,30 +1234,41 @@ where
                     let _ = block_tx.send(tip.hash);
                 }
             }
-            Err(error) => tracing::warn!(
-                error = %format!("{error:#}"),
-                "could not read the mainchain tip; retrying on the next tick"
-            ),
+            Err(error) => {
+                let message = format!("{error:#}");
+                if !read_failed {
+                    report_error(message.clone()).await;
+                }
+                read_failed = true;
+                tracing::warn!(
+                    error = %message,
+                    "could not read the mainchain tip; retrying on the next tick"
+                );
+            }
         }
     }
 }
 
 /// Re-read the mutable enforcer state on every tip change and publish what
 /// changed.
+#[allow(clippy::too_many_arguments)]
 async fn monitor_state(
     client: EnforcerClient,
     recorder: Recorder,
-    sidechains_rx: watch::Receiver<Vec<u8>>,
+    sidechains: Vec<u8>,
+    discover_new_slots: bool,
     tracker: state::Tracker,
     snapshot_block: Vec<u8>,
     block_rx: watch::Receiver<Vec<u8>>,
+    sidechain_state_tx: watch::Sender<u64>,
     shutdown_rx: watch::Receiver<bool>,
 ) -> Result<()> {
     tracing::info!("started enforcer state worker");
 
     refresh_on_new_blocks(
         client,
-        sidechains_rx,
+        sidechains,
+        discover_new_slots,
         tracker,
         snapshot_block,
         block_rx,
@@ -1014,8 +1277,12 @@ async fn monitor_state(
               payloads: Vec<events::EnforcerEvent>,
               metadata: SnapshotMetadata| {
             let recorder = recorder.clone();
+            let sidechain_state_tx = sidechain_state_tx.clone();
             async move {
                 let published = payloads.len();
+                let active_sidechains_changed = payloads
+                    .iter()
+                    .any(|payload| state::active_instances(payload).is_some());
                 let events = payloads
                     .into_iter()
                     .map(|payload| {
@@ -1027,6 +1294,11 @@ async fn monitor_state(
                     .record_snapshot_batch(events, CaptureMethod::Poll, &metadata)
                     .await
                     .context("recording refreshed enforcer state")?;
+                if active_sidechains_changed {
+                    sidechain_state_tx.send_modify(|version| {
+                        *version = version.wrapping_add(1);
+                    });
+                }
                 tracing::info!(published, "published refreshed enforcer state");
                 Ok(())
             }
@@ -1038,9 +1310,11 @@ async fn monitor_state(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn refresh_on_new_blocks<S, P, F>(
     mut source: S,
-    sidechains_rx: watch::Receiver<Vec<u8>>,
+    sidechains: Vec<u8>,
+    discover_new_slots: bool,
     mut tracker: state::Tracker,
     snapshot_block: Vec<u8>,
     mut block_rx: watch::Receiver<Vec<u8>>,
@@ -1086,10 +1360,12 @@ where
         // silently skipping it would leave a gap that looks like "nothing
         // changed". The deployment restarts the extractor, which republishes the
         // whole snapshot.
-        let sidechains = sidechains_rx.borrow().clone();
-        let reading = source.collect_state(&sidechains).await.with_context(|| {
-            format!("refreshing enforcer state at block {}", hex::encode(&block))
-        })?;
+        let reading = source
+            .collect_state(&sidechains, discover_new_slots)
+            .await
+            .with_context(|| {
+                format!("refreshing enforcer state at block {}", hex::encode(&block))
+            })?;
         refreshed_at = block;
 
         let metadata = reading.metadata;
@@ -1220,7 +1496,7 @@ async fn supervise_workers(mut workers: JoinSet<Result<()>>) -> Result<()> {
     Ok(())
 }
 
-async fn abort_and_drain(workers: &mut JoinSet<Result<()>>) {
+async fn abort_and_drain<T: 'static>(workers: &mut JoinSet<T>) {
     workers.abort_all();
     while workers.join_next().await.is_some() {}
 }
@@ -1317,7 +1593,7 @@ fn log_published_event(sidechain: u8, event: &Event) {
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, BTreeSet, VecDeque};
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, SystemTime};
 
@@ -1325,15 +1601,16 @@ mod tests {
     use futures_util::{StreamExt, stream};
     use shared::protobuf::enforcer_extractor as events;
     use shared::protobuf::event::event::MonitorEvent;
-    use shared::store::{SnapshotConsistency, SnapshotMetadata};
+    use shared::store::{SidechainInstanceRef, SnapshotConsistency, SnapshotMetadata};
     use tokio::sync::{Notify, watch};
     use tokio::time::timeout;
 
     use super::{
         BackfillRequest, Heartbeat, SourceFuture, StartupSource, StateSource, TipSource,
-        announce_tip_changes, forward_stream, prepare_observation, queue_tip_reconciliations,
+        active_instances_for_slots, announce_tip_changes, current_tip_receiver, forward_stream,
+        prepare_observation, prepare_stable_observation, queue_tip_reconciliations,
         refresh_on_new_blocks, schedule_backfill_retry, snapshot_tips_are_consistent,
-        supervise_workers, unobserved_activations,
+        supervise_workers,
     };
     use crate::proto::{common, mainchain};
     use crate::snapshot::InitialSnapshot;
@@ -1356,18 +1633,54 @@ mod tests {
         ObservedBlock::at_height(vec![byte; 32], 996_259)
     }
 
+    fn instance(sidechain: u8, activation_height: u32) -> SidechainInstanceRef {
+        SidechainInstanceRef {
+            sidechain,
+            sidechain_instance_id: format!("instance-{sidechain}-{activation_height}"),
+            activation_height,
+        }
+    }
+
+    fn active_sidechains(slots: &[(u8, u32)]) -> events::EnforcerEvent {
+        events::EnforcerEvent {
+            event: Some(events::enforcer_event::Event::ActiveSidechains(
+                events::ActiveSidechainsSnapshot {
+                    sidechains: slots
+                        .iter()
+                        .map(|&(sidechain, activation_height)| events::ActiveSidechain {
+                            sidechain_number: u32::from(sidechain),
+                            raw_description: vec![sidechain; 32],
+                            proposal_height: 1,
+                            activation_height,
+                            ..Default::default()
+                        })
+                        .collect(),
+                },
+            )),
+        }
+    }
+
     #[test]
-    fn dynamic_discovery_returns_only_new_active_slots() {
-        let observed = [9_u8, 98].into_iter().collect();
+    fn configured_slots_resolve_to_their_exact_active_instances() {
+        let state = vec![active_sidechains(&[
+            (9, 987_402),
+            (98, 987_402),
+            (130, 996_485),
+        ])];
+        let instances = active_instances_for_slots(&state, &[9, 130]).expect("active instances");
+
         assert_eq!(
-            unobserved_activations(&observed, vec![(9, 987_402), (98, 987_402), (130, 996_485)]),
-            vec![(130, 996_485)]
+            instances
+                .iter()
+                .map(|instance| (instance.sidechain, instance.activation_height))
+                .collect::<Vec<_>>(),
+            vec![(9, 987_402), (130, 996_485)]
         );
     }
 
     #[test]
     fn a_tip_change_queues_the_latest_target_for_every_known_slot() {
-        let activations = BTreeMap::from([(9, 987_402), (98, 987_402)]);
+        let activations = BTreeMap::from([(9, instance(9, 987_402)), (98, instance(98, 987_402))]);
         let mut pending = BTreeMap::new();
 
         queue_tip_reconciliations(&activations, &mut pending, &observed_tip(0x22));
@@ -1375,8 +1688,8 @@ mod tests {
 
         assert_eq!(pending.len(), 2, "tip updates coalesce by sidechain");
         for (sidechain, request) in pending {
-            assert_eq!(request.sidechain, sidechain);
-            assert_eq!(request.activation_height, 987_402);
+            assert_eq!(request.instance.sidechain, sidechain);
+            assert_eq!(request.instance.activation_height, 987_402);
             assert_eq!(request.target, observed_tip(0x33));
         }
     }
@@ -1386,8 +1699,7 @@ mod tests {
         let mut retries = futures_util::stream::FuturesUnordered::new();
         let mut deferred = BTreeSet::new();
         let request = BackfillRequest {
-            sidechain: 9,
-            activation_height: 987_402,
+            instance: instance(9, 987_402),
             target: observed_tip(0x22),
         };
 
@@ -1400,7 +1712,7 @@ mod tests {
         schedule_backfill_retry(&mut retries, &mut deferred, request, Duration::from_secs(1));
 
         assert_eq!(retries.len(), 1);
-        assert_eq!(deferred, BTreeSet::from([9]));
+        assert_eq!(deferred, BTreeSet::from(["instance-9-987402".to_owned()]));
     }
 
     fn disconnected(byte: u8) -> mainchain::SubscribeEventsResponse {
@@ -1467,12 +1779,30 @@ mod tests {
         calls: Arc<Mutex<Vec<String>>>,
         tips: Arc<Mutex<VecDeque<Vec<u8>>>>,
         snapshot_tip: Vec<u8>,
+        active: Arc<Mutex<VecDeque<Vec<SidechainInstanceRef>>>>,
+        snapshot_states: Arc<Mutex<VecDeque<Vec<events::EnforcerEvent>>>>,
     }
 
     impl StartupSource for FakeStartupSource {
         type Stream = futures_util::stream::Pending<
             std::result::Result<mainchain::SubscribeEventsResponse, tonic::Status>,
         >;
+
+        fn active_instances(&mut self) -> SourceFuture<'_, Vec<SidechainInstanceRef>> {
+            let calls = Arc::clone(&self.calls);
+            let active = Arc::clone(&self.active);
+            Box::pin(async move {
+                calls
+                    .lock()
+                    .expect("startup call lock")
+                    .push("active".to_owned());
+                active
+                    .lock()
+                    .expect("active instance lock")
+                    .pop_front()
+                    .context("configured fake active instances")
+            })
+        }
 
         fn subscribe_events(&mut self, sidechain: u8) -> SourceFuture<'_, Self::Stream> {
             let calls = Arc::clone(&self.calls);
@@ -1509,6 +1839,7 @@ mod tests {
         ) -> SourceFuture<'a, InitialSnapshot> {
             let calls = Arc::clone(&self.calls);
             let snapshot_tip = self.snapshot_tip.clone();
+            let snapshot_states = Arc::clone(&self.snapshot_states);
             Box::pin(async move {
                 calls
                     .lock()
@@ -1516,7 +1847,11 @@ mod tests {
                     .push("snapshot".to_owned());
                 Ok(InitialSnapshot {
                     constants: Vec::new(),
-                    state: Vec::new(),
+                    state: snapshot_states
+                        .lock()
+                        .expect("snapshot state lock")
+                        .pop_front()
+                        .context("configured fake snapshot state")?,
                     anchor: ObservedBlock::at_height(snapshot_tip, 996_259),
                 })
             })
@@ -1545,6 +1880,7 @@ mod tests {
         fn collect_state<'a>(
             &'a mut self,
             _sidechains: &'a [u8],
+            _discover_new_slots: bool,
         ) -> SourceFuture<'a, state::Reading> {
             let collections = Arc::clone(&self.collections);
             let calls = Arc::clone(&self.calls);
@@ -1586,9 +1922,11 @@ mod tests {
             calls: Arc::clone(&calls),
             tips: Arc::new(Mutex::new(VecDeque::from([vec![0x11; 32], vec![0x11; 32]]))),
             snapshot_tip: vec![0x11; 32],
+            active: Arc::new(Mutex::new(VecDeque::new())),
+            snapshot_states: Arc::new(Mutex::new(VecDeque::from([Vec::new()]))),
         };
 
-        let observation = prepare_observation(&mut source, &[9, 98])
+        let observation = prepare_observation(&mut source, &[9, 98], &[9, 98])
             .await
             .expect("prepared observation");
 
@@ -1622,6 +1960,90 @@ mod tests {
         );
         assert!(tip_positions[0] < snapshot_position);
         assert!(snapshot_position < tip_positions[1]);
+    }
+
+    #[tokio::test]
+    async fn explicitly_configured_inactive_slots_wait_without_a_subscription() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let snapshot_state = vec![active_sidechains(&[])];
+        let active = state::active_instances(&snapshot_state[0])
+            .expect("active-sidechains payload")
+            .expect("valid active instance");
+        let mut source = FakeStartupSource {
+            calls: Arc::clone(&calls),
+            tips: Arc::new(Mutex::new(VecDeque::from([vec![0x11; 32], vec![0x11; 32]]))),
+            snapshot_tip: vec![0x11; 32],
+            active: Arc::new(Mutex::new(VecDeque::from([active]))),
+            snapshot_states: Arc::new(Mutex::new(VecDeque::from([snapshot_state]))),
+        };
+
+        let (desired, observation) = prepare_stable_observation(&mut source, &[9, 98])
+            .await
+            .expect("inactive configured slots are allowed");
+
+        assert_eq!(desired, vec![9, 98]);
+        assert_eq!(
+            observation
+                .streams
+                .iter()
+                .map(|(sidechain, _)| *sidechain)
+                .collect::<Vec<_>>(),
+            Vec::<u8>::new()
+        );
+        let calls = calls.lock().expect("startup call lock");
+        assert!(!calls.iter().any(|call| call == "subscribe:9"));
+        assert!(!calls.iter().any(|call| call == "subscribe:98"));
+    }
+
+    #[tokio::test]
+    async fn automatic_startup_retries_when_the_active_set_changes() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let first_state = active_sidechains(&[(9, 987_402)]);
+        let stable_state = active_sidechains(&[(9, 987_402), (98, 987_500)]);
+        let first_active = state::active_instances(&first_state)
+            .expect("active-sidechains payload")
+            .expect("valid first active set");
+        let stable_active = state::active_instances(&stable_state)
+            .expect("active-sidechains payload")
+            .expect("valid stable active set");
+        let mut source = FakeStartupSource {
+            calls: Arc::clone(&calls),
+            tips: Arc::new(Mutex::new(VecDeque::from([
+                vec![0x11; 32],
+                vec![0x11; 32],
+                vec![0x11; 32],
+                vec![0x11; 32],
+            ]))),
+            snapshot_tip: vec![0x11; 32],
+            active: Arc::new(Mutex::new(VecDeque::from([first_active, stable_active]))),
+            snapshot_states: Arc::new(Mutex::new(VecDeque::from([
+                vec![stable_state.clone()],
+                vec![stable_state],
+            ]))),
+        };
+
+        let (desired, observation) = prepare_stable_observation(&mut source, &[])
+            .await
+            .expect("startup converges on the stable active set");
+
+        assert_eq!(desired, vec![9, 98]);
+        assert_eq!(
+            observation
+                .streams
+                .iter()
+                .map(|(sidechain, _)| *sidechain)
+                .collect::<Vec<_>>(),
+            vec![9, 98]
+        );
+        assert_eq!(
+            calls
+                .lock()
+                .expect("startup call lock")
+                .iter()
+                .filter(|call| call.as_str() == "active")
+                .count(),
+            2
+        );
     }
 
     #[test]
@@ -1711,6 +2133,35 @@ mod tests {
             .await
             .expect("worker reacts to changed notification")
             .expect("join worker")
+            .expect("clean worker shutdown");
+    }
+
+    #[tokio::test]
+    async fn a_new_stream_ignores_tip_changes_from_before_its_subscription() {
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (tip_tx, tip_rx) = watch::channel(observed_tip(0x11));
+        tip_tx.send(observed_tip(0x22)).expect("advance old tip");
+        tip_tx
+            .send(observed_tip(0x33))
+            .expect("advance old tip again");
+        let tip_rx = current_tip_receiver(tip_rx.clone());
+        let stream = stream::pending::<Result<mainchain::SubscribeEventsResponse, tonic::Status>>();
+        let mut worker = tokio::spawn(forward_stream(
+            9,
+            stream,
+            tip_rx,
+            Duration::from_millis(10),
+            shutdown_rx,
+            |_event| async { Ok(()) },
+        ));
+
+        timeout(Duration::from_millis(40), &mut worker)
+            .await
+            .expect_err("old tip versions must not arm the watchdog");
+        shutdown_tx.send(true).expect("send shutdown");
+        worker
+            .await
+            .expect("join stream worker")
             .expect("clean worker shutdown");
     }
 
@@ -1853,7 +2304,8 @@ mod tests {
 
         let worker = tokio::spawn(refresh_on_new_blocks(
             source,
-            watch::channel(vec![9]).1,
+            vec![9],
+            false,
             state::Tracker::new(vec![ctip_payload(9, 100)]),
             snapshot_tip,
             block_rx,
@@ -1903,7 +2355,8 @@ mod tests {
 
         let worker = tokio::spawn(refresh_on_new_blocks(
             source,
-            watch::channel(vec![9]).1,
+            vec![9],
+            false,
             state::Tracker::new(vec![ctip_payload(9, 100)]),
             snapshot_tip.clone(),
             block_rx,
@@ -1966,7 +2419,8 @@ mod tests {
 
         let worker = tokio::spawn(refresh_on_new_blocks(
             FakeStateSource::new(Vec::new()),
-            watch::channel(vec![9]).1,
+            vec![9],
+            false,
             state::Tracker::new(Vec::new()),
             vec![0x11; 32],
             block_rx,
@@ -1992,7 +2446,8 @@ mod tests {
         let worker = tokio::spawn(refresh_on_new_blocks(
             // No scripted collection: the fake reports a failure.
             FakeStateSource::new(Vec::new()),
-            watch::channel(vec![9]).1,
+            vec![9],
+            false,
             state::Tracker::new(Vec::new()),
             vec![0x11; 32],
             block_rx,
@@ -2108,7 +2563,8 @@ mod tests {
             block_tx,
             tip_tx,
             shutdown_rx,
-            |_tip, _previous, _moved| async { Ok(()) },
+            |_tip, _previous, _moved, _recovered| async { Ok(()) },
+            |_error| async {},
         ));
 
         timeout(Duration::from_secs(5), block_rx.changed())
@@ -2157,6 +2613,8 @@ mod tests {
         let (tip_tx, _tip_rx) = watch::channel(observed_tip(0x11));
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let liveness = temporary_liveness_path("failed-tip");
+        let reported_errors = Arc::new(AtomicUsize::new(0));
+        let error_counter = Arc::clone(&reported_errors);
         let mut worker = tokio::spawn(announce_tip_changes(
             FailingTipSource,
             TEST_TIP_INTERVAL,
@@ -2164,7 +2622,11 @@ mod tests {
             block_tx,
             tip_tx,
             shutdown_rx,
-            |_tip, _previous, _moved| async { Ok(()) },
+            |_tip, _previous, _moved, _recovered| async { Ok(()) },
+            move |_error| {
+                error_counter.fetch_add(1, Ordering::SeqCst);
+                async {}
+            },
         ));
 
         // A poll is not a record write, so a failure waits for the next tick
@@ -2175,6 +2637,11 @@ mod tests {
         assert!(
             !liveness.exists(),
             "an extractor that cannot read the tip must not report itself healthy"
+        );
+        assert_eq!(
+            reported_errors.load(Ordering::SeqCst),
+            1,
+            "one failing streak is reported once instead of writing on every tick"
         );
 
         shutdown_tx.send(true).expect("send shutdown");
@@ -2196,7 +2663,8 @@ mod tests {
 
         let worker = tokio::spawn(refresh_on_new_blocks(
             FakeStateSource::new(Vec::new()),
-            watch::channel(Vec::new()).1,
+            Vec::new(),
+            true,
             state::Tracker::new(Vec::new()),
             vec![0x11; 32],
             block_rx,

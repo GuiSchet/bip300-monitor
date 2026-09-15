@@ -72,7 +72,9 @@ cargo run -p enforcer-extractor -- \
   --nats-url nats://127.0.0.1:4222
 ```
 
-Use `--sidechain 9,98` to monitor an explicit fixed set. All options also have
+Use `--sidechain 9,98` to select an explicit fixed set. A configured slot may
+be inactive at startup; the extractor keeps running and begins its stream and
+full-history recovery when that slot becomes active. All options also have
 `BIP300_MONITOR_*` environment-variable equivalents shown by `--help`.
 
 Inspect live events with:

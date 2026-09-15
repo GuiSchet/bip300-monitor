@@ -1,26 +1,25 @@
-//! Bounded, resumable recovery of blocks observed before the extractor started.
+//! Shared bounded, resumable historical-walk engine.
 //!
-//! `GetBlockInfo` is unary and returns a bounded ancestor prefix in one message.
-//! A total-history request would therefore make both the enforcer and this
-//! process allocate the whole result. This module walks backwards in small
-//! pages, commits each page with its cursor, and never publishes historical
-//! rows to NATS.
+//! Both the slot block stream and the global BIP300-delta stream walk the same
+//! newest-first cursor. Stream adapters supply only the RPC fetch and header
+//! accessor; persistence, retry, reorg, and shutdown semantics live here once.
 
+use std::future::Future;
+use std::pin::Pin;
 use std::time::Duration;
 
 use anyhow::{Context, Error, Result, bail};
 use shared::protobuf::enforcer_extractor as events;
 use shared::protobuf::event::{Event, ObservedBlock};
 use shared::recorder::Recorder;
-use shared::store::{HistoryCoverage, HistoryPage, HistoryStatus};
+use shared::store::{HistoryCoverage, HistoryPage, HistoryStatus, SidechainInstanceRef};
 use tokio::sync::watch;
 use tonic::Code;
 
 use crate::EnforcerClient;
 use crate::convert;
 use crate::event::envelope;
-use crate::proto::mainchain;
-use crate::state;
+use crate::snapshot;
 
 const HISTORY_STREAM: &str = "block";
 
@@ -30,45 +29,145 @@ pub(crate) struct Settings {
     pub(crate) page_pause: Duration,
 }
 
-/// Result of one pass toward a fixed tip.
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) enum Outcome {
-    UpToDate,
-    Completed { blocks: usize, pages: usize },
-    Deferred { blocks: usize, pages: usize },
-    Interrupted { blocks: usize, pages: usize },
+    UpToDate {
+        target: ObservedBlock,
+    },
+    Completed {
+        target: ObservedBlock,
+        blocks: usize,
+        pages: usize,
+    },
+    Deferred {
+        target: ObservedBlock,
+        blocks: usize,
+        pages: usize,
+    },
+    Superseded {
+        target: ObservedBlock,
+        blocks: usize,
+        pages: usize,
+    },
+    Interrupted {
+        target: ObservedBlock,
+        blocks: usize,
+        pages: usize,
+    },
 }
 
-enum PageFetch {
-    Found(mainchain::GetBlockInfoResponse),
-    Unavailable(Error),
+pub(crate) struct HistoryScope<'a> {
+    pub(crate) stream: &'static str,
+    pub(crate) sidechain: Option<u8>,
+    pub(crate) sidechain_instance_id: Option<&'a str>,
+    pub(crate) activation_height: u32,
+}
+
+type FetchFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<Vec<events::EnforcerEvent>>> + Send + 'a>>;
+
+/// The two operations that differ between historical streams.
+pub(crate) trait HistoryStream {
+    fn scope(&self) -> HistoryScope<'_>;
+
+    fn fetch<'a>(
+        &'a self,
+        client: &'a mut EnforcerClient,
+        cursor: &'a ObservedBlock,
+        requested: u32,
+    ) -> FetchFuture<'a>;
+
+    fn header<'a>(&self, payload: &'a events::EnforcerEvent) -> Result<&'a events::BlockHeader>;
+
+    fn unavailable_error(&self, error: &Error) -> bool {
+        error_has_code(error, Code::NotFound)
+    }
+
+    fn inconclusive_probe_error(&self, error: &Error) -> bool {
+        retryable_page_error(error)
+    }
+}
+
+struct BlockHistory<'a> {
+    instance: &'a SidechainInstanceRef,
+}
+
+impl HistoryStream for BlockHistory<'_> {
+    fn scope(&self) -> HistoryScope<'_> {
+        HistoryScope {
+            stream: HISTORY_STREAM,
+            sidechain: Some(self.instance.sidechain),
+            sidechain_instance_id: Some(&self.instance.sidechain_instance_id),
+            activation_height: self.instance.activation_height,
+        }
+    }
+
+    fn fetch<'a>(
+        &'a self,
+        client: &'a mut EnforcerClient,
+        cursor: &'a ObservedBlock,
+        requested: u32,
+    ) -> FetchFuture<'a> {
+        Box::pin(async move {
+            let response = client
+                .get_block_info(
+                    hex::encode(&cursor.hash),
+                    self.instance.sidechain,
+                    Some(requested - 1),
+                )
+                .await?;
+            convert::block_info(self.instance.sidechain, response)
+        })
+    }
+
+    fn header<'a>(&self, payload: &'a events::EnforcerEvent) -> Result<&'a events::BlockHeader> {
+        connected_header(payload)
+    }
 }
 
 /// Recover one slot from its activation height through `tip`.
-///
-/// A cursor already in `history_coverage` wins over `tip`, so a restart first
-/// finishes the exact branch/page it had begun. The caller then reads the
-/// current tip and invokes this again to reconcile blocks that arrived while
-/// the earlier target was being filled.
 pub(crate) async fn run(
     client: &mut EnforcerClient,
     recorder: &Recorder,
-    sidechain: u8,
-    activation_height: u32,
+    instance: &SidechainInstanceRef,
+    tip: &ObservedBlock,
+    settings: Settings,
+    shutdown_rx: watch::Receiver<bool>,
+) -> Result<Outcome> {
+    run_history(
+        client,
+        recorder,
+        &BlockHistory { instance },
+        tip,
+        settings,
+        shutdown_rx,
+    )
+    .await
+}
+
+/// Run the common newest-first historical cursor for one stream adapter.
+pub(crate) async fn run_history<S: HistoryStream>(
+    client: &mut EnforcerClient,
+    recorder: &Recorder,
+    stream: &S,
     tip: &ObservedBlock,
     settings: Settings,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> Result<Outcome> {
-    let Some(mut progress) = prepare_cycle(
-        recorder,
-        sidechain,
-        activation_height,
-        tip,
-        settings.page_blocks,
-    )
-    .await?
+    let scope = stream.scope();
+    if !scope_is_current(recorder, &scope).await? {
+        mark_superseded(recorder, &scope).await?;
+        return Ok(Outcome::Superseded {
+            target: tip.clone(),
+            blocks: 0,
+            pages: 0,
+        });
+    }
+    let Some(mut progress) = prepare_cycle(recorder, &scope, tip, settings.page_blocks).await?
     else {
-        return Ok(Outcome::UpToDate);
+        return Ok(Outcome::UpToDate {
+            target: tip.clone(),
+        });
     };
 
     let mut blocks = 0_usize;
@@ -77,99 +176,172 @@ pub(crate) async fn run(
 
     loop {
         if *shutdown_rx.borrow() {
-            return Ok(Outcome::Interrupted { blocks, pages });
+            return Ok(Outcome::Interrupted {
+                target: progress.target_tip.clone(),
+                blocks,
+                pages,
+            });
+        }
+        if !scope_is_current(recorder, &scope).await? {
+            mark_superseded(recorder, &scope).await?;
+            return Ok(Outcome::Superseded {
+                target: progress.target_tip.clone(),
+                blocks,
+                pages,
+            });
         }
 
         let cursor = progress
             .next
             .clone()
             .context("a running history cursor is missing its next block")?;
-        let cursor_height = cursor
-            .height
-            .context("a running history cursor is missing its height")?;
+        let cursor_height = required_height(&cursor, "history cursor")?;
         let remaining = blocks_through_floor(cursor_height, progress.floor_height)?;
         let requested = u32::try_from(remaining.min(u64::from(progress.effective_page_blocks)))
             .expect("a page size fits in a u32");
 
-        let fetch = match client
-            .get_block_info(hex::encode(&cursor.hash), sidechain, Some(requested - 1))
-            .await
-        {
-            Ok(response) => classify_page_fetch(response, &cursor),
-            Err(error) if error_has_code(&error, Code::NotFound) => PageFetch::Unavailable(error),
+        enum Page {
+            Found(Vec<events::EnforcerEvent>),
+            Unavailable(Error),
+        }
+        let page = match stream.fetch(client, &cursor, requested).await {
+            Ok(payloads) if payloads.is_empty() => Page::Unavailable(anyhow::anyhow!(
+                "history cursor {} was not found",
+                hex::encode(&cursor.hash)
+            )),
+            Ok(payloads) => Page::Found(payloads),
+            Err(error) if stream.unavailable_error(&error) => Page::Unavailable(error),
             Err(error) if retryable_page_error(&error) && progress.effective_page_blocks > 1 => {
-                let reduced = (progress.effective_page_blocks / 2).max(1);
+                let previous_page_blocks = progress.effective_page_blocks;
+                let reduced = (previous_page_blocks / 2).max(1);
                 let message = format!("{error:#}");
-                recorder
+                if let Err(resize_error) = recorder
                     .store()
-                    .resize_history_page(HISTORY_STREAM, Some(sidechain), reduced, &message)
+                    .resize_history_page(
+                        scope.stream,
+                        scope.sidechain,
+                        scope.sidechain_instance_id,
+                        reduced,
+                        &message,
+                    )
                     .await
-                    .context("persisting the reduced history page size")?;
+                {
+                    return settle_failure(
+                        recorder,
+                        &scope,
+                        resize_error.context("persisting the reduced history page size"),
+                        &progress.target_tip,
+                        blocks,
+                        pages,
+                        FailureMode::Fatal,
+                    )
+                    .await;
+                }
+                progress.effective_page_blocks = reduced;
                 tracing::warn!(
-                    sidechain,
-                    previous_page_blocks = progress.effective_page_blocks,
+                    stream = scope.stream,
+                    sidechain = ?scope.sidechain,
+                    previous_page_blocks,
                     effective_page_blocks = reduced,
                     error = %message,
-                    "history request was too large; retrying the same cursor with a smaller page"
+                    "history request was too large; retrying the same cursor"
                 );
-                progress.effective_page_blocks = reduced;
                 continue;
             }
             Err(error) => {
-                return fail(recorder, sidechain, error)
-                    .await
-                    .context("requesting a historical block page");
+                return settle_failure(
+                    recorder,
+                    &scope,
+                    error,
+                    &progress.target_tip,
+                    blocks,
+                    pages,
+                    FailureMode::Fatal,
+                )
+                .await;
             }
         };
 
-        let response = match fetch {
-            PageFetch::Found(response) => response,
-            PageFetch::Unavailable(error) => {
-                let current_tip = current_tip(client)
+        let payloads = match page {
+            Page::Found(payloads) => payloads,
+            Page::Unavailable(error) => {
+                let current_tip = snapshot::current_tip(client)
                     .await
-                    .context("recovering from an unavailable historical cursor")?;
-                if current_tip.hash == progress.target_tip.hash {
-                    defer(recorder, sidechain, &error).await?;
+                    .context("reading the current tip after an unavailable history cursor")?;
+                let target_availability = if current_tip.hash == progress.target_tip.hash {
+                    Some(true)
+                } else {
+                    match target_is_available(stream, client, &progress.target_tip).await {
+                        Ok(availability) => availability,
+                        Err(probe_error) => {
+                            tracing::warn!(
+                                stream = scope.stream,
+                                sidechain = ?scope.sidechain,
+                                error = %format!("{probe_error:#}"),
+                                "could not classify the persisted target; preserving its cursor"
+                            );
+                            None
+                        }
+                    }
+                };
+                let replacement =
+                    replacement_target(&current_tip, &progress.target_tip, target_availability);
+                if let Some(current_tip) = replacement {
                     tracing::warn!(
-                        sidechain,
+                        stream = scope.stream,
+                        sidechain = ?scope.sidechain,
                         unavailable_cursor = %hex::encode(&cursor.hash),
-                        target = %hex::encode(&progress.target_tip.hash),
-                        "historical cursor is unavailable at the unchanged target; deferring this slot"
+                        previous_target = %hex::encode(&progress.target_tip.hash),
+                        current_target = %hex::encode(&current_tip.hash),
+                        "historical target left the available branch; restarting from activation"
                     );
-                    return Ok(Outcome::Deferred { blocks, pages });
+                    progress = begin_full_cycle(
+                        recorder,
+                        &scope,
+                        &current_tip,
+                        progress.effective_page_blocks,
+                    )
+                    .await?;
+                    restarted_from_activation = true;
+                    continue;
                 }
-                tracing::warn!(
-                    sidechain,
-                    unavailable_cursor = %hex::encode(&cursor.hash),
-                    previous_target = %hex::encode(&progress.target_tip.hash),
-                    current_target = %hex::encode(&current_tip.hash),
-                    "historical cursor left the available branch; restarting this slot from activation"
-                );
-                progress = begin_full_cycle(
+
+                let outcome = settle_failure(
                     recorder,
-                    sidechain,
-                    activation_height,
-                    &current_tip,
-                    progress.effective_page_blocks,
+                    &scope,
+                    error,
+                    &progress.target_tip,
+                    blocks,
+                    pages,
+                    FailureMode::Deferred,
                 )
                 .await?;
-                restarted_from_activation = true;
-                continue;
+                if matches!(outcome, Outcome::Deferred { .. }) {
+                    tracing::warn!(
+                        stream = scope.stream,
+                        sidechain = ?scope.sidechain,
+                        unavailable_cursor = %hex::encode(&cursor.hash),
+                        target = %hex::encode(&progress.target_tip.hash),
+                        "historical cursor is unavailable; preserving its exact target for retry"
+                    );
+                }
+                return Ok(outcome);
             }
         };
 
-        let payloads = match convert::block_info(sidechain, response)
-            .and_then(|payloads| verify_page(&payloads, &cursor, requested).map(|()| payloads))
-        {
-            Ok(payloads) => payloads,
-            Err(error) => {
-                return fail(recorder, sidechain, error)
-                    .await
-                    .context("validating a historical block page");
-            }
-        };
-
-        let oldest = connected_header(
+        if let Err(error) = verify_page_with(stream, &payloads, &cursor, requested) {
+            return settle_failure(
+                recorder,
+                &scope,
+                error.context("validating a historical page"),
+                &progress.target_tip,
+                blocks,
+                pages,
+                FailureMode::Fatal,
+            )
+            .await;
+        }
+        let oldest = stream.header(
             payloads
                 .last()
                 .context("a verified historical page is not empty")?,
@@ -177,30 +349,34 @@ pub(crate) async fn run(
         let returned = u32::try_from(payloads.len()).expect("a page length fits in a u32");
         let completes_cycle = u64::from(returned) == remaining;
 
-        // Extending a previous continuous range is valid only if this branch
-        // actually reaches its covered tip. A mismatch is a reorg: replay the
-        // complete canonical history from activation instead of claiming a
-        // joined range that does not exist.
         if completes_cycle
             && let Some(floor_hash) = progress.floor_hash.as_deref()
             && oldest.previous_hash != floor_hash
         {
             if restarted_from_activation {
-                let error = anyhow::anyhow!(
-                    "history branch still failed to reach its floor after restarting from activation"
-                );
-                return fail(recorder, sidechain, error).await;
+                return settle_failure(
+                    recorder,
+                    &scope,
+                    anyhow::anyhow!(
+                        "history branch still failed to reach its floor after restarting from activation"
+                    ),
+                    &progress.target_tip,
+                    blocks,
+                    pages,
+                    FailureMode::Fatal,
+                )
+                .await;
             }
             tracing::warn!(
-                sidechain,
+                stream = scope.stream,
+                sidechain = ?scope.sidechain,
                 expected_floor_hash = %hex::encode(floor_hash),
                 actual_floor_hash = %hex::encode(&oldest.previous_hash),
-                "covered tip is not an ancestor of the target; restarting this slot from activation"
+                "covered tip is not an ancestor of the target; restarting from activation"
             );
             progress = begin_full_cycle(
                 recorder,
-                sidechain,
-                activation_height,
+                &scope,
                 &progress.target_tip,
                 progress.effective_page_blocks,
             )
@@ -220,14 +396,15 @@ pub(crate) async fn run(
                     .context("a non-final history page cannot end at genesis")?,
             ))
         };
-        let events = historical_events(payloads)?;
+        let events = historical_events(stream, payloads)?;
         let inserted = match recorder
             .store()
             .record_history_page(
                 &events,
                 HistoryPage {
-                    stream: HISTORY_STREAM,
-                    sidechain: Some(sidechain),
+                    stream: scope.stream,
+                    sidechain: scope.sidechain,
+                    sidechain_instance_id: scope.sidechain_instance_id,
                     expected_next: &cursor,
                     next: next.as_ref(),
                 },
@@ -236,9 +413,16 @@ pub(crate) async fn run(
         {
             Ok(inserted) => inserted,
             Err(error) => {
-                return fail(recorder, sidechain, error)
-                    .await
-                    .context("recording a historical block page");
+                return settle_failure(
+                    recorder,
+                    &scope,
+                    error.context("recording a historical page"),
+                    &progress.target_tip,
+                    blocks,
+                    pages,
+                    FailureMode::Fatal,
+                )
+                .await;
             }
         };
 
@@ -247,7 +431,8 @@ pub(crate) async fn run(
         progress.rows_recorded += inserted;
         progress.next = next;
         tracing::debug!(
-            sidechain,
+            stream = scope.stream,
+            sidechain = ?scope.sidechain,
             pages,
             blocks,
             inserted,
@@ -255,27 +440,36 @@ pub(crate) async fn run(
             returned,
             cursor_height,
             target_height = ?progress.target_tip.height,
-            "committed a historical block page"
+            "committed a historical page"
         );
 
         if progress.next.is_none() {
             tracing::info!(
-                sidechain,
+                stream = scope.stream,
+                sidechain = ?scope.sidechain,
                 pages,
                 blocks,
                 rows_recorded = progress.rows_recorded,
-                start_height = activation_height,
+                start_height = scope.activation_height,
                 target_height = ?progress.target_tip.height,
-                "completed contiguous block history"
+                "completed contiguous history"
             );
-            return Ok(Outcome::Completed { blocks, pages });
+            return Ok(Outcome::Completed {
+                target: progress.target_tip.clone(),
+                blocks,
+                pages,
+            });
         }
 
         if !settings.page_pause.is_zero() {
             tokio::select! {
                 biased;
                 () = wait_for_shutdown(&mut shutdown_rx) => {
-                    return Ok(Outcome::Interrupted { blocks, pages });
+                    return Ok(Outcome::Interrupted {
+                        target: progress.target_tip.clone(),
+                        blocks,
+                        pages,
+                    });
                 }
                 () = tokio::time::sleep(settings.page_pause) => {}
             }
@@ -283,78 +477,47 @@ pub(crate) async fn run(
     }
 }
 
-fn classify_page_fetch(
-    response: mainchain::GetBlockInfoResponse,
-    cursor: &ObservedBlock,
-) -> PageFetch {
-    if response.infos.is_empty() {
-        PageFetch::Unavailable(anyhow::anyhow!(
-            "historical cursor {} was not found",
-            hex::encode(&cursor.hash)
-        ))
-    } else {
-        PageFetch::Found(response)
-    }
-}
-
 async fn prepare_cycle(
     recorder: &Recorder,
-    sidechain: u8,
-    activation_height: u32,
+    scope: &HistoryScope<'_>,
     tip: &ObservedBlock,
     configured_page_blocks: u32,
 ) -> Result<Option<HistoryCoverage>> {
-    let tip_height = tip.height.context("backfill target tip has no height")?;
-    if tip_height < activation_height {
+    let tip_height = required_height(tip, "history target")?;
+    if tip_height < scope.activation_height {
         bail!(
-            "sidechain {sidechain} activates at {activation_height}, after target tip {tip_height}"
+            "history stream {} starts at {}, after target tip {tip_height}",
+            scope.stream,
+            scope.activation_height
         );
     }
-
     let existing = recorder
         .store()
-        .history_coverage(HISTORY_STREAM, Some(sidechain))
+        .history_coverage(scope.stream, scope.sidechain, scope.sidechain_instance_id)
         .await
-        .with_context(|| format!("reading block history coverage for sidechain {sidechain}"))?;
+        .with_context(|| format!("reading {} history coverage", scope.stream))?;
     let Some(existing) = existing else {
-        return begin_full_cycle(
-            recorder,
-            sidechain,
-            activation_height,
-            tip,
-            configured_page_blocks,
-        )
-        .await
-        .map(Some);
+        return begin_full_cycle(recorder, scope, tip, configured_page_blocks)
+            .await
+            .map(Some);
     };
-
-    if existing.coverage_start_height != activation_height {
+    if existing.coverage_start_height != scope.activation_height {
         bail!(
-            "sidechain {sidechain} history starts at {}, but the enforcer now reports activation at {activation_height}",
-            existing.coverage_start_height
+            "history stream {} starts at {}, expected {}",
+            scope.stream,
+            existing.coverage_start_height,
+            scope.activation_height
         );
     }
 
     match existing.status {
         HistoryStatus::Running => Ok(Some(existing)),
-        HistoryStatus::Error if existing.target_tip.hash != tip.hash => {
-            tracing::warn!(
-                sidechain,
-                failed_target = %hex::encode(&existing.target_tip.hash),
-                current_target = %hex::encode(&tip.hash),
-                "failed history target is stale; restarting this slot from activation"
-            );
-            let page_blocks = existing.effective_page_blocks.min(configured_page_blocks);
-            begin_full_cycle(recorder, sidechain, activation_height, tip, page_blocks)
-                .await
-                .map(Some)
-        }
-        HistoryStatus::Error => {
+        HistoryStatus::Error | HistoryStatus::Superseded => {
             recorder
                 .store()
-                .resume_history(HISTORY_STREAM, Some(sidechain))
+                .resume_history(scope.stream, scope.sidechain, scope.sidechain_instance_id)
                 .await
-                .with_context(|| format!("resuming block history for sidechain {sidechain}"))?;
+                .with_context(|| format!("resuming {} history", scope.stream))?;
             let mut resumed = existing;
             resumed.status = HistoryStatus::Running;
             resumed.last_error = None;
@@ -368,15 +531,15 @@ async fn prepare_cycle(
             if covered.hash == tip.hash {
                 return Ok(None);
             }
-
             let page_blocks = existing.effective_page_blocks.min(configured_page_blocks);
-            if tip_height > covered.height.context("covered tip has no height")? {
+            if tip_height > required_height(&covered, "covered history tip")? {
                 recorder
                     .store()
                     .begin_history_cycle(
-                        HISTORY_STREAM,
-                        Some(sidechain),
-                        activation_height,
+                        scope.stream,
+                        scope.sidechain,
+                        scope.sidechain_instance_id,
+                        scope.activation_height,
                         Some(&covered),
                         tip,
                         Some(&covered.hash),
@@ -384,11 +547,10 @@ async fn prepare_cycle(
                         page_blocks,
                     )
                     .await
-                    .with_context(|| format!("extending block history for sidechain {sidechain}"))
+                    .with_context(|| format!("extending {} history", scope.stream))
                     .map(Some)
             } else {
-                // Same/lower height with another hash is necessarily a reorg.
-                begin_full_cycle(recorder, sidechain, activation_height, tip, page_blocks)
+                begin_full_cycle(recorder, scope, tip, page_blocks)
                     .await
                     .map(Some)
             }
@@ -398,69 +560,131 @@ async fn prepare_cycle(
 
 async fn begin_full_cycle(
     recorder: &Recorder,
-    sidechain: u8,
-    activation_height: u32,
+    scope: &HistoryScope<'_>,
     tip: &ObservedBlock,
     page_blocks: u32,
 ) -> Result<HistoryCoverage> {
     recorder
         .store()
         .begin_history_cycle(
-            HISTORY_STREAM,
-            Some(sidechain),
-            activation_height,
+            scope.stream,
+            scope.sidechain,
+            scope.sidechain_instance_id,
+            scope.activation_height,
             None,
             tip,
             None,
-            activation_height.checked_sub(1),
+            scope.activation_height.checked_sub(1),
             page_blocks,
         )
         .await
-        .with_context(|| format!("starting full block history for sidechain {sidechain}"))
+        .with_context(|| format!("starting full {} history", scope.stream))
+}
+
+async fn target_is_available<S: HistoryStream>(
+    stream: &S,
+    client: &mut EnforcerClient,
+    target: &ObservedBlock,
+) -> Result<Option<bool>> {
+    match stream.fetch(client, target, 1).await {
+        Ok(payloads) => Ok(Some(!payloads.is_empty())),
+        Err(error) if stream.inconclusive_probe_error(&error) => Ok(None),
+        Err(error) if stream.unavailable_error(&error) => Ok(Some(false)),
+        Err(error) => Err(error).context("probing the persisted history target"),
+    }
+}
+
+fn replacement_target(
+    current_tip: &ObservedBlock,
+    persisted_target: &ObservedBlock,
+    target_availability: Option<bool>,
+) -> Option<ObservedBlock> {
+    (current_tip.hash != persisted_target.hash && target_availability == Some(false))
+        .then(|| current_tip.clone())
+}
+
+async fn scope_is_current(recorder: &Recorder, scope: &HistoryScope<'_>) -> Result<bool> {
+    let (Some(sidechain), Some(instance_id)) = (scope.sidechain, scope.sidechain_instance_id)
+    else {
+        return Ok(true);
+    };
+    Ok(recorder
+        .store()
+        .current_sidechain_instance_id(sidechain)
+        .await?
+        .as_deref()
+        == Some(instance_id))
+}
+
+async fn mark_superseded(recorder: &Recorder, scope: &HistoryScope<'_>) -> Result<()> {
+    let (Some(sidechain), Some(instance_id)) = (scope.sidechain, scope.sidechain_instance_id)
+    else {
+        return Ok(());
+    };
+    recorder
+        .store()
+        .supersede_history(
+            scope.stream,
+            sidechain,
+            instance_id,
+            "sidechain instance is no longer active",
+        )
+        .await
+}
+
+fn historical_events<S: HistoryStream>(
+    stream: &S,
+    mut payloads: Vec<events::EnforcerEvent>,
+) -> Result<Vec<Event>> {
+    payloads.reverse();
+    payloads
+        .into_iter()
+        .map(|payload| {
+            let header = stream.header(&payload)?;
+            let anchor = ObservedBlock::at_height(header.hash.clone(), header.height);
+            envelope(payload, anchor)
+        })
+        .collect()
+}
+
+fn required_height(block: &ObservedBlock, name: &str) -> Result<u32> {
+    block
+        .height
+        .with_context(|| format!("{name} has no height"))
 }
 
 fn blocks_through_floor(cursor_height: u32, floor_height: Option<u32>) -> Result<u64> {
     match floor_height {
-        Some(floor_height) => {
-            let blocks = cursor_height.checked_sub(floor_height).with_context(|| {
+        Some(floor_height) => cursor_height
+            .checked_sub(floor_height)
+            .filter(|blocks| *blocks > 0)
+            .map(u64::from)
+            .with_context(|| {
                 format!(
-                    "history cursor {cursor_height} is below its exclusive floor {floor_height}"
+                    "history cursor {cursor_height} is not above its exclusive floor {floor_height}"
                 )
-            })?;
-            if blocks == 0 {
-                bail!("history cursor is already at its exclusive floor {floor_height}");
-            }
-            Ok(u64::from(blocks))
-        }
+            }),
         None => Ok(u64::from(cursor_height) + 1),
     }
 }
 
-/// Validate a bounded newest-first page before any of it is recorded.
-pub(crate) fn verify_page(
+pub(crate) fn verify_page_with<S: HistoryStream>(
+    stream: &S,
     payloads: &[events::EnforcerEvent],
     cursor: &ObservedBlock,
     requested: u32,
 ) -> Result<()> {
-    if requested == 0 {
-        bail!("a historical page must request at least one block");
+    if requested == 0 || payloads.is_empty() {
+        bail!("a historical page must request and return at least one block");
     }
-    if payloads.is_empty() {
-        bail!("a requested historical page cannot be empty");
-    }
-    let maximum = requested as usize;
-    if payloads.len() > maximum {
+    if payloads.len() > requested as usize {
         bail!(
-            "historical page requested at most {maximum} blocks but returned {}",
+            "historical page requested at most {requested} blocks but returned {}",
             payloads.len()
         );
     }
-    let cursor_height = cursor.height.context("history page cursor has no height")?;
-    let newest = connected_header(
-        payloads
-            .first()
-            .expect("an empty historical page was rejected"),
-    )?;
+    let cursor_height = required_height(cursor, "history page cursor")?;
+    let newest = stream.header(&payloads[0])?;
     if newest.hash != cursor.hash || newest.height != cursor_height {
         bail!(
             "historical page begins at {} height {}, expected {} height {}",
@@ -470,10 +694,9 @@ pub(crate) fn verify_page(
             cursor_height
         );
     }
-
     for pair in payloads.windows(2) {
-        let newer = connected_header(&pair[0])?;
-        let older = connected_header(&pair[1])?;
+        let newer = stream.header(&pair[0])?;
+        let older = stream.header(&pair[1])?;
         if newer.previous_hash != older.hash || newer.height != older.height.saturating_add(1) {
             bail!(
                 "historical page breaks between heights {} and {}",
@@ -482,8 +705,11 @@ pub(crate) fn verify_page(
             );
         }
     }
-
-    let oldest = connected_header(payloads.last().expect("non-empty page"))?;
+    let oldest = stream.header(
+        payloads
+            .last()
+            .expect("an empty historical page was rejected"),
+    )?;
     let returned = u32::try_from(payloads.len()).expect("a page length fits in a u32");
     let expected_oldest = cursor_height
         .checked_sub(returned - 1)
@@ -497,6 +723,77 @@ pub(crate) fn verify_page(
     Ok(())
 }
 
+pub(crate) fn retryable_page_error(error: &Error) -> bool {
+    error_has_code(error, Code::DeadlineExceeded) || error_has_code(error, Code::ResourceExhausted)
+}
+
+pub(crate) fn error_has_code(error: &Error, code: Code) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<tonic::Status>()
+            .is_some_and(|status| status.code() == code)
+    })
+}
+
+#[derive(Clone, Copy)]
+enum FailureMode {
+    Fatal,
+    Deferred,
+}
+
+async fn settle_failure(
+    recorder: &Recorder,
+    scope: &HistoryScope<'_>,
+    error: Error,
+    target: &ObservedBlock,
+    blocks: usize,
+    pages: usize,
+    mode: FailureMode,
+) -> Result<Outcome> {
+    let message = format!("{error:#}");
+    let status = match recorder
+        .store()
+        .settle_history_failure(
+            scope.stream,
+            scope.sidechain,
+            scope.sidechain_instance_id,
+            &message,
+        )
+        .await
+    {
+        Ok(status) => status,
+        Err(mark_error) => {
+            return Err(error).context(format!(
+                "also failed to settle the history error in Postgres: {mark_error:#}"
+            ));
+        }
+    };
+    match (status, mode) {
+        (HistoryStatus::Superseded, _) => Ok(Outcome::Superseded {
+            target: target.clone(),
+            blocks,
+            pages,
+        }),
+        (HistoryStatus::Error, FailureMode::Deferred) => Ok(Outcome::Deferred {
+            target: target.clone(),
+            blocks,
+            pages,
+        }),
+        (HistoryStatus::Error, FailureMode::Fatal) => Err(error),
+        (status, _) => Err(error).context(format!(
+            "history failure settled to unexpected status {status:?}"
+        )),
+    }
+}
+
+async fn wait_for_shutdown(shutdown_rx: &mut watch::Receiver<bool>) {
+    loop {
+        if *shutdown_rx.borrow() || shutdown_rx.changed().await.is_err() {
+            return;
+        }
+    }
+}
+
 fn connected_header(payload: &events::EnforcerEvent) -> Result<&events::BlockHeader> {
     let Some(events::enforcer_event::Event::BlockConnected(block)) = payload.event.as_ref() else {
         bail!("a historical block carried an unexpected payload");
@@ -507,82 +804,17 @@ fn connected_header(payload: &events::EnforcerEvent) -> Result<&events::BlockHea
         .context("a historical connected block is missing its header")
 }
 
-fn historical_events(mut payloads: Vec<events::EnforcerEvent>) -> Result<Vec<Event>> {
-    // The RPC is newest-first; durable reads and the original live stream are
-    // easier to reason about in chain order.
-    payloads.reverse();
-    payloads
-        .into_iter()
-        .map(|payload| {
-            let anchor = state::block_anchor(&payload)?;
-            envelope(payload, anchor)
-        })
-        .collect()
-}
-
-fn retryable_page_error(error: &Error) -> bool {
-    error_has_code(error, Code::DeadlineExceeded) || error_has_code(error, Code::ResourceExhausted)
-}
-
-fn error_has_code(error: &Error, code: Code) -> bool {
-    error.chain().any(|cause| {
-        cause
-            .downcast_ref::<tonic::Status>()
-            .is_some_and(|status| status.code() == code)
-    })
-}
-
-async fn current_tip(client: &mut EnforcerClient) -> Result<ObservedBlock> {
-    let payload = convert::chain_tip(client.get_chain_tip().await?)?;
-    state::tip_anchor(&payload)
-}
-
-async fn fail<T>(recorder: &Recorder, sidechain: u8, error: Error) -> Result<T> {
-    let message = format!("{error:#}");
-    if let Err(mark_error) = recorder
-        .store()
-        .fail_history(HISTORY_STREAM, Some(sidechain), &message)
-        .await
-    {
-        return Err(error).context(format!(
-            "also failed to preserve the history error in Postgres: {mark_error:#}"
-        ));
-    }
-    Err(error)
-}
-
-async fn defer(recorder: &Recorder, sidechain: u8, error: &Error) -> Result<()> {
-    let message = format!("{error:#}");
-    recorder
-        .store()
-        .fail_history(HISTORY_STREAM, Some(sidechain), &message)
-        .await
-        .context("preserving the deferred history error in Postgres")
-}
-
-async fn wait_for_shutdown(shutdown_rx: &mut watch::Receiver<bool>) {
-    loop {
-        if *shutdown_rx.borrow() {
-            return;
-        }
-        if shutdown_rx.changed().await.is_err() {
-            return;
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use shared::protobuf::enforcer_extractor as events;
     use shared::protobuf::event::ObservedBlock;
-
+    use shared::store::SidechainInstanceRef;
     use tonic::Code;
 
     use super::{
-        PageFetch, blocks_through_floor, classify_page_fetch, error_has_code, retryable_page_error,
-        verify_page,
+        BlockHistory, blocks_through_floor, error_has_code, replacement_target,
+        retryable_page_error, verify_page_with,
     };
-    use crate::proto::mainchain;
 
     fn recovered(hash: u8, previous_hash: u8, height: u32) -> events::EnforcerEvent {
         events::EnforcerEvent {
@@ -603,73 +835,65 @@ mod tests {
         }
     }
 
+    fn stream_instance() -> SidechainInstanceRef {
+        SidechainInstanceRef {
+            sidechain: 9,
+            sidechain_instance_id: "test-instance".to_owned(),
+            activation_height: 101,
+        }
+    }
+
     #[test]
-    fn page_is_exact_and_contiguous_newest_first() {
+    fn historical_pages_are_exact_and_contiguous() {
+        let instance = stream_instance();
+        let stream = BlockHistory {
+            instance: &instance,
+        };
+        let cursor = ObservedBlock::at_height(vec![0x14; 32], 104);
         let payloads = vec![
             recovered(0x14, 0x13, 104),
             recovered(0x13, 0x12, 103),
             recovered(0x12, 0x11, 102),
         ];
-        verify_page(&payloads, &ObservedBlock::at_height(vec![0x14; 32], 104), 3)
-            .expect("valid page");
+        verify_page_with(&stream, &payloads, &cursor, 3).expect("valid page");
+        assert!(verify_page_with(&stream, &payloads, &cursor, 2).is_err());
+        assert!(
+            verify_page_with(
+                &stream,
+                &[recovered(0x14, 0xaa, 104), recovered(0x13, 0x12, 103)],
+                &cursor,
+                2,
+            )
+            .is_err()
+        );
     }
 
     #[test]
-    fn an_empty_success_response_is_an_unavailable_cursor() {
-        let cursor = ObservedBlock::at_height(vec![0x14; 32], 104);
-        assert!(matches!(
-            classify_page_fetch(mainchain::GetBlockInfoResponse::default(), &cursor),
-            PageFetch::Unavailable(_)
-        ));
-
-        let response = mainchain::GetBlockInfoResponse {
-            infos: vec![mainchain::get_block_info_response::Info::default()],
-        };
-        assert!(matches!(
-            classify_page_fetch(response, &cursor),
-            PageFetch::Found(_)
-        ));
-    }
-
-    #[test]
-    fn short_pages_are_accepted_but_empty_oversized_or_broken_pages_are_rejected() {
-        let cursor = ObservedBlock::at_height(vec![0x14; 32], 104);
-        let short = vec![recovered(0x14, 0x13, 104)];
-        verify_page(&short, &cursor, 2).expect("a short contiguous page is valid");
-
-        assert!(verify_page(&[], &cursor, 2).is_err());
-
-        let oversized = vec![recovered(0x14, 0x13, 104), recovered(0x13, 0x12, 103)];
-        assert!(verify_page(&oversized, &cursor, 1).is_err());
-
-        let broken = vec![recovered(0x14, 0xaa, 104), recovered(0x13, 0x12, 103)];
-        assert!(verify_page(&broken, &cursor, 2).is_err());
-    }
-
-    #[test]
-    fn page_must_begin_at_the_requested_cursor() {
-        let payloads = vec![recovered(0x14, 0x13, 104)];
-        assert!(verify_page(&payloads, &ObservedBlock::at_height(vec![0x99; 32], 104), 1).is_err());
-    }
-
-    #[test]
-    fn floor_is_exclusive_and_genesis_can_be_included() {
-        assert_eq!(blocks_through_floor(104, Some(100)).expect("gap"), 4);
-        assert_eq!(blocks_through_floor(0, None).expect("genesis"), 1);
+    fn floor_ranges_are_exclusive_and_never_empty() {
+        assert_eq!(blocks_through_floor(104, Some(100)).unwrap(), 4);
         assert!(blocks_through_floor(100, Some(100)).is_err());
-        assert!(blocks_through_floor(99, Some(100)).is_err());
+        assert_eq!(blocks_through_floor(0, None).unwrap(), 1);
     }
 
     #[test]
-    fn grpc_errors_are_classified_without_losing_their_context() {
-        let exhausted = anyhow::Error::new(tonic::Status::resource_exhausted("large page"))
-            .context("request failed");
-        assert!(retryable_page_error(&exhausted));
-        assert!(!error_has_code(&exhausted, Code::NotFound));
+    fn grpc_retry_classification_walks_anyhow_context() {
+        let deadline =
+            anyhow::Error::new(tonic::Status::deadline_exceeded("slow")).context("requesting page");
+        assert!(retryable_page_error(&deadline));
+        assert!(error_has_code(&deadline, Code::DeadlineExceeded));
+        assert!(!error_has_code(&deadline, Code::NotFound));
+    }
 
-        let missing = anyhow::Error::new(tonic::Status::not_found("orphaned cursor"))
-            .context("request failed");
-        assert!(error_has_code(&missing, Code::NotFound));
-        assert!(!retryable_page_error(&missing));
+    #[test]
+    fn a_moved_tip_does_not_replace_a_valid_or_inconclusive_retry_target() {
+        let persisted = ObservedBlock::at_height(vec![0x11; 32], 100);
+        let current = ObservedBlock::at_height(vec![0x22; 32], 101);
+
+        assert_eq!(replacement_target(&current, &persisted, Some(true)), None);
+        assert_eq!(replacement_target(&current, &persisted, None), None);
+        assert_eq!(
+            replacement_target(&current, &persisted, Some(false)),
+            Some(current)
+        );
     }
 }

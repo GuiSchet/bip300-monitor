@@ -16,7 +16,9 @@ use anyhow::{Context, Result};
 use crate::nats::{EventPublisher, NatsArgs};
 use crate::nats_subjects::Subject;
 use crate::protobuf::event::{Event, ObservedBlock};
-use crate::store::{CaptureMethod, DatasetManifest, PostgresArgs, SnapshotMetadata, Store};
+use crate::store::{
+    CaptureMethod, DatasetManifest, PostgresArgs, SidechainInstanceRef, SnapshotMetadata, Store,
+};
 use std::time::SystemTime;
 
 /// Writes observed events to the record and fans them out to live consumers.
@@ -30,10 +32,9 @@ pub struct Recorder {
 impl Recorder {
     /// Connect to the record and to the live transport.
     ///
-    /// The record is connected first: without somewhere to store observations
-    /// there is no point holding a publisher open. Only the record has to be
-    /// reachable — the publisher reconnects in the background — so a NATS
-    /// outage degrades the live fan-out instead of stopping the extractor.
+    /// The publisher is validated first so malformed NATS configuration cannot
+    /// leave a durable extractor run behind. An unreachable NATS server still
+    /// yields a reconnecting client, so an outage degrades only live fan-out.
     pub async fn connect(
         postgres: &PostgresArgs,
         nats: &NatsArgs,
@@ -61,12 +62,12 @@ impl Recorder {
         client_name: &'static str,
         manifest: DatasetManifest,
     ) -> Result<Self> {
-        let store = Store::connect_with_manifest(postgres, source, manifest)
-            .await
-            .context("connecting the event record")?;
         let publisher = EventPublisher::connect(nats, client_name)
             .await
             .context("connecting the live event publisher")?;
+        let store = Store::connect_with_manifest(postgres, source, manifest)
+            .await
+            .context("connecting the event record")?;
 
         Ok(Self {
             store,
@@ -78,6 +79,29 @@ impl Recorder {
     /// Record one event and fan it out.
     pub async fn record(&self, event: Event) -> Result<()> {
         self.record_batch(vec![event]).await
+    }
+
+    /// Record an event against the exact activation whose stream supplied it.
+    pub async fn record_for_instance(
+        &self,
+        event: Event,
+        instance: &SidechainInstanceRef,
+    ) -> Result<()> {
+        let events = [event];
+        let recorded = self
+            .store
+            .record_with_method_for_instance(&events, CaptureMethod::Live, instance)
+            .await
+            .context("recording an instance-scoped event")?;
+        if recorded == 0 {
+            tracing::debug!(
+                sidechain = instance.sidechain,
+                instance = %instance.sidechain_instance_id,
+                "the instance-scoped event fact was already recorded"
+            );
+        }
+        self.fan_out(&events).await;
+        Ok(())
     }
 
     /// Record a batch of events in one transaction, then fan them out.
@@ -154,9 +178,14 @@ impl Recorder {
             .await
     }
 
-    /// Refresh extractor health after an unchanged successful tip read.
-    pub async fn record_tip_heartbeat(&self, tip: &ObservedBlock) -> Result<()> {
-        self.store.record_tip_heartbeat(tip).await
+    /// Persist a best-effort operational error for status consumers.
+    pub async fn record_extractor_error(&self, error: &str) -> Result<()> {
+        self.store.record_extractor_error(error).await
+    }
+
+    /// Clear a best-effort operational error after the source recovers.
+    pub async fn clear_extractor_error(&self) -> Result<()> {
+        self.store.clear_extractor_error().await
     }
 
     /// Mark the current extractor run as cleanly finished or failed.
