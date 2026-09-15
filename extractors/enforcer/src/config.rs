@@ -7,7 +7,7 @@ use anyhow::{Result, bail};
 use clap::Parser;
 use shared::logging::LogLevel;
 use shared::nats::NatsArgs;
-use shared::store::PostgresArgs;
+use shared::store::{DatasetManifest, PostgresArgs};
 
 /// Runtime configuration for the enforcer extractor.
 #[derive(Clone, Parser)]
@@ -20,6 +20,38 @@ pub struct Args {
     /// Postgres connection settings for the authoritative record.
     #[command(flatten)]
     pub postgres: PostgresArgs,
+
+    /// Stable network identifier attached to every durable observation.
+    #[arg(long, env = "BIP300_MONITOR_NETWORK_ID", default_value = "development")]
+    pub network_id: String,
+
+    /// BIP300 activation height defining this dataset.
+    #[arg(long, env = "BIP300_MONITOR_ACTIVATION_HEIGHT", default_value_t = 0)]
+    pub activation_height: u32,
+
+    /// Exact activation block hash defining this dataset.
+    #[arg(
+        long,
+        env = "BIP300_MONITOR_ACTIVATION_BLOCK_HASH",
+        default_value = "unknown"
+    )]
+    pub activation_block_hash: String,
+
+    /// Exact node source commit used by this deployment.
+    #[arg(long, env = "BIP300_MONITOR_NODE_COMMIT", default_value = "unknown")]
+    pub node_commit: String,
+
+    /// Exact enforcer source commit used by this deployment.
+    #[arg(
+        long,
+        env = "BIP300_MONITOR_ENFORCER_COMMIT",
+        default_value = "unknown"
+    )]
+    pub enforcer_commit: String,
+
+    /// Exact monitor source commit used to build this extractor.
+    #[arg(long, env = "BIP300_MONITOR_MONITOR_COMMIT", default_value = "unknown")]
+    pub monitor_commit: String,
 
     /// Default log level when RUST_LOG does not provide a filter.
     #[arg(
@@ -91,6 +123,18 @@ pub struct Args {
     )]
     pub tip_poll_interval_seconds: u64,
 
+    /// Maximum time a live event stream may remain silent after the tip moves.
+    ///
+    /// This is deliberately separate from the unary RPC timeout: historical
+    /// requests and HTTP/2 scheduling can legitimately delay stream frames.
+    #[arg(
+        long,
+        env = "BIP300_MONITOR_STREAM_STALL_TIMEOUT_SECONDS",
+        default_value_t = 60,
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
+    pub stream_stall_timeout_seconds: u64,
+
     /// File whose modification time is refreshed on every successful tip read.
     ///
     /// The extractor exposes no port, so a container healthcheck has nothing to
@@ -136,6 +180,13 @@ impl Args {
                 self.nats.nats_flush_timeout_seconds
             );
         }
+        if self.stream_stall_timeout_seconds < self.tip_poll_interval_seconds {
+            bail!(
+                "stream stall timeout ({}s) must be at least the tip poll interval ({}s)",
+                self.stream_stall_timeout_seconds,
+                self.tip_poll_interval_seconds
+            );
+        }
 
         let mut unique = HashSet::with_capacity(self.sidechains.len());
         for sidechain in &self.sidechains {
@@ -143,6 +194,7 @@ impl Args {
                 bail!("sidechain slot {sidechain} was configured more than once");
             }
         }
+        validate_identity(self)?;
         Ok(())
     }
 
@@ -156,6 +208,11 @@ impl Args {
         Duration::from_secs(self.tip_poll_interval_seconds)
     }
 
+    /// Return the live event-stream stall timeout.
+    pub const fn stream_stall_timeout(&self) -> Duration {
+        Duration::from_secs(self.stream_stall_timeout_seconds)
+    }
+
     /// Return the configured pause between historical pages.
     pub const fn backfill_page_pause(&self) -> Duration {
         Duration::from_millis(self.backfill_page_pause_ms)
@@ -165,6 +222,63 @@ impl Args {
     pub const fn shutdown_timeout(&self) -> Duration {
         Duration::from_secs(self.shutdown_timeout_seconds)
     }
+
+    /// Build the durable dataset/run manifest stored with observations.
+    pub fn dataset_manifest(&self) -> DatasetManifest {
+        DatasetManifest {
+            network_id: self.network_id.clone(),
+            activation_height: self.activation_height,
+            activation_block_hash: self.activation_block_hash.clone(),
+            node_commit: self.node_commit.clone(),
+            enforcer_commit: self.enforcer_commit.clone(),
+            monitor_commit: self.monitor_commit.clone(),
+            event_contract_version: shared::protobuf::enforcer_extractor::EVENT_CONTRACT_VERSION,
+            capabilities: serde_json::json!([
+                "event_facts",
+                "event_observations",
+                "tip_observations",
+                "snapshot_consistency",
+                "extractor_status",
+                "resumable_sidechain_history",
+                "resumable_global_bip300_history",
+                "raw_bip300_coinbase_scripts",
+                "resolved_m1_m8_deltas",
+                "treasury_transitions"
+            ]),
+            creation_reason: "pre-Drivechain Pulse L1 observation dataset".to_owned(),
+        }
+    }
+}
+
+fn validate_identity(args: &Args) -> Result<()> {
+    if args.network_id.is_empty()
+        || !args
+            .network_id
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+    {
+        bail!("network id must contain only lowercase ASCII letters, digits, or hyphens");
+    }
+
+    let production_identity = args.activation_height != 0
+        || args.activation_block_hash != "unknown"
+        || args.node_commit != "unknown"
+        || args.enforcer_commit != "unknown"
+        || args.monitor_commit != "unknown";
+    if production_identity {
+        validate_hex(&args.activation_block_hash, 64, "activation block hash")?;
+        validate_hex(&args.node_commit, 40, "node commit")?;
+        validate_hex(&args.enforcer_commit, 40, "enforcer commit")?;
+        validate_hex(&args.monitor_commit, 40, "monitor commit")?;
+    }
+    Ok(())
+}
+
+fn validate_hex(value: &str, length: usize, name: &str) -> Result<()> {
+    if value.len() != length || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        bail!("{name} must contain exactly {length} hexadecimal characters");
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -190,6 +304,7 @@ mod tests {
         assert_eq!(args.nats.nats_url, "nats://nats:4222");
         assert_eq!(args.log_level, LogLevel::Info);
         assert_eq!(args.request_timeout_seconds, 10);
+        assert_eq!(args.stream_stall_timeout_seconds, 60);
         assert_eq!(args.backfill_page_blocks, 128);
         assert_eq!(args.backfill_page_pause_ms, 100);
         assert_eq!(args.nats.nats_flush_timeout_seconds, 10);
@@ -231,6 +346,20 @@ mod tests {
                     .contains("must be greater than the NATS flush timeout")
             );
         }
+    }
+
+    #[test]
+    fn validates_the_stream_stall_and_tip_poll_relationship() {
+        let invalid = Args::try_parse_from([
+            "enforcer-extractor",
+            "--tip-poll-interval-seconds",
+            "30",
+            "--stream-stall-timeout-seconds",
+            "29",
+        ])
+        .expect("syntactically valid arguments");
+
+        assert!(invalid.validate().is_err());
     }
 
     #[test]

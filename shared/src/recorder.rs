@@ -15,8 +15,11 @@ use anyhow::{Context, Result};
 
 use crate::nats::{EventPublisher, NatsArgs};
 use crate::nats_subjects::Subject;
-use crate::protobuf::event::Event;
-use crate::store::{PostgresArgs, Store};
+use crate::protobuf::event::{Event, ObservedBlock};
+use crate::store::{
+    CaptureMethod, DatasetManifest, PostgresArgs, SidechainInstanceRef, SnapshotMetadata, Store,
+};
+use std::time::SystemTime;
 
 /// Writes observed events to the record and fans them out to live consumers.
 #[derive(Clone)]
@@ -29,10 +32,9 @@ pub struct Recorder {
 impl Recorder {
     /// Connect to the record and to the live transport.
     ///
-    /// The record is connected first: without somewhere to store observations
-    /// there is no point holding a publisher open. Only the record has to be
-    /// reachable — the publisher reconnects in the background — so a NATS
-    /// outage degrades the live fan-out instead of stopping the extractor.
+    /// The publisher is validated first so malformed NATS configuration cannot
+    /// leave a durable extractor run behind. An unreachable NATS server still
+    /// yields a reconnecting client, so an outage degrades only live fan-out.
     pub async fn connect(
         postgres: &PostgresArgs,
         nats: &NatsArgs,
@@ -40,12 +42,32 @@ impl Recorder {
         source: &'static str,
         client_name: &'static str,
     ) -> Result<Self> {
-        let store = Store::connect(postgres, source)
-            .await
-            .context("connecting the event record")?;
+        Self::connect_with_manifest(
+            postgres,
+            nats,
+            subject,
+            source,
+            client_name,
+            DatasetManifest::default(),
+        )
+        .await
+    }
+
+    /// Connect and attach every observation to an explicit dataset/build.
+    pub async fn connect_with_manifest(
+        postgres: &PostgresArgs,
+        nats: &NatsArgs,
+        subject: Subject,
+        source: &'static str,
+        client_name: &'static str,
+        manifest: DatasetManifest,
+    ) -> Result<Self> {
         let publisher = EventPublisher::connect(nats, client_name)
             .await
             .context("connecting the live event publisher")?;
+        let store = Store::connect_with_manifest(postgres, source, manifest)
+            .await
+            .context("connecting the event record")?;
 
         Ok(Self {
             store,
@@ -59,15 +81,48 @@ impl Recorder {
         self.record_batch(vec![event]).await
     }
 
+    /// Record an event against the exact activation whose stream supplied it.
+    pub async fn record_for_instance(
+        &self,
+        event: Event,
+        instance: &SidechainInstanceRef,
+    ) -> Result<()> {
+        let events = [event];
+        let recorded = self
+            .store
+            .record_with_method_for_instance(&events, CaptureMethod::Live, instance)
+            .await
+            .context("recording an instance-scoped event")?;
+        if recorded == 0 {
+            tracing::debug!(
+                sidechain = instance.sidechain,
+                instance = %instance.sidechain_instance_id,
+                "the instance-scoped event fact was already recorded"
+            );
+        }
+        self.fan_out(&events).await;
+        Ok(())
+    }
+
     /// Record a batch of events in one transaction, then fan them out.
     pub async fn record_batch(&self, events: Vec<Event>) -> Result<()> {
+        self.record_batch_with_method(events, CaptureMethod::Live)
+            .await
+    }
+
+    /// Record a batch with explicit capture provenance, then fan it out.
+    pub async fn record_batch_with_method(
+        &self,
+        events: Vec<Event>,
+        method: CaptureMethod,
+    ) -> Result<()> {
         if events.is_empty() {
             return Ok(());
         }
 
         let recorded = self
             .store
-            .record(&events)
+            .record_with_method(&events, method)
             .await
             .context("recording observed events")?;
         if recorded < events.len() as u64 {
@@ -82,6 +137,60 @@ impl Recorder {
 
         self.fan_out(&events).await;
         Ok(())
+    }
+
+    /// Record a consistent (or explicitly inconsistent) unary snapshot.
+    pub async fn record_snapshot_batch(
+        &self,
+        events: Vec<Event>,
+        method: CaptureMethod,
+        metadata: &SnapshotMetadata,
+    ) -> Result<()> {
+        if events.is_empty() {
+            return Ok(());
+        }
+        let recorded = self
+            .store
+            .record_snapshot(&events, method, metadata)
+            .await
+            .context("recording an observed snapshot")?;
+        if recorded < events.len() as u64 {
+            tracing::debug!(
+                observed = events.len(),
+                recorded,
+                "some snapshot facts were already recorded"
+            );
+        }
+        self.fan_out(&events).await;
+        Ok(())
+    }
+
+    /// Persist a changed mainchain-tip observation.
+    pub async fn record_tip_observation(
+        &self,
+        tip: &ObservedBlock,
+        previous: Option<&ObservedBlock>,
+        method: CaptureMethod,
+        observed_at: SystemTime,
+    ) -> Result<()> {
+        self.store
+            .record_tip_observation(tip, previous, method, observed_at)
+            .await
+    }
+
+    /// Persist a best-effort operational error for status consumers.
+    pub async fn record_extractor_error(&self, error: &str) -> Result<()> {
+        self.store.record_extractor_error(error).await
+    }
+
+    /// Clear a best-effort operational error after the source recovers.
+    pub async fn clear_extractor_error(&self) -> Result<()> {
+        self.store.clear_extractor_error().await
+    }
+
+    /// Mark the current extractor run as cleanly finished or failed.
+    pub async fn finish_run(&self, status: &str, reason: Option<&str>) -> Result<()> {
+        self.store.finish_run(status, reason).await
     }
 
     /// Access the record directly, for reads such as the backfill checkpoint.

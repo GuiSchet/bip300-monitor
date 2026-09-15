@@ -10,6 +10,12 @@ future Beta or Mainnet transition does not require another deployment copy.
 
 Alphanet is experimental. Use a dedicated data directory and no real funds.
 
+The lock distinguishes the latest official enforcer runtime from the reviewed
+observer fork that adds `GetBip300BlockDelta`. Until the fork image is
+published and `ENFORCER_COMMIT`/`ENFORCER_IMAGE` are promoted together,
+`just verify` intentionally cannot certify global BIP300 history. This is a
+pre-Pulse safety gate, not a reason to relabel the official image as the fork.
+
 ## Requirements
 
 - Ubuntu 24.04 on `x86_64`.
@@ -64,6 +70,10 @@ therefore report `Connected ... pre-activation block(s) from stored headers`
 before the validator processes blocks at and above the locked activation
 height.
 
+The generated node configuration sets `prune=0` explicitly. Runtime readiness
+rejects `getblockchaininfo.pruned = true`, because the observer RPC needs raw
+historical blocks to preserve exact scripts and transactions.
+
 The default `.env.example` deliberately sets
 `TRUST_ASSUMEUTXO_SNAPSHOT=true`. With that policy, `just enforcer-up` accepts
 either a fully validated chainstate or exactly two chainstates whose active one
@@ -93,11 +103,11 @@ just verify
 ```
 
 Verification asks the record, not the logs. It reads the block the newest
-recorded snapshot is anchored to, then requires **exactly one** row at that block
-for each snapshot kind, plus one CTIP and one withdrawal-bundle proposals row per
-configured slot. Exactly one, not at least one: a second row at the same block
-would mean the identity constraint stopped collapsing a republished snapshot,
-which is the shape of a table that grows on every restart.
+recorded snapshot is anchored to, selects the newest event-contract version at
+that block, and requires **exactly one fact** per expected snapshot kind and
+slot. It also requires complete per-instance `block` coverage and global
+`bip300_delta` coverage even when there are zero active slots. Repeated captures
+belong in `event_observation`, not as duplicate facts.
 
 Rows outlive a container, and the block is what scopes them — a previous run's
 rows are anchored at a previous block. Scoping by time instead would be wrong in
@@ -129,6 +139,10 @@ there. `just down` stops the stack without deleting `${ECASH_DATA_ROOT}`.
 always continues page by page until complete. `BIP300_MONITOR_BACKFILL_PAGE_BLOCKS`
 defaults to 128 (maximum 512) and bounds one RPC/transaction; it never limits
 total coverage. `BIP300_MONITOR_BACKFILL_PAGE_PAUSE_MS` defaults to 100.
+`BIP300_MONITOR_TIP_POLL_INTERVAL_SECONDS` defaults to 30.
+`BIP300_MONITOR_STREAM_STALL_TIMEOUT_SECONDS` independently controls live
+stream liveness (default 60); it must be at least the tip-poll interval and is
+not the unary RPC deadline.
 Existing `.env` files must remove `BIP300_MONITOR_BACKFILL_MAX_BLOCKS`, which is
 rejected to prevent the old silent truncation semantics.
 
@@ -176,10 +190,15 @@ configuration is still fatal, because that is a mistake rather than an outage.
 
 Two different gaps follow from that, and only one of them is about transport:
 
-- **The extractor was down.** `SubscribeEvents` does not replay history, so a
-  restart leaves a real hole that only a backfill can close. The extractor walks
-  the whole gap in bounded pages, stores each page and its cursor atomically,
-  and resumes after interruption. Historical pages bypass NATS.
+- **The extractor was down or a live stream stopped delivering.**
+  `SubscribeEvents` does not replay history, so only a backfill can close the
+  resulting hole. Every polled tip move queues reconciliation for all active
+  slots. A stream that stays silent after that move fails the process within the
+  dedicated stream-stall timeout, and the next start subscribes before
+  snapshotting. The
+  extractor walks the whole gap in bounded pages, stores each page and its
+  cursor atomically, and resumes after interruption. Historical pages bypass
+  NATS. A quiet tip never arms the stream watchdog.
 - **A live consumer missed a message.** Cosmetic, because the record already
   has it.
 

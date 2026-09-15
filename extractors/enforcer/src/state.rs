@@ -9,6 +9,10 @@
 use anyhow::{Context, Result, bail};
 use shared::protobuf::enforcer_extractor as events;
 use shared::protobuf::event::ObservedBlock;
+use shared::store::{
+    SidechainInstanceRef, SnapshotConsistency, SnapshotMetadata, sidechain_instance_ref,
+};
+use std::time::SystemTime;
 
 use crate::EnforcerClient;
 use crate::convert;
@@ -22,6 +26,7 @@ const GLOBAL_PAYLOADS: usize = 2;
 pub(crate) struct Reading {
     pub(crate) anchor: ObservedBlock,
     pub(crate) payloads: Vec<events::EnforcerEvent>,
+    pub(crate) metadata: SnapshotMetadata,
 }
 
 /// Read the enforcer tip and then the mutable state anchored to it.
@@ -29,37 +34,65 @@ pub(crate) struct Reading {
 /// The tip is read first so the anchor never claims a block newer than the
 /// state it labels.
 ///
-/// The anchor is that tip, not the block whose arrival triggered the read. These
-/// RPCs answer "what is true now", so the tip they were read against is the only
-/// block the reading honestly describes; if the chain moved in between, the
-/// anchor is the later block and the reading belongs to it. A consequence worth
-/// naming: that block may not have a `block_connected` row yet, because the slot
-/// worker that will record it has not seen it.
-pub(crate) async fn collect(client: &mut EnforcerClient, sidechains: &[u8]) -> Result<Reading> {
-    let anchor = tip_anchor(&convert::chain_tip(client.get_chain_tip().await?)?)?;
-    let payloads = collect_payloads(client, sidechains).await?;
-
-    Ok(Reading { anchor, payloads })
+/// The anchor is that first tip, not the block whose arrival triggered the read.
+/// If the chain moves while the payloads are being fetched, the metadata marks
+/// the observation as changed but the payloads are never attributed to a block
+/// that did not exist when the read began. Live refreshes use one attempt so a
+/// busy chain cannot multiply the hot-path RPC load; startup has its own bounded
+/// consistency retry.
+pub(crate) async fn collect(
+    client: &mut EnforcerClient,
+    sidechains: &[u8],
+    discover_new_slots: bool,
+) -> Result<Reading> {
+    let started_at = SystemTime::now();
+    let tip_before = tip_anchor(&convert::chain_tip(client.get_chain_tip().await?)?)?;
+    let payloads = collect_payloads(client, sidechains, discover_new_slots).await?;
+    let tip_after = tip_anchor(&convert::chain_tip(client.get_chain_tip().await?)?)?;
+    let consistency = if tip_before.hash == tip_after.hash {
+        SnapshotConsistency::Stable
+    } else {
+        SnapshotConsistency::Changed
+    };
+    Ok(Reading {
+        anchor: tip_before.clone(),
+        payloads,
+        metadata: SnapshotMetadata {
+            started_at,
+            finished_at: SystemTime::now(),
+            tip_before,
+            tip_after,
+            consistency,
+            attempts: 1,
+        },
+    })
 }
 
 /// Collect every mutable-state payload in a deterministic order.
 pub(crate) async fn collect_payloads(
     client: &mut EnforcerClient,
     sidechains: &[u8],
+    discover_new_slots: bool,
 ) -> Result<Vec<events::EnforcerEvent>> {
     let mut payloads = Vec::with_capacity(GLOBAL_PAYLOADS + PAYLOADS_PER_SLOT * sidechains.len());
     payloads.push(convert::sidechain_proposals(
         client.get_sidechain_proposals().await?,
     )?);
-    payloads.push(convert::active_sidechains(client.get_sidechains().await?)?);
-    for sidechain in sidechains {
-        payloads.push(convert::ctip(
-            *sidechain,
-            client.get_ctip(*sidechain).await?,
-        )?);
+    let active_payload = convert::active_sidechains(client.get_sidechains().await?)?;
+    let active_instances = active_instances(&active_payload)
+        .context("expected an active-sidechains payload while collecting state")??;
+    let selected_instances = active_instances
+        .iter()
+        .filter(|instance| discover_new_slots || sidechains.contains(&instance.sidechain))
+        .cloned()
+        .collect::<Vec<_>>();
+    payloads.push(active_payload);
+    for instance in &selected_instances {
+        let sidechain = instance.sidechain;
+        payloads.push(convert::ctip(sidechain, client.get_ctip(sidechain).await?)?);
         payloads.push(convert::withdrawal_bundle_proposals(
-            *sidechain,
-            client.get_withdrawal_bundle_proposals(*sidechain).await?,
+            sidechain,
+            client.get_withdrawal_bundle_proposals(sidechain).await?,
         )?);
     }
 
@@ -129,29 +162,10 @@ fn payload_key(payload: &events::EnforcerEvent) -> Result<PayloadKey> {
     }
 }
 
-/// Slots the enforcer currently reports as active.
-///
-/// Returns `None` when the payload is not an active-sidechains snapshot, so a
-/// caller can scan a mixed collection without matching on the variant itself.
-pub(crate) fn active_slots(payload: &events::EnforcerEvent) -> Option<Vec<u8>> {
-    let events::enforcer_event::Event::ActiveSidechains(snapshot) = payload.event.as_ref()? else {
-        return None;
-    };
-    Some(
-        snapshot
-            .sidechains
-            .iter()
-            // A slot is one byte on the wire. One that does not fit is not a
-            // slot this monitor could ever subscribe to.
-            .filter_map(|sidechain| u8::try_from(sidechain.sidechain_number).ok())
-            .collect(),
-    )
-}
-
-/// Active slot numbers paired with their exact activation heights.
-pub(crate) fn active_slot_activations(
+/// Exact identities currently occupying active slots.
+pub(crate) fn active_instances(
     payload: &events::EnforcerEvent,
-) -> Option<Result<Vec<(u8, u32)>>> {
+) -> Option<Result<Vec<SidechainInstanceRef>>> {
     let events::enforcer_event::Event::ActiveSidechains(snapshot) = payload.event.as_ref()? else {
         return None;
     };
@@ -159,15 +173,7 @@ pub(crate) fn active_slot_activations(
         snapshot
             .sidechains
             .iter()
-            .map(|sidechain| {
-                let slot = u8::try_from(sidechain.sidechain_number).with_context(|| {
-                    format!(
-                        "active sidechain slot {} does not fit in a u8",
-                        sidechain.sidechain_number
-                    )
-                })?;
-                Ok((slot, sidechain.activation_height))
-            })
+            .map(sidechain_instance_ref)
             .collect(),
     )
 }
@@ -213,7 +219,7 @@ pub(crate) fn block_anchor(payload: &events::EnforcerEvent) -> Result<ObservedBl
 mod tests {
     use shared::protobuf::enforcer_extractor as events;
 
-    use super::{Tracker, active_slot_activations, block_anchor, tip_anchor};
+    use super::{Tracker, active_instances, block_anchor, tip_anchor};
 
     fn ctip(sidechain_number: u32, value_sats: u64) -> events::EnforcerEvent {
         events::EnforcerEvent {
@@ -339,7 +345,7 @@ mod tests {
     }
 
     #[test]
-    fn active_slots_are_read_only_from_an_active_sidechains_snapshot() {
+    fn active_instances_are_read_only_from_an_active_sidechains_snapshot() {
         let snapshot = events::EnforcerEvent {
             event: Some(events::enforcer_event::Event::ActiveSidechains(
                 events::ActiveSidechainsSnapshot {
@@ -359,18 +365,17 @@ mod tests {
             )),
         };
 
-        assert_eq!(super::active_slots(&snapshot), Some(vec![9, 98]));
         assert_eq!(
-            active_slot_activations(&snapshot)
+            active_instances(&snapshot)
                 .expect("active snapshot")
-                .expect("valid slots"),
+                .expect("valid slots")
+                .into_iter()
+                .map(|instance| (instance.sidechain, instance.activation_height))
+                .collect::<Vec<_>>(),
             vec![(9, 987_402), (98, 987_402)]
         );
-        assert_eq!(super::active_slots(&ctip(9, 100)), None);
-        assert_eq!(
-            super::active_slots(&events::EnforcerEvent { event: None }),
-            None
-        );
+        assert!(active_instances(&ctip(9, 100)).is_none());
+        assert!(active_instances(&events::EnforcerEvent { event: None }).is_none());
     }
 
     #[test]
@@ -387,7 +392,7 @@ mod tests {
         };
 
         assert!(
-            active_slot_activations(&snapshot)
+            active_instances(&snapshot)
                 .expect("active snapshot")
                 .is_err()
         );

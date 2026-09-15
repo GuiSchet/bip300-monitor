@@ -59,8 +59,9 @@ fn summarize(payload: &events::enforcer_event::Event) -> Result<String> {
                 .as_ref()
                 .context("chain info is missing BIP300 constants")?;
             Ok(format!(
-                "network={} activation_height={} withdrawal_bundle_max_age={}",
+                "network={} raw_network={} activation_height={} withdrawal_bundle_max_age={}",
                 network.as_str_name().to_ascii_lowercase(),
+                chain_info.raw_network,
                 constants.activation_height,
                 constants.withdrawal_bundle_max_age
             ))
@@ -75,6 +76,21 @@ fn summarize(payload: &events::enforcer_event::Event) -> Result<String> {
                 "height={} block_hash={}",
                 header.height,
                 hex::encode(&header.hash)
+            ))
+        }
+        events::enforcer_event::Event::Bip300BlockDelta(delta) => {
+            validate_bip300_delta(delta)?;
+            let header = delta
+                .header
+                .as_ref()
+                .context("BIP300 block delta is missing its block header")?;
+            Ok(format!(
+                "height={} block_hash={} coinbase_messages={} treasury_transitions={} m8={}",
+                header.height,
+                hex::encode(&header.hash),
+                delta.coinbase_messages.len(),
+                delta.treasury_transitions.len(),
+                delta.confirmed_bmm_requests.len()
             ))
         }
         events::enforcer_event::Event::SidechainProposals(snapshot) => {
@@ -160,6 +176,74 @@ fn summarize(payload: &events::enforcer_event::Event) -> Result<String> {
             ))
         }
     }
+}
+
+fn validate_bip300_delta(delta: &events::Bip300BlockDelta) -> Result<()> {
+    validate_header(
+        delta
+            .header
+            .as_ref()
+            .context("BIP300 block delta is missing its block header")?,
+    )?;
+    require_32_bytes(&delta.coinbase_txid, "bip300_block_delta.coinbase_txid")?;
+    for message in &delta.coinbase_messages {
+        if message.raw_script_pubkey.is_empty() {
+            bail!("BIP300 coinbase message has an empty raw scriptPubKey");
+        }
+        match message
+            .message
+            .as_ref()
+            .context("BIP300 coinbase message is missing its typed message")?
+        {
+            events::bip300_coinbase_message::Message::M1(m1) => {
+                require_32_bytes(&m1.description_hash, "bip300_m1.description_hash")?;
+            }
+            events::bip300_coinbase_message::Message::M2(m2) => {
+                require_32_bytes(&m2.description_hash, "bip300_m2.description_hash")?;
+            }
+            events::bip300_coinbase_message::Message::M3(m3) => {
+                require_32_bytes(&m3.m6id, "bip300_m3.m6id")?;
+            }
+            events::bip300_coinbase_message::Message::M4(m4) => {
+                for effect in &m4.effects {
+                    if let Some(m6id) = effect.upvoted_m6id.as_ref() {
+                        require_32_bytes(m6id, "bip300_m4.upvoted_m6id")?;
+                    }
+                    for m6id in &effect.downvoted_m6ids {
+                        require_32_bytes(m6id, "bip300_m4.downvoted_m6id")?;
+                    }
+                }
+            }
+            events::bip300_coinbase_message::Message::M7(m7) => {
+                require_32_bytes(&m7.hstar, "bip300_m7.hstar")?;
+            }
+        }
+    }
+    for transition in &delta.treasury_transitions {
+        for (name, ctip) in [
+            ("previous_ctip", transition.previous_ctip.as_ref()),
+            ("new_ctip", transition.new_ctip.as_ref()),
+        ] {
+            if let Some(ctip) = ctip {
+                require_32_bytes(&ctip.txid, &format!("treasury_transition.{name}.txid"))?;
+            }
+        }
+        if let Some(m6id) = transition.m6id.as_ref() {
+            require_32_bytes(m6id, "treasury_transition.m6id")?;
+        }
+    }
+    for request in &delta.confirmed_bmm_requests {
+        require_32_bytes(&request.txid, "confirmed_bmm_request.txid")?;
+        require_32_bytes(&request.hstar, "confirmed_bmm_request.hstar")?;
+        require_32_bytes(
+            &request.previous_mainchain_block_hash,
+            "confirmed_bmm_request.previous_mainchain_block_hash",
+        )?;
+        if request.transaction.is_empty() {
+            bail!("confirmed BMM request has an empty transaction");
+        }
+    }
+    Ok(())
 }
 
 fn validate_header(header: &events::BlockHeader) -> Result<()> {
@@ -275,6 +359,7 @@ mod tests {
             (
                 events::enforcer_event::Event::ChainInfo(events::ChainInfo {
                     network: events::Network::Regtest as i32,
+                    raw_network: events::Network::Regtest as i32,
                     bip300_constants: Some(events::Bip300Constants {
                         activation_height: 100,
                         withdrawal_bundle_max_age: 200,
@@ -288,6 +373,16 @@ mod tests {
                     header: Some(header(1)),
                 }),
                 "chain_tip",
+            ),
+            (
+                events::enforcer_event::Event::Bip300BlockDelta(events::Bip300BlockDelta {
+                    header: Some(header(2)),
+                    coinbase_txid: vec![0x33; 32],
+                    coinbase_messages: Vec::new(),
+                    treasury_transitions: Vec::new(),
+                    confirmed_bmm_requests: Vec::new(),
+                }),
+                "bip300_block_delta",
             ),
             (
                 events::enforcer_event::Event::SidechainProposals(

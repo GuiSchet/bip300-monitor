@@ -1,7 +1,7 @@
 # shellcheck shell=bash
 # Reproducible eCash network, image, tool, and snapshot lock.
 LOCK_FORMAT=2
-LOCKED_AT=2026-09-10
+LOCKED_AT=2026-09-14
 
 NETWORK_ID=alphanet
 ECASH_NODE_CHAIN=main
@@ -31,8 +31,14 @@ ECASH_NODE_EXPECTED_VERSION=31
 
 ENFORCER_REPO=https://github.com/LayerTwo-Labs/bip300301_enforcer.git
 ENFORCER_BRANCH=master
-ENFORCER_COMMIT=9c056a465c9e940e80d47ccb36fe10c6f3fbcb0d
-ENFORCER_IMAGE=ghcr.io/layertwo-labs/bip300301_enforcer:sha-9c056a4@sha256:9c9a1e752c47d1e5e5a3df8d40213359d161a8b00a29ef0881bb3bb3f1e66279
+ENFORCER_COMMIT=7958ceffa997ffa905f046de71c8e3cf33437c2d
+ENFORCER_IMAGE=ghcr.io/layertwo-labs/bip300301_enforcer:sha-7958cef@sha256:176c69d61983559e464890179c6c9ff697b5d9fc913c2a1fa21e2d44c8c1eb4b
+# Local, reviewed observer fork. This commit is based directly on
+# ENFORCER_BASE_COMMIT and adds only the read-only GetBip300BlockDelta contract
+# and implementation. ENFORCER_COMMIT remains the truthful runtime pin until
+# the fork's OCI image is published and promoted with its immutable digest.
+ENFORCER_BASE_COMMIT=7958ceffa997ffa905f046de71c8e3cf33437c2d
+ENFORCER_OBSERVER_COMMIT=2ea92c062869199bfec21dd21fdd6192a87dafec
 ENFORCER_NETWORK_PRESET=alphanet
 ENFORCER_API_NETWORK=NETWORK_MAINNET
 

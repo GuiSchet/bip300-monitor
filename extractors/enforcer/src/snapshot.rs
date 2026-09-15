@@ -4,6 +4,7 @@ use anyhow::Result;
 use shared::protobuf::enforcer_extractor as events;
 use shared::protobuf::event::ObservedBlock;
 use shared::recorder::Recorder;
+use shared::store::{CaptureMethod, SnapshotMetadata};
 
 use crate::EnforcerClient;
 use crate::convert;
@@ -33,7 +34,7 @@ pub(crate) async fn collect_snapshot(
         chain_tip,
     ];
 
-    let state = state::collect_payloads(client, sidechains).await?;
+    let state = state::collect_payloads(client, sidechains, false).await?;
 
     Ok(InitialSnapshot {
         constants,
@@ -51,7 +52,11 @@ pub(crate) async fn current_tip(client: &mut EnforcerClient) -> Result<ObservedB
 ///
 /// Takes the snapshot by reference because the caller keeps its mutable-state
 /// payloads to seed the state tracker.
-pub(crate) async fn record_snapshot(recorder: &Recorder, snapshot: &InitialSnapshot) -> Result<()> {
+pub(crate) async fn record_snapshot(
+    recorder: &Recorder,
+    snapshot: &InitialSnapshot,
+    metadata: &SnapshotMetadata,
+) -> Result<()> {
     let events = snapshot
         .constants
         .iter()
@@ -59,5 +64,7 @@ pub(crate) async fn record_snapshot(recorder: &Recorder, snapshot: &InitialSnaps
         .map(|payload| envelope(payload.clone(), snapshot.anchor.clone()))
         .collect::<Result<Vec<_>>>()?;
 
-    recorder.record_batch(events).await
+    recorder
+        .record_snapshot_batch(events, CaptureMethod::Startup, metadata)
+        .await
 }

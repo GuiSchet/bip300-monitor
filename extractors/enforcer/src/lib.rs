@@ -7,6 +7,7 @@ pub mod client;
 pub mod config;
 pub mod convert;
 mod event;
+mod header_backfill;
 pub mod proto;
 pub mod runtime;
 mod snapshot;

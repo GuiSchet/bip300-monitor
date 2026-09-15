@@ -17,7 +17,10 @@ The extractor:
 - follows live block connections and disconnections;
 - discovers active sidechain slots, including slots activated while it runs;
 - stores normalized protobuf events in Postgres before publishing them to NATS;
-- recovers missing block history after startup or downtime.
+- records every capture occurrence separately from its idempotent event fact;
+- records tip transitions and snapshot-consistency windows durably;
+- recovers both per-slot block history and global BIP300/301 deltas after
+  startup or downtime.
 
 Postgres is authoritative. Core NATS is best-effort live delivery: historical
 pages go directly to Postgres and do not flood live consumers.
@@ -30,26 +33,34 @@ The workspace contains:
 
 ## Historical recovery
 
-For every active slot, the first backfill walks from the current tip through the
-slot's activation height. Later runs extend that proven range.
+Two resumable streams have distinct coverage:
 
-History is processed in bounded pages of 128 blocks by default. Every page is
-checked for exact size, height and hash continuity, then its events and next
-cursor are committed in one Postgres transaction. Interrupted work resumes from
-that cursor. Oversized or timed-out requests reduce the page size automatically,
-and a reorg can restart the affected slot from activation.
+- `block`, per sidechain instance, walks through that instance's activation
+  height and stores headers, BMM commitments, deposits and terminal withdrawal
+  outcomes;
+- `bip300_delta`, global even when no slot is active, walks from the network
+  activation height and stores exact BIP300 coinbase scripts, resolved
+  M1/M2/M3/M4/M7 effects, M5/M6 treasury transitions and confirmed M8
+  requests.
 
-The historical block stream includes block headers, BMM commitments, deposits
-and withdrawal-bundle outcomes. The current enforcer API does not expose past
-CTIP, proposal or pending-bundle snapshots; those RPCs only return current
-state. `history_coverage.stream = 'block'` therefore proves complete block
-history, not complete historical state snapshots.
+Pages and cursors commit atomically, are bounded, reorg-aware and bypass NATS.
+The unary state RPCs still expose only current CTIP/proposal/pending-bundle
+state. Historical snapshots are therefore never fabricated; historical
+transitions come from persisted enforcer diffs and unpruned Core blocks.
+
+`GetBip300BlockDelta` lives in the reviewed enforcer observer fork recorded in
+[`proto/upstream/README.md`](proto/upstream/README.md). Until an OCI image for
+that exact commit is published and promoted, the official base image remains
+usable for development but cannot pass the pre-Pulse delta-history gate.
 
 ## Event contract
 
-The monitor publishes a stable protobuf contract rather than forwarding raw
-enforcer responses. See [event schema and semantics](proto/README.md) for event
-variants, byte order, snapshot semantics, idempotency and reorg handling.
+The monitor publishes a versioned normalized protobuf contract rather than
+forwarding raw enforcer responses. PostgreSQL schema v4 binds each fact and
+occurrence to a dataset and extractor run, preserves `A -> B -> A` tip order,
+tracks sidechain instances and retains coverage revisions. See
+[event schema and semantics](proto/README.md) for event variants, byte order,
+snapshot semantics, idempotency and reorg handling.
 
 ## Run locally
 
@@ -61,7 +72,9 @@ cargo run -p enforcer-extractor -- \
   --nats-url nats://127.0.0.1:4222
 ```
 
-Use `--sidechain 9,98` to monitor an explicit fixed set. All options also have
+Use `--sidechain 9,98` to select an explicit fixed set. A configured slot may
+be inactive at startup; the extractor keeps running and begins its stream and
+full-history recovery when that slot becomes active. All options also have
 `BIP300_MONITOR_*` environment-variable equivalents shown by `--help`.
 
 Inspect live events with:
@@ -76,7 +89,8 @@ Add `--full-events` to print complete normalized JSON payloads.
 
 ```bash
 cargo check --workspace --jobs 2
-cargo test --workspace --jobs 2
+cargo test --workspace --all-targets --jobs 2
+deployments/ecash/scripts/static-check.sh
 ```
 
 Generating the gRPC client requires `protoc`. PostgreSQL and NATS integration

@@ -49,6 +49,7 @@ mod tests {
         EnforcerEvent {
             event: Some(enforcer_event::Event::ChainInfo(ChainInfo {
                 network: Network::Regtest as i32,
+                raw_network: Network::Regtest as i32,
                 bip300_constants: None,
             })),
         }

@@ -60,6 +60,9 @@ while :; do
         compose logs --no-color --since "${started_at}" event-logger 2>/dev/null || true
     )"
     all_delivered=true
+    if ! record_has_global_block bip300_block_delta "${live_hash}"; then
+        all_delivered=false
+    fi
     for sidechain in "${sidechains[@]}"; do
         # The record is what has to hold the block. The two log assertions
         # additionally prove the live fan-out path still reaches a consumer.
