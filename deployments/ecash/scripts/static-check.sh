@@ -198,6 +198,15 @@ grep -Fq 'current_sidechain_instance current_instance' \
 grep -Fq 'record_has_global_block bip300_block_delta' \
     "${DEPLOYMENT_ROOT}/scripts/verify-live.sh" ||
     die "verify-live.sh does not assert the live global BIP300 delta"
+for valid_kind in chain_tip bip300_block_delta; do
+    valid_event_kind "${valid_kind}" ||
+        die "event kind validation rejected ${valid_kind}"
+done
+for invalid_kind in '' 3bip300_delta BIP300_delta bip300-delta 'bip300 delta'; do
+    if valid_event_kind "${invalid_kind}"; then
+        die "event kind validation accepted invalid value: ${invalid_kind}"
+    fi
+done
 grep -Fq 'compose stop enforcer-extractor postgres' \
     "${DEPLOYMENT_ROOT}/scripts/reset-record.sh" ||
     die "reset-record.sh no longer preserves the node and enforcer services"

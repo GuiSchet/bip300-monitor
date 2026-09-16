@@ -460,6 +460,12 @@ logs_contain_snapshot_completion() {
     return 1
 }
 
+valid_event_kind() {
+    local kind="$1"
+
+    [[ "${kind}" =~ ^[a-z][a-z0-9_]*$ ]]
+}
+
 count_snapshot_events() {
     local logs="$1"
     local kind="$2"
@@ -468,7 +474,7 @@ count_snapshot_events() {
     local event_pattern
     local line
 
-    [[ "${kind}" =~ ^[a-z_]+$ ]] || return 1
+    valid_event_kind "${kind}" || return 1
     event_pattern="(^|[[:space:]])event=\"?${kind}\"?([[:space:]]|$)"
     if [[ -n "${sidechain}" ]]; then
         [[ "${sidechain}" =~ ^[0-9]+$ ]] || return 1
@@ -556,7 +562,7 @@ record_event_count_at() {
                AND latest.block_hash = decode(:'block_hash', 'hex')
         )"
 
-    [[ "${kind}" =~ ^[a-z_]+$ ]] || return 1
+    valid_event_kind "${kind}" || return 1
     [[ "${block_hash}" =~ ^[[:xdigit:]]{64}$ ]] || return 1
     if [[ -n "${sidechain}" ]]; then
         [[ "${sidechain}" =~ ^[0-9]+$ ]] || return 1
@@ -574,7 +580,7 @@ record_has_block() {
     local block_hash="$3"
     local count
 
-    [[ "${kind}" =~ ^[a-z_]+$ ]] || return 1
+    valid_event_kind "${kind}" || return 1
     [[ "${sidechain}" =~ ^[0-9]+$ ]] || return 1
     [[ "${block_hash}" =~ ^[[:xdigit:]]{64}$ ]] || return 1
 
@@ -598,7 +604,7 @@ record_has_global_block() {
     local block_hash="$2"
     local count
 
-    [[ "${kind}" =~ ^[a-z_]+$ ]] || return 1
+    valid_event_kind "${kind}" || return 1
     [[ "${block_hash}" =~ ^[[:xdigit:]]{64}$ ]] || return 1
     count="$(
         postgres_query \
