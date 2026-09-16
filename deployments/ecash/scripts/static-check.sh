@@ -316,16 +316,23 @@ if has_snapshot_event "${snapshot_logs}" ctip 8; then
     die "snapshot presence check accepted a missing snapshot kind"
 fi
 
+grep -Fq 'desired_sidechain_count = sidechains.len(),' \
+    "${DEPLOYMENT_ROOT}/../../extractors/enforcer/src/runtime.rs" ||
+    die "snapshot completion matcher is not aligned with the extractor log field"
 logs_contain_snapshot_completion \
-    'INFO sidechain_count=2 published initial enforcer snapshot' 2 ||
+    'INFO desired_sidechain_count=2 published initial enforcer snapshot' 2 ||
     die "snapshot completion matcher rejected a valid message"
 if logs_contain_snapshot_completion \
-    'INFO sidechain_count=1 published initial enforcer snapshot' 2; then
+    'INFO desired_sidechain_count=1 published initial enforcer snapshot' 2; then
     die "snapshot completion matcher accepted the wrong sidechain count"
 fi
 if logs_contain_snapshot_completion \
-    'INFO sidechain_count=2 published live enforcer event' 2; then
+    'INFO desired_sidechain_count=2 published live enforcer event' 2; then
     die "snapshot completion matcher accepted the wrong message"
+fi
+if logs_contain_snapshot_completion \
+    'INFO sidechain_count=2 published initial enforcer snapshot' 2; then
+    die "snapshot completion matcher accepted a field the pinned extractor does not emit"
 fi
 
 # Docker renders StartedAt with Go's RFC3339Nano, so the fraction has a

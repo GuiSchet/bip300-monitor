@@ -450,7 +450,7 @@ logs_contain_snapshot_completion() {
     local line
 
     [[ "${sidechain_count}" =~ ^[0-9]+$ ]] || return 1
-    count_pattern="(^|[[:space:]])sidechain_count=${sidechain_count}([^0-9]|$)"
+    count_pattern="(^|[[:space:]])desired_sidechain_count=${sidechain_count}([^0-9]|$)"
     while IFS= read -r line; do
         if [[ "${line}" == *"published initial enforcer snapshot"* &&
             "${line}" =~ ${count_pattern} ]]; then
