@@ -10,11 +10,10 @@ future Beta or Mainnet transition does not require another deployment copy.
 
 Alphanet is experimental. Use a dedicated data directory and no real funds.
 
-The lock distinguishes the latest official enforcer runtime from the reviewed
-observer fork that adds `GetBip300BlockDelta`. Until the fork image is
-published and `ENFORCER_COMMIT`/`ENFORCER_IMAGE` are promoted together,
-`just verify` intentionally cannot certify global BIP300 history. This is a
-pre-Pulse safety gate, not a reason to relabel the official image as the fork.
+The lock pins the reviewed observer fork that adds `GetBip300BlockDelta`, while
+recording its official base commit separately for provenance. The observer
+commit and immutable image move together, and `just verify` requires complete
+global BIP300 history before this pre-Pulse deployment can be accepted.
 
 ## Requirements
 

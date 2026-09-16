@@ -1,7 +1,7 @@
 # shellcheck shell=bash
 # Reproducible eCash network, image, tool, and snapshot lock.
 LOCK_FORMAT=2
-LOCKED_AT=2026-09-14
+LOCKED_AT=2026-09-15
 
 NETWORK_ID=alphanet
 ECASH_NODE_CHAIN=main
@@ -29,14 +29,14 @@ ECASH_NODE_COMMIT=e9267a1f88f1856789348a61f04718529e1bd063
 ECASH_NODE_IMAGE=ghcr.io/ecash-com/bitcoin:alphanet@sha256:22698f3306b4b6658a64beb33c506442b2385aae8b7fb786986ac1c5e8843304
 ECASH_NODE_EXPECTED_VERSION=31
 
-ENFORCER_REPO=https://github.com/LayerTwo-Labs/bip300301_enforcer.git
-ENFORCER_BRANCH=master
-ENFORCER_COMMIT=7958ceffa997ffa905f046de71c8e3cf33437c2d
-ENFORCER_IMAGE=ghcr.io/layertwo-labs/bip300301_enforcer:sha-7958cef@sha256:176c69d61983559e464890179c6c9ff697b5d9fc913c2a1fa21e2d44c8c1eb4b
-# Local, reviewed observer fork. This commit is based directly on
+ENFORCER_REPO=https://github.com/GuiSchet/bip300301_enforcer.git
+ENFORCER_BRANCH=feature/bip300-monitor-block-delta
+ENFORCER_COMMIT=2ea92c062869199bfec21dd21fdd6192a87dafec
+ENFORCER_IMAGE=ghcr.io/guischet/bip300301_enforcer:sha-2ea92c062869@sha256:0fe3c397f205eb016c95858a2395013c32233d127fadc7c2a8ad25b342aa3065
+# Reviewed observer fork. This commit is based directly on
 # ENFORCER_BASE_COMMIT and adds only the read-only GetBip300BlockDelta contract
-# and implementation. ENFORCER_COMMIT remains the truthful runtime pin until
-# the fork's OCI image is published and promoted with its immutable digest.
+# and implementation. The runtime commit and immutable image pin are the exact
+# observer build; the official base remains recorded separately for provenance.
 ENFORCER_BASE_COMMIT=7958ceffa997ffa905f046de71c8e3cf33437c2d
 ENFORCER_OBSERVER_COMMIT=2ea92c062869199bfec21dd21fdd6192a87dafec
 ENFORCER_NETWORK_PRESET=alphanet
@@ -50,9 +50,9 @@ POSTGRES_IMAGE=docker.io/library/postgres:18.2-alpine@sha256:035b9ab53cfa147d720
 POSTGRES_DB=bip300_monitor
 POSTGRES_USER=bip300_monitor
 
-MONITOR_IMAGE_COMMIT=d3349359f516ded218ef924924aba3854e1d90ac
-ENFORCER_EXTRACTOR_IMAGE=docker.io/guischet/bip300-enforcer-extractor:sha-d3349359f516@sha256:370bda7338320c084645cf997620fc704dc6d1ad93567db33c35f07e09e9e8ae
-EVENT_LOGGER_IMAGE=docker.io/guischet/bip300-event-logger:sha-d3349359f516@sha256:a6247ad988d9a94b04d51cf2ab931b2ff7e5ce9b1ba5778009d1142bf26d0e74
+MONITOR_IMAGE_COMMIT=29956711578b33ed45f828691d038bfa0babd2f4
+ENFORCER_EXTRACTOR_IMAGE=docker.io/guischet/bip300-enforcer-extractor:sha-29956711578b@sha256:91e06a9302977fcca0cf499725b3ba80e73a65dc2b84cae1e6533094495b964b
+EVENT_LOGGER_IMAGE=docker.io/guischet/bip300-event-logger:sha-29956711578b@sha256:4e1f298b2fde8eafe011b9cfc1bf61ce0ffc4ed2e2ef529715e7a5b70a16bc51
 
 JUST_VERSION=1.57.0
 JUST_TARGET=x86_64-unknown-linux-musl
