@@ -132,10 +132,9 @@ for image in \
     "${POSTGRES_IMAGE}" \
     "${ENFORCER_EXTRACTOR_IMAGE}" \
     "${EVENT_LOGGER_IMAGE}"; do
-    # The enforcer index publishes an arm64 child as well, and pinning that one
-    # by mistake would only surface as a runtime exec format error. Third-party
-    # pins are multi-architecture indexes; the monitor images have no index
-    # because this repository's CI builds linux/amd64 only.
+    # Registry pins may resolve either to a multi-architecture index or to one
+    # manifest. Reject a missing/wrong amd64 child before it can surface later
+    # as a runtime exec-format error.
     image_manifest="$(
         docker buildx imagetools inspect "${image}" --raw 2>/dev/null
     )" || die "could not resolve pinned image: ${image}"

@@ -540,7 +540,7 @@ actual_peer_count="$(grep -c '^addnode=' "${rendered_node_config}")"
 [[ "${ENFORCER_COMMIT}" == "${ENFORCER_OBSERVER_COMMIT}" ]]
 [[ "${MONITOR_IMAGE_COMMIT}" =~ ^[[:xdigit:]]{40}$ ]]
 [[ "${ECASH_NODE_IMAGE}" == *":${ECASH_NODE_BRANCH}@sha256:"* ]]
-[[ "${ENFORCER_IMAGE}" == *":sha-${ENFORCER_COMMIT:0:7}@sha256:"* ]]
+[[ "${ENFORCER_IMAGE}" == *":sha-${ENFORCER_COMMIT:0:12}@sha256:"* ]]
 [[ "${ENFORCER_EXTRACTOR_IMAGE}" == *":sha-${MONITOR_IMAGE_COMMIT:0:12}@sha256:"* ]]
 [[ "${EVENT_LOGGER_IMAGE}" == *":sha-${MONITOR_IMAGE_COMMIT:0:12}@sha256:"* ]]
 [[ "${POSTGRES_IMAGE}" == *"@sha256:"* ]]

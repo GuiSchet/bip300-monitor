@@ -18,11 +18,11 @@ ECASH_TIP_HEIGHT_URL=https://esplora.alpha.ecash.ninja/blocks/tip/height
 ECASH_EXPECTED_DATA_BYTES=1200000000000
 ECASH_MIN_FREE_PERCENT=20
 
-# Third-party images are pinned to the multi-architecture index digest, which
-# is what `docker pull <tag>` reports. The monitor images below have no index:
-# this repository's CI builds linux/amd64 only, so their tag resolves straight
-# to a single manifest. preflight.sh checks that every pin resolves to
-# linux/amd64 rather than to another platform's child.
+# The node, NATS and Postgres are pinned to multi-architecture index digests,
+# which is what `docker pull <tag>` reports. The reviewed observer enforcer and
+# monitor images are built only for linux/amd64, so their tags resolve straight
+# to single manifests. preflight.sh validates both shapes and rejects a pin
+# without exactly one linux/amd64 runtime.
 ECASH_NODE_REPO=https://github.com/ecash-com/bitcoin.git
 ECASH_NODE_BRANCH=alphanet
 ECASH_NODE_COMMIT=e9267a1f88f1856789348a61f04718529e1bd063
