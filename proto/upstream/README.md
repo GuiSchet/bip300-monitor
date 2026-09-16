@@ -3,18 +3,19 @@
 These protobuf files are copied from the reviewed observer fork:
 
 - Official repository: <https://github.com/LayerTwo-Labs/bip300301_enforcer>
+- Observer fork: <https://github.com/GuiSchet/bip300301_enforcer>
 - Base commit: `7958ceffa997ffa905f046de71c8e3cf33437c2d`
 - Observer commit: `2ea92c062869199bfec21dd21fdd6192a87dafec`
 - Local branch: `feature/bip300-monitor-block-delta` in
   `upstream/enforcer`
+- Published branch: `feature/bip300-monitor-block-delta` in the observer fork
 - Copied: 2026-09-14
 
 Only the read-only `ValidatorService` contract and its direct CUSF message
 dependencies are vendored. The monitor does not link to the enforcer
 implementation. The observer commit is based directly on the official commit
-and adds `GetBip300BlockDelta`; its portable OCI image and public fork URL are
-still pending publication. Until then, `ENFORCER_IMAGE` intentionally remains
-the official base image and cannot satisfy the delta-history deployment gate.
+and adds `GetBip300BlockDelta`; `VERSIONS.lock` pins that exact runtime commit
+and its immutable OCI image for the delta-history deployment gate.
 
 `validator-observer.patch` is the reproducible delta from the official
 `validator.proto` to the vendored observer contract. This lets CI reconstruct
@@ -40,7 +41,7 @@ The base and observer commits above must equal `ENFORCER_BASE_COMMIT` and
 against disk, downloads the official base, applies the checked-in observer
 patch and confirms the reconstructed API byte for byte. If the sibling
 `upstream/enforcer` checkout is available, it additionally verifies the exact
-observer commit and its parent. Promoting the fork image therefore requires
+observer commit and its parent. A later observer update therefore requires
 re-vendoring and changing the immutable runtime pin in the same change.
 
 Before updating these files:

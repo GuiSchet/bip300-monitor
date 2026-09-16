@@ -49,9 +49,10 @@ state. Historical snapshots are therefore never fabricated; historical
 transitions come from persisted enforcer diffs and unpruned Core blocks.
 
 `GetBip300BlockDelta` lives in the reviewed enforcer observer fork recorded in
-[`proto/upstream/README.md`](proto/upstream/README.md). Until an OCI image for
-that exact commit is published and promoted, the official base image remains
-usable for development but cannot pass the pre-Pulse delta-history gate.
+[`proto/upstream/README.md`](proto/upstream/README.md). The deployment lock pins
+that exact commit and its immutable OCI image, so the global delta history is a
+required part of deployment verification rather than an optional development
+path.
 
 ## Event contract
 
