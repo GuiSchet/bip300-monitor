@@ -216,6 +216,9 @@ load_deployment_env() {
     require_positive_integer \
         HISTORY_WAIT_SECONDS "${HISTORY_WAIT_SECONDS:-43200}"
     require_positive_integer \
+        BIP300_MONITOR_REQUEST_TIMEOUT_SECONDS \
+        "${BIP300_MONITOR_REQUEST_TIMEOUT_SECONDS:-120}"
+    require_positive_integer \
         BIP300_MONITOR_BACKFILL_PAGE_BLOCKS \
         "${BIP300_MONITOR_BACKFILL_PAGE_BLOCKS:-128}"
     ((${BIP300_MONITOR_BACKFILL_PAGE_BLOCKS:-128} <= 512)) ||

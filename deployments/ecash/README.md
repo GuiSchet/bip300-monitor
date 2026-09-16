@@ -138,6 +138,8 @@ there. `just down` stops the stack without deleting `${ECASH_DATA_ROOT}`.
 always continues page by page until complete. `BIP300_MONITOR_BACKFILL_PAGE_BLOCKS`
 defaults to 128 (maximum 512) and bounds one RPC/transaction; it never limits
 total coverage. `BIP300_MONITOR_BACKFILL_PAGE_PAUSE_MS` defaults to 100.
+`BIP300_MONITOR_REQUEST_TIMEOUT_SECONDS` defaults to 120 for deployment RPCs,
+so cold historical pages can complete without removing the deadline.
 `BIP300_MONITOR_TIP_POLL_INTERVAL_SECONDS` defaults to 30.
 `BIP300_MONITOR_STREAM_STALL_TIMEOUT_SECONDS` independently controls live
 stream liveness (default 60); it must be at least the tip-poll interval and is

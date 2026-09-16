@@ -51,6 +51,8 @@ for invalid_assignment in \
     'LIVE_EVENT_WAIT_SECONDS=0' \
     'LIVE_EVENT_WAIT_SECONDS=invalid' \
     'HISTORY_WAIT_SECONDS=0' \
+    'BIP300_MONITOR_REQUEST_TIMEOUT_SECONDS=0' \
+    'BIP300_MONITOR_REQUEST_TIMEOUT_SECONDS=invalid' \
     'BIP300_MONITOR_BACKFILL_PAGE_BLOCKS=0' \
     'BIP300_MONITOR_BACKFILL_PAGE_BLOCKS=513' \
     'BIP300_MONITOR_BACKFILL_PAGE_PAUSE_MS=invalid' \
@@ -459,6 +461,7 @@ jq -e '.services["enforcer-extractor"].environment.BIP300_MONITOR_NATS_URL == "n
 # The full history is mandatory; only one page is bounded in memory.
 jq -e '.services["enforcer-extractor"].environment.BIP300_MONITOR_BACKFILL_PAGE_BLOCKS == "128"
     and .services["enforcer-extractor"].environment.BIP300_MONITOR_BACKFILL_PAGE_PAUSE_MS == "100"
+    and .services["enforcer-extractor"].environment.BIP300_MONITOR_REQUEST_TIMEOUT_SECONDS == "120"
     and .services["enforcer-extractor"].environment.BIP300_MONITOR_TIP_POLL_INTERVAL_SECONDS == "30"
     and .services["enforcer-extractor"].environment.BIP300_MONITOR_STREAM_STALL_TIMEOUT_SECONDS == "60"
     and (.services["enforcer-extractor"].environment
