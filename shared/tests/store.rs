@@ -142,6 +142,18 @@ fn chain_tip(hash: u8, height: u32) -> events::enforcer_event::Event {
     })
 }
 
+fn bmm_requests(parent: u8, bid_sats: u64) -> events::enforcer_event::Event {
+    events::enforcer_event::Event::BmmRequests(events::BmmRequestsSnapshot {
+        previous_mainchain_block_hash: vec![parent; 32],
+        requests: vec![events::BmmRequest {
+            sidechain_number: 9,
+            txid: vec![bid_sats as u8; 32],
+            critical_hash: vec![0x33; 32],
+            bid_sats,
+        }],
+    })
+}
+
 fn sidechain_proposals() -> events::enforcer_event::Event {
     events::enforcer_event::Event::SidechainProposals(events::SidechainProposalsSnapshot {
         proposals: Vec::new(),
@@ -436,6 +448,83 @@ async fn pre_v4_coverage_is_isolated_and_triggers_a_safe_rebackfill() {
         None,
         "ambiguous legacy coverage must not satisfy a current instance"
     );
+}
+
+#[tokio::test]
+async fn v5_backfills_fact_hash_when_a_legacy_envelope_hash_is_null() {
+    let admin_url = std::env::var("BIP300_MONITOR_TEST_POSTGRES_URL")
+        .expect("BIP300_MONITOR_TEST_POSTGRES_URL must point at a test Postgres");
+    let (admin, connection) = tokio_postgres::connect(&admin_url, tokio_postgres::NoTls)
+        .await
+        .expect("connect to the test Postgres");
+    tokio::spawn(connection);
+    let database = "bip300_test_legacy_null_envelope_hash";
+    admin
+        .batch_execute(&format!("DROP DATABASE IF EXISTS {database}"))
+        .await
+        .expect("drop previous legacy fixture");
+    admin
+        .batch_execute(&format!("CREATE DATABASE {database}"))
+        .await
+        .expect("create legacy fixture");
+
+    let mut config = admin_url
+        .parse::<tokio_postgres::Config>()
+        .expect("parse test Postgres URL");
+    config.dbname(database);
+    let (legacy, connection) = config
+        .connect(tokio_postgres::NoTls)
+        .await
+        .expect("connect to legacy fixture");
+    tokio::spawn(connection);
+    for migration in [
+        include_str!("../schema/0001_event.sql"),
+        include_str!("../schema/0002_event_identity_nulls.sql"),
+        include_str!("../schema/0003_history_coverage.sql"),
+        include_str!("../schema/0004_observation_provenance.sql"),
+    ] {
+        legacy
+            .batch_execute(migration)
+            .await
+            .expect("apply legacy migration");
+    }
+    legacy
+        .batch_execute(
+            "CREATE TABLE schema_version (
+                 version integer PRIMARY KEY,
+                 applied_at timestamptz NOT NULL DEFAULT now()
+             );
+             INSERT INTO schema_version (version) VALUES (1), (2), (3), (4);
+             INSERT INTO event
+                 (observed_at, source, kind, sidechain, block_hash, height,
+                  envelope, payload, dataset_id, event_contract_version,
+                  envelope_sha256, sidechain_instance_id)
+             VALUES
+                 (now(), 'enforcer', 'chain_info', NULL,
+                  decode(repeat('11', 32), 'hex'), 1,
+                  decode('0102', 'hex'), '{}'::jsonb,
+                  '00000000-0000-0000-0000-000000000001', 3, NULL, NULL);",
+        )
+        .await
+        .expect("seed a v4 row without an envelope hash");
+    drop(legacy);
+
+    Store::connect(&args_for(&admin_url, database), "enforcer")
+        .await
+        .expect("migrate the legacy record to v5");
+    let client = query_client("legacy_null_envelope_hash").await;
+    let row = client
+        .query_one(
+            "SELECT fact_sha256, sha256(envelope)
+               FROM event
+              WHERE kind = 'chain_info'",
+            &[],
+        )
+        .await
+        .expect("query the backfilled fact hash");
+    let fact_hash: Vec<u8> = row.get(0);
+    let expected_hash: Vec<u8> = row.get(1);
+    assert_eq!(fact_hash, expected_hash);
 }
 
 #[tokio::test]
@@ -1084,4 +1173,57 @@ async fn a_new_event_contract_cannot_alias_an_older_normalized_fact() {
         .expect("query immutable dataset metadata")
         .get(0);
     assert_eq!(dataset_version, i32::try_from(initial_version).unwrap());
+}
+
+#[tokio::test]
+async fn live_bmm_changes_share_a_parent_without_aliasing_facts() {
+    let test = "bmm_fact_identity";
+    let store = store_for(test, "enforcer").await;
+    let anchor = ObservedBlock::at_height(vec![0xdd; 32], 967_700);
+    let first = envelope(
+        bmm_requests(0xdd, 10),
+        Some(anchor.clone()),
+        1_700_000_000_000,
+    );
+    let changed = envelope(
+        bmm_requests(0xdd, 20),
+        Some(anchor.clone()),
+        1_700_000_005_000,
+    );
+    let repeated = envelope(
+        bmm_requests(0xdd, 10),
+        Some(anchor.clone()),
+        1_700_000_010_000,
+    );
+
+    assert_eq!(store.record(&[first]).await.expect("first sample"), 1);
+    assert_eq!(store.record(&[changed]).await.expect("changed sample"), 1);
+    assert_eq!(
+        store.record(&[repeated]).await.expect("repeated sample"),
+        0,
+        "an identical auction state should reuse its immutable fact"
+    );
+
+    let client = query_client(test).await;
+    let fact_count: i64 = client
+        .query_one(
+            "SELECT count(*) FROM event WHERE kind = 'bmm_requests' AND block_hash = $1",
+            &[&anchor.hash],
+        )
+        .await
+        .expect("count BMM facts")
+        .get(0);
+    let observation_count: i64 = client
+        .query_one(
+            "SELECT count(*)
+               FROM event_observation observation
+               JOIN event fact ON fact.id = observation.event_id
+              WHERE fact.kind = 'bmm_requests' AND fact.block_hash = $1",
+            &[&anchor.hash],
+        )
+        .await
+        .expect("count BMM observations")
+        .get(0);
+    assert_eq!(fact_count, 2);
+    assert_eq!(observation_count, 3);
 }

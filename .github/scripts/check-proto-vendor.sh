@@ -11,9 +11,10 @@ readonly REPOSITORY_ROOT
 readonly PROTO_ROOT="${REPOSITORY_ROOT}/proto/upstream"
 readonly PROTO_README="${PROTO_ROOT}/README.md"
 readonly OBSERVER_PATCH="${PROTO_ROOT}/validator-observer.patch"
-readonly VERSIONS_FILE="${REPOSITORY_ROOT}/deployments/ecash/VERSIONS.lock"
+VERSIONS_FILE="${BIP300_MONITOR_PROTO_VERSIONS_FILE:-${REPOSITORY_ROOT}/deployments/ecash/VERSIONS.lock}"
+readonly VERSIONS_FILE
 readonly UPSTREAM_RAW_URL=https://raw.githubusercontent.com/LayerTwo-Labs/bip300301_enforcer
-readonly DEFAULT_OBSERVER_REPO="${REPOSITORY_ROOT}/../upstream/enforcer"
+readonly DEFAULT_OBSERVER_REPO="${REPOSITORY_ROOT}/../bip300301_enforcer"
 
 die() {
     printf 'error: %s\n' "$*" >&2

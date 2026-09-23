@@ -123,6 +123,16 @@ pub struct Args {
     )]
     pub tip_poll_interval_seconds: u64,
 
+    /// How often the live BMM auction is sampled while the parent block is
+    /// unchanged. A tip change triggers an immediate additional sample.
+    #[arg(
+        long,
+        env = "BIP300_MONITOR_BMM_REQUEST_POLL_INTERVAL_SECONDS",
+        default_value_t = 5,
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
+    pub bmm_request_poll_interval_seconds: u64,
+
     /// Maximum time a live event stream may remain silent after the tip moves.
     ///
     /// This is deliberately separate from the unary RPC timeout: historical
@@ -208,6 +218,11 @@ impl Args {
         Duration::from_secs(self.tip_poll_interval_seconds)
     }
 
+    /// Return the live BMM-auction polling interval.
+    pub const fn bmm_request_poll_interval(&self) -> Duration {
+        Duration::from_secs(self.bmm_request_poll_interval_seconds)
+    }
+
     /// Return the live event-stream stall timeout.
     pub const fn stream_stall_timeout(&self) -> Duration {
         Duration::from_secs(self.stream_stall_timeout_seconds)
@@ -243,7 +258,8 @@ impl Args {
                 "resumable_global_bip300_history",
                 "raw_bip300_coinbase_scripts",
                 "resolved_m1_m8_deltas",
-                "treasury_transitions"
+                "treasury_transitions",
+                "live_bmm_bid_snapshots"
             ]),
             creation_reason: "pre-Drivechain Pulse L1 observation dataset".to_owned(),
         }
@@ -304,6 +320,7 @@ mod tests {
         assert_eq!(args.nats.nats_url, "nats://nats:4222");
         assert_eq!(args.log_level, LogLevel::Info);
         assert_eq!(args.request_timeout_seconds, 10);
+        assert_eq!(args.bmm_request_poll_interval_seconds, 5);
         assert_eq!(args.stream_stall_timeout_seconds, 60);
         assert_eq!(args.backfill_page_blocks, 128);
         assert_eq!(args.backfill_page_pause_ms, 100);

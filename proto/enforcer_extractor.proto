@@ -17,6 +17,7 @@ message EnforcerEvent {
     BlockDisconnected block_disconnected = 7;
     WithdrawalBundleProposalsSnapshot withdrawal_bundle_proposals = 8;
     Bip300BlockDelta bip300_block_delta = 10;
+    BmmRequestsSnapshot bmm_requests = 11;
   }
 }
 
@@ -194,6 +195,24 @@ message ConfirmedBmmRequest {
   // 32-byte block hash in conventional display order.
   bytes previous_mainchain_block_hash = 5;
   optional uint64 fee_sats = 6;
+}
+
+// A point-in-time sample of the enforcer's unconfirmed BMM auction. This is
+// not a complete transaction history: requests may enter and leave between
+// polls. The envelope is anchored to the same parent block recorded here.
+message BmmRequestsSnapshot {
+  // 32-byte parent block hash in conventional display order.
+  bytes previous_mainchain_block_hash = 1;
+  repeated BmmRequest requests = 2;
+}
+
+message BmmRequest {
+  uint32 sidechain_number = 1;
+  // 32-byte transaction ID in conventional display order.
+  bytes txid = 2;
+  // Consensus-encoded h* bytes.
+  bytes critical_hash = 3;
+  uint64 bid_sats = 4;
 }
 
 message SidechainDeclaration {

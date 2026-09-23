@@ -17,7 +17,19 @@ jq -n \
     --arg network "${NETWORK_ID}" \
     --arg magic "${ECASH_NETWORK_MAGIC}" \
     --argjson activationHeight "${ECASH_ACTIVATION_HEIGHT}" \
-    '{network: $network, magic: $magic, activationHeight: $activationHeight}'
+    --argjson snapshotHeight "${ECASH_SNAPSHOT_HEIGHT}" \
+    --arg snapshotBlockHash "${ECASH_SNAPSHOT_BLOCK_HASH}" \
+    --arg snapshotTransform "${ECASH_SNAPSHOT_TRANSFORM}" \
+    --arg snapshotSha256 "${ECASH_SNAPSHOT_SHA256}" \
+    --arg snapshotSourceSha256 "${ECASH_SNAPSHOT_SOURCE_SHA256:-}" \
+    --arg snapshotSourceMagic "${ECASH_SNAPSHOT_SOURCE_NETWORK_MAGIC:-}" \
+    '{network: $network, magic: $magic, activationHeight: $activationHeight,
+      snapshotHeight: $snapshotHeight, snapshotBlockHash: $snapshotBlockHash,
+      snapshotTransform: $snapshotTransform, snapshotSha256: $snapshotSha256,
+      snapshotSourceSha256:
+        (if $snapshotSourceSha256 == "" then null else $snapshotSourceSha256 end),
+      snapshotSourceMagic:
+        (if $snapshotSourceMagic == "" then null else $snapshotSourceMagic end)}'
 
 compose ps
 require_service_running ecash-node
@@ -99,6 +111,18 @@ if ! service_is_running nats; then
 fi
 
 if service_is_running postgres; then
+    info "normalized monitor contract and BMM polling"
+    event_contract_version="$(record_current_event_contract_version 2>/dev/null || true)"
+    bmm_polling_live=false
+    if record_current_run_has_bmm_observation 2>/dev/null; then
+        bmm_polling_live=true
+    fi
+    jq -n \
+        --arg event_contract_version "${event_contract_version:-unknown}" \
+        --argjson bmm_polling_live "${bmm_polling_live}" \
+        '{eventContractVersion: $event_contract_version,
+          successfulBmmPollInCurrentRun: $bmm_polling_live}'
+
     info "block history coverage"
     if coverage="$(history_coverage_json 2>/dev/null)" && jq -e . <<<"${coverage}" >/dev/null; then
         jq . <<<"${coverage}"

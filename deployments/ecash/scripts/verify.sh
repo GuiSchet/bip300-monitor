@@ -155,6 +155,17 @@ while :; do
     sleep 2
 done
 
+bmm_wait_seconds="${BMM_REQUEST_WAIT_SECONDS:-30}"
+bmm_deadline="$((SECONDS + bmm_wait_seconds))"
+until record_current_run_has_bmm_observation; do
+    ((SECONDS < bmm_deadline)) ||
+        die "the current extractor run did not record a successful BMM request poll after ${bmm_wait_seconds}s"
+    sleep 1
+done
+event_contract_version="$(record_current_event_contract_version)"
+[[ "${event_contract_version}" == 4 ]] ||
+    die "the current extractor uses event contract v${event_contract_version:-unknown}; Betanet requires v4"
+
 snapshot_height="$(record_snapshot_height)"
 [[ "${snapshot_height}" =~ ^[0-9]+$ ]] ||
     die "the recorded semantic snapshot has no valid height"
@@ -187,4 +198,4 @@ final_active_activations="$(active_sidechain_activations)"
 [[ "${final_active_activations}" == "${active_activations}" ]] ||
     die "the active sidechain set changed during verification; run 'just verify' again so the new slot is included"
 
-info "${NETWORK_ID} observation pipeline verification passed (snapshot live, global BIP300 and slot histories complete, slots=${observed_sidechains:-none})"
+info "${NETWORK_ID} observation pipeline verification passed (contract=v${event_contract_version}, BMM polling live, snapshot live, global BIP300 and slot histories complete, slots=${observed_sidechains:-none})"

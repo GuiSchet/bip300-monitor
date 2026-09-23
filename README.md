@@ -19,6 +19,7 @@ The extractor:
 - stores normalized protobuf events in Postgres before publishing them to NATS;
 - records every capture occurrence separately from its idempotent event fact;
 - records tip transitions and snapshot-consistency windows durably;
+- samples the live BMM auction, including successful empty states;
 - recovers both per-slot block history and global BIP300/301 deltas after
   startup or downtime.
 
@@ -57,9 +58,11 @@ path.
 ## Event contract
 
 The monitor publishes a versioned normalized protobuf contract rather than
-forwarding raw enforcer responses. PostgreSQL schema v4 binds each fact and
-occurrence to a dataset and extractor run, preserves `A -> B -> A` tip order,
-tracks sidechain instances and retains coverage revisions. See
+forwarding raw enforcer responses. Event contract v4 adds normalized live BMM
+request snapshots, and PostgreSQL schema v5 permits multiple auction states at
+one parent block without duplicating repeated observations. Schema v4 binds
+each fact and occurrence to a dataset and extractor run, preserves `A -> B ->
+A` tip order, tracks sidechain instances and retains coverage revisions. See
 [event schema and semantics](proto/README.md) for event variants, byte order,
 snapshot semantics, idempotency and reorg handling.
 
@@ -114,6 +117,8 @@ The locked eCash Alphanet stack includes the node, enforcer, Postgres, Core
 NATS, extractor and logger. See the
 [eCash deployment runbook](deployments/ecash/README.md) for provisioning,
 verification, history status, resource limits and recovery.
+The gated HOSTKEY transition to Betanet is documented in the
+[Betanet migration runbook](docs/betanet-migration.md).
 
 ## Scope
 

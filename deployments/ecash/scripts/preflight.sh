@@ -99,12 +99,27 @@ done < <(network_peers)
 info "locked peers reachable: ${reachable_peers}/${locked_peers}"
 
 # --location matches how snapshot.sh downloads this same URL, so a redirect
-# cannot fail preflight on a snapshot that would fetch correctly.
-snapshot_headers="$(
+# cannot fail preflight on a snapshot that would fetch correctly. A transformed
+# snapshot is fetched from a Bitcoin mirror and verified locally before its
+# four network-magic bytes are rewritten.
+snapshot_remote_url="${ECASH_SNAPSHOT_URL}"
+snapshot_remote_size="${ECASH_SNAPSHOT_SIZE}"
+if [[ "${ECASH_SNAPSHOT_TRANSFORM}" == network_magic_v2 ]]; then
+    snapshot_remote_size="${ECASH_SNAPSHOT_SOURCE_SIZE}"
+fi
+if ! snapshot_headers="$(
     curl --fail --silent --show-error --head --location --max-time 30 \
-        "${ECASH_SNAPSHOT_URL}"
-)" ||
-    die "could not reach the pinned ${NETWORK_ID} snapshot"
+        "${snapshot_remote_url}"
+)"; then
+    if [[ "${ECASH_SNAPSHOT_TRANSFORM}" != network_magic_v2 ]]; then
+        die "could not reach the pinned ${NETWORK_ID} snapshot"
+    fi
+    snapshot_remote_url="${ECASH_SNAPSHOT_MIRROR_URL}"
+    snapshot_headers="$(
+        curl --fail --silent --show-error --head --location --max-time 30 \
+            "${snapshot_remote_url}"
+    )" || die "could not reach either pinned ${NETWORK_ID} snapshot source"
+fi
 snapshot_content_length="$(
     awk '
         tolower($1) == "content-length:" {
@@ -114,16 +129,21 @@ snapshot_content_length="$(
         END { print content_length }
     ' <<<"${snapshot_headers}"
 )"
-[[ "${snapshot_content_length}" == "${ECASH_SNAPSHOT_SIZE}" ]] ||
-    die "snapshot HTTP size is ${snapshot_content_length:-unavailable}, expected ${ECASH_SNAPSHOT_SIZE}"
+[[ "${snapshot_content_length}" == "${snapshot_remote_size}" ]] ||
+    die "snapshot HTTP size is ${snapshot_content_length:-unavailable}, expected ${snapshot_remote_size}"
+info "pinned snapshot source is reachable: ${snapshot_remote_url}"
 
-snapshot_checksums="$(
-    curl --fail --silent --show-error --max-time 15 \
-        "${ECASH_SNAPSHOT_CHECKSUMS_URL}"
-)" || die "could not read the upstream ${NETWORK_ID} snapshot checksums"
-grep -Fxq "${ECASH_SNAPSHOT_SHA256}  ${ECASH_SNAPSHOT_FILE}" \
-    <<<"${snapshot_checksums}" ||
-    die "upstream checksums do not match the locked ${NETWORK_ID} snapshot"
+if [[ "${ECASH_SNAPSHOT_TRANSFORM}" == none ]]; then
+    snapshot_checksums="$(
+        curl --fail --silent --show-error --max-time 15 \
+            "${ECASH_SNAPSHOT_CHECKSUMS_URL}"
+    )" || die "could not read the upstream ${NETWORK_ID} snapshot checksums"
+    grep -Fxq "${ECASH_SNAPSHOT_SHA256}  ${ECASH_SNAPSHOT_FILE}" \
+        <<<"${snapshot_checksums}" ||
+        die "upstream checksums do not match the locked ${NETWORK_ID} snapshot"
+else
+    info "transformed snapshot source and output are pinned by SHA-256 in VERSIONS.lock"
+fi
 
 for image in \
     "${ECASH_NODE_IMAGE}" \

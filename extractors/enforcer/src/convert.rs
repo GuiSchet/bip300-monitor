@@ -45,6 +45,52 @@ pub fn chain_tip(response: mainchain::GetChainTipResponse) -> Result<events::Enf
     )))
 }
 
+/// Convert a point-in-time sample of the unconfirmed BMM auction.
+pub fn bmm_requests(
+    previous_mainchain_block_hash: Vec<u8>,
+    response: mainchain::GetSeenBmmRequestsResponse,
+) -> Result<events::EnforcerEvent> {
+    let previous_mainchain_block_hash = require_32_bytes(
+        previous_mainchain_block_hash,
+        "bmm_requests.previous_mainchain_block_hash",
+    )?;
+    let mut requests = response
+        .requests
+        .into_iter()
+        .enumerate()
+        .map(|(index, request)| {
+            if request.sidechain_number > u32::from(u8::MAX) {
+                bail!(
+                    "BMM request at index {index} has invalid sidechain slot {}",
+                    request.sidechain_number
+                );
+            }
+            Ok(events::BmmRequest {
+                sidechain_number: request.sidechain_number,
+                txid: hash_from_reverse(request.txid, "bmm_request.txid")?,
+                critical_hash: fixed_consensus_hex(
+                    request.critical_hash,
+                    "bmm_request.critical_hash",
+                )?,
+                bid_sats: request.bid_sats,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    requests.sort_by(|left, right| {
+        left.sidechain_number
+            .cmp(&right.sidechain_number)
+            .then_with(|| right.bid_sats.cmp(&left.bid_sats))
+            .then_with(|| left.txid.cmp(&right.txid))
+    });
+
+    Ok(enforcer_event(events::enforcer_event::Event::BmmRequests(
+        events::BmmRequestsSnapshot {
+            previous_mainchain_block_hash,
+            requests,
+        },
+    )))
+}
+
 /// Convert `GetBlockInfo` results, preserving the upstream newest-first order.
 pub fn block_info(
     sidechain_number: u8,
@@ -615,7 +661,7 @@ fn required<T>(value: Option<T>, field: &str) -> Result<T> {
 mod tests {
     use shared::protobuf::enforcer_extractor as events;
 
-    use super::{bip300_block_deltas, network};
+    use super::{bip300_block_deltas, bmm_requests, network};
     use crate::proto::{common, mainchain};
 
     fn reverse_hex(byte: u8) -> common::ReverseHex {
@@ -650,6 +696,64 @@ mod tests {
         // defined network. The warning is what preserves the raw value.
         assert_eq!(network(9_999), events::Network::Unknown);
         assert_eq!(network(-1), events::Network::Unknown);
+    }
+
+    #[test]
+    fn live_bmm_requests_are_validated_and_canonically_sorted() {
+        let response = mainchain::GetSeenBmmRequestsResponse {
+            requests: vec![
+                mainchain::get_seen_bmm_requests_response::BmmRequest {
+                    sidechain_number: 9,
+                    txid: Some(reverse_hex(0x22)),
+                    critical_hash: Some(consensus_hex(&[0x33; 32])),
+                    bid_sats: 10,
+                },
+                mainchain::get_seen_bmm_requests_response::BmmRequest {
+                    sidechain_number: 3,
+                    txid: Some(reverse_hex(0x11)),
+                    critical_hash: Some(consensus_hex(&[0x44; 32])),
+                    bid_sats: 2,
+                },
+                mainchain::get_seen_bmm_requests_response::BmmRequest {
+                    sidechain_number: 9,
+                    txid: Some(reverse_hex(0x55)),
+                    critical_hash: Some(consensus_hex(&[0x66; 32])),
+                    bid_sats: 20,
+                },
+            ],
+        };
+
+        let event = bmm_requests(vec![0xaa; 32], response).expect("valid BMM snapshot");
+        let events::enforcer_event::Event::BmmRequests(snapshot) =
+            event.event.expect("concrete event")
+        else {
+            panic!("wrong normalized event variant")
+        };
+        assert_eq!(snapshot.previous_mainchain_block_hash, vec![0xaa; 32]);
+        assert_eq!(
+            snapshot
+                .requests
+                .iter()
+                .map(|request| (request.sidechain_number, request.bid_sats))
+                .collect::<Vec<_>>(),
+            vec![(3, 2), (9, 20), (9, 10)]
+        );
+    }
+
+    #[test]
+    fn an_observed_empty_bmm_auction_is_a_valid_snapshot() {
+        let event = bmm_requests(
+            vec![0xaa; 32],
+            mainchain::GetSeenBmmRequestsResponse::default(),
+        )
+        .expect("an empty response is observed data");
+        let events::enforcer_event::Event::BmmRequests(snapshot) =
+            event.event.expect("concrete event")
+        else {
+            panic!("wrong normalized event variant")
+        };
+        assert_eq!(snapshot.previous_mainchain_block_hash, vec![0xaa; 32]);
+        assert!(snapshot.requests.is_empty());
     }
 
     #[test]

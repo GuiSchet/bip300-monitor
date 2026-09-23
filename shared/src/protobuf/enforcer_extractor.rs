@@ -3,17 +3,17 @@
 include!(concat!(env!("OUT_DIR"), "/enforcer_extractor.rs"));
 
 /// Version of the normalized enforcer event contract stored with every fact.
-pub const EVENT_CONTRACT_VERSION: u32 = 3;
+pub const EVENT_CONTRACT_VERSION: u32 = 4;
 
 // These fingerprints deliberately live beside the version. Any edit to either
 // protobuf contract makes the test below fail until the compatibility review
 // records a new version/fingerprint pair here.
 #[cfg(test)]
-const EVENT_CONTRACT_V3_ENVELOPE_SHA256: &str =
+const EVENT_CONTRACT_V4_ENVELOPE_SHA256: &str =
     "02f7fa9e75ecc965fe46a0fdb4a9757274f6e29e33b741d5108f954f15574b3e";
 #[cfg(test)]
-const EVENT_CONTRACT_V3_PAYLOAD_SHA256: &str =
-    "cf16cf7b709dd466c05b3fbc45cfe8fd80f85e2a14400a2204cb629da98297bd";
+const EVENT_CONTRACT_V4_PAYLOAD_SHA256: &str =
+    "93732f85315c251992f50fc6e966b91765788daacb0aa8114ee3944a29a8a4d0";
 
 impl enforcer_event::Event {
     /// Stable name of this event variant.
@@ -31,13 +31,17 @@ impl enforcer_event::Event {
             Self::BlockDisconnected(_) => "block_disconnected",
             Self::WithdrawalBundleProposals(_) => "withdrawal_bundle_proposals",
             Self::Bip300BlockDelta(_) => "bip300_block_delta",
+            Self::BmmRequests(_) => "bmm_requests",
         }
     }
 
     /// The sidechain slot this event is scoped to, if any.
     pub const fn sidechain_number(&self) -> Option<u32> {
         match self {
-            Self::ChainInfo(_) | Self::ChainTip(_) | Self::Bip300BlockDelta(_) => None,
+            Self::ChainInfo(_)
+            | Self::ChainTip(_)
+            | Self::Bip300BlockDelta(_)
+            | Self::BmmRequests(_) => None,
             Self::SidechainProposals(_) | Self::ActiveSidechains(_) => None,
             Self::Ctip(snapshot) => Some(snapshot.sidechain_number),
             Self::BlockConnected(block) => Some(block.sidechain_number),
@@ -55,17 +59,17 @@ mod kind_tests {
 
     #[test]
     fn contract_version_matches_the_reviewed_proto_fingerprints() {
-        assert_eq!(super::EVENT_CONTRACT_VERSION, 3);
+        assert_eq!(super::EVENT_CONTRACT_VERSION, 4);
         assert_eq!(
             hex::encode(Sha256::digest(include_bytes!("../../../proto/event.proto"))),
-            super::EVENT_CONTRACT_V3_ENVELOPE_SHA256,
+            super::EVENT_CONTRACT_V4_ENVELOPE_SHA256,
             "event.proto changed: review compatibility and bump EVENT_CONTRACT_VERSION"
         );
         assert_eq!(
             hex::encode(Sha256::digest(include_bytes!(
                 "../../../proto/enforcer_extractor.proto"
             ))),
-            super::EVENT_CONTRACT_V3_PAYLOAD_SHA256,
+            super::EVENT_CONTRACT_V4_PAYLOAD_SHA256,
             "enforcer_extractor.proto changed: review compatibility and bump EVENT_CONTRACT_VERSION"
         );
     }
@@ -89,6 +93,7 @@ mod kind_tests {
             )
             .kind(),
             enforcer_event::Event::Bip300BlockDelta(super::Bip300BlockDelta::default()).kind(),
+            enforcer_event::Event::BmmRequests(super::BmmRequestsSnapshot::default()).kind(),
         ];
 
         let unique = kinds.iter().collect::<std::collections::BTreeSet<_>>();
