@@ -254,12 +254,14 @@ impl Args {
                 "tip_observations",
                 "snapshot_consistency",
                 "extractor_status",
+                "per_worker_health",
                 "resumable_sidechain_history",
                 "resumable_global_bip300_history",
                 "raw_bip300_coinbase_scripts",
                 "resolved_m1_m8_deltas",
                 "treasury_transitions",
-                "live_bmm_bid_snapshots"
+                "live_bmm_bid_snapshots",
+                "mempool_backed_bmm_bid_snapshots"
             ]),
             creation_reason: "pre-Drivechain Pulse L1 observation dataset".to_owned(),
         }

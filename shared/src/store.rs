@@ -36,6 +36,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../schema/0003_history_coverage.sql"),
     include_str!("../schema/0004_observation_provenance.sql"),
     include_str!("../schema/0005_event_fact_identity.sql"),
+    include_str!("../schema/0006_worker_health_and_observation_order.sql"),
 ];
 
 /// Advisory-lock key that serializes the migration of one record.
@@ -253,7 +254,8 @@ impl Default for DatasetManifest {
                 "event_observations",
                 "tip_observations",
                 "snapshot_consistency",
-                "extractor_status"
+                "extractor_status",
+                "per_worker_health"
             ]),
             creation_reason: "development or test dataset".to_owned(),
         }
@@ -268,6 +270,23 @@ pub enum CaptureMethod {
     Backfill,
     Poll,
     Reconcile,
+}
+
+/// Independently supervised workers whose health must not overwrite another
+/// worker's status.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExtractorWorker {
+    MainchainTip,
+    BmmRequests,
+}
+
+impl ExtractorWorker {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::MainchainTip => "mainchain_tip",
+            Self::BmmRequests => "bmm_requests",
+        }
+    }
 }
 
 /// Whether the mainchain tip stayed fixed around a grouped unary snapshot.
@@ -812,34 +831,106 @@ impl Store {
         Ok(())
     }
 
-    /// Record an operational extractor error without changing durable facts.
-    pub async fn record_extractor_error(&self, error: &str) -> Result<()> {
-        let client = self.client.lock().await;
-        client
-            .execute(
-                "UPDATE extractor_status
-                    SET last_error = $4, updated_at = now()
-                  WHERE dataset_id = $1::text::uuid AND source = $2 AND run_id = $3::text::uuid",
-                &[&self.dataset_id, &self.source, &self.run_id, &error],
-            )
+    /// Create the durable rows for independently supervised workers.
+    pub async fn initialize_worker_statuses(&self, workers: &[ExtractorWorker]) -> Result<()> {
+        let mut client = self.client.lock().await;
+        let transaction = client
+            .transaction()
             .await
-            .context("recording the extractor error")?;
+            .context("opening the worker-status initialization transaction")?;
+        for worker in workers {
+            transaction
+                .execute(
+                    "INSERT INTO extractor_worker_status (run_id, worker)
+                     VALUES ($1::text::uuid, $2)
+                     ON CONFLICT (run_id, worker) DO NOTHING",
+                    &[&self.run_id, &worker.as_str()],
+                )
+                .await
+                .with_context(|| format!("initializing {} worker status", worker.as_str()))?;
+        }
+        recompute_extractor_error(&transaction, &self.dataset_id, self.source, &self.run_id)
+            .await?;
+        transaction
+            .commit()
+            .await
+            .context("committing worker-status initialization")?;
         Ok(())
     }
 
-    /// Clear a previously reported operational error after recovery.
-    pub async fn clear_extractor_error(&self) -> Result<()> {
-        let client = self.client.lock().await;
-        client
-            .execute(
-                "UPDATE extractor_status
-                    SET last_error = NULL, updated_at = now()
-                  WHERE dataset_id = $1::text::uuid AND source = $2
-                    AND run_id = $3::text::uuid AND last_error IS NOT NULL",
-                &[&self.dataset_id, &self.source, &self.run_id],
+    /// Record one worker failure and expose it after the configured threshold.
+    /// Returns the durable consecutive-failure count.
+    pub async fn record_worker_failure(
+        &self,
+        worker: ExtractorWorker,
+        error: &str,
+        degraded_after: u32,
+    ) -> Result<u32> {
+        if degraded_after == 0 {
+            bail!("worker degradation threshold must be positive");
+        }
+        let threshold = i32::try_from(degraded_after)
+            .context("worker degradation threshold does not fit in an i32")?;
+        let mut client = self.client.lock().await;
+        let transaction = client
+            .transaction()
+            .await
+            .context("opening the worker failure transaction")?;
+        let row = transaction
+            .query_opt(
+                "UPDATE extractor_worker_status
+                    SET consecutive_failures = consecutive_failures + 1,
+                        last_error = CASE
+                            WHEN consecutive_failures + 1 >= $3 THEN $4
+                            ELSE NULL
+                        END,
+                        last_failure_at = now(),
+                        updated_at = now()
+                  WHERE run_id = $1::text::uuid AND worker = $2
+                  RETURNING consecutive_failures",
+                &[&self.run_id, &worker.as_str(), &threshold, &error],
             )
             .await
-            .context("clearing the extractor error")?;
+            .with_context(|| format!("recording {} worker failure", worker.as_str()))?
+            .with_context(|| format!("{} worker status was not initialized", worker.as_str()))?;
+        let failures: i32 = row.get(0);
+        recompute_extractor_error(&transaction, &self.dataset_id, self.source, &self.run_id)
+            .await?;
+        transaction
+            .commit()
+            .await
+            .context("committing the worker failure")?;
+        u32::try_from(failures).context("worker failure count is negative")
+    }
+
+    /// Mark one worker healthy without touching any other worker's error.
+    pub async fn record_worker_success(&self, worker: ExtractorWorker) -> Result<()> {
+        let mut client = self.client.lock().await;
+        let transaction = client
+            .transaction()
+            .await
+            .context("opening the worker success transaction")?;
+        let updated = transaction
+            .execute(
+                "UPDATE extractor_worker_status
+                    SET consecutive_failures = 0,
+                        last_error = NULL,
+                        last_success_at = now(),
+                        updated_at = now()
+                  WHERE run_id = $1::text::uuid AND worker = $2",
+                &[&self.run_id, &worker.as_str()],
+            )
+            .await
+            .with_context(|| format!("recording {} worker success", worker.as_str()))?;
+        if updated != 1 {
+            bail!("{} worker status was not initialized", worker.as_str());
+        }
+        recompute_extractor_error(&transaction, &self.dataset_id, self.source, &self.run_id)
+            .await?;
+        transaction
+            .commit()
+            .await
+            .context("committing the worker success")?;
         Ok(())
     }
 
@@ -1822,13 +1913,36 @@ async fn update_extractor_status(
             "UPDATE extractor_status
                 SET last_tip_hash = $4,
                     last_tip_height = $5,
-                    last_error = NULL,
                     updated_at = now()
               WHERE dataset_id = $1::text::uuid AND source = $2 AND run_id = $3::text::uuid",
             &[&dataset_id, &source, &run_id, &tip.hash, &height],
         )
         .await
         .context("updating extractor status")?;
+    Ok(())
+}
+
+async fn recompute_extractor_error(
+    transaction: &Transaction<'_>,
+    dataset_id: &str,
+    source: &str,
+    run_id: &str,
+) -> Result<()> {
+    transaction
+        .execute(
+            "UPDATE extractor_status
+                SET last_error = (
+                        SELECT string_agg(worker || ': ' || last_error, '; ' ORDER BY worker)
+                          FROM extractor_worker_status
+                         WHERE run_id = $3::text::uuid AND last_error IS NOT NULL
+                    ),
+                    updated_at = now()
+              WHERE dataset_id = $1::text::uuid AND source = $2
+                AND run_id = $3::text::uuid",
+            &[&dataset_id, &source, &run_id],
+        )
+        .await
+        .context("recomputing aggregate extractor error")?;
     Ok(())
 }
 

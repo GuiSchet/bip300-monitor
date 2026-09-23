@@ -18,11 +18,13 @@ assignments as an audit reference.
   `00000000000000030101ba5cfea54b22becc79f95dc6040beb76e01dd9d04042`.
 - Wire magic `eca5b104`; P2P/RPC ports `8533`/`8532`.
 
-The normalized monitor contract is v4. It adds live BMM auction snapshots with
-slot, transaction id, critical hash and bid in satoshis. Facts are sorted
-canonically and hashed without their observation timestamp, while every poll
-occurrence remains in `event_observation`. A successful empty response is
-recorded; an RPC error is not converted into an empty auction.
+The normalized monitor contract is v5. It requires the validator mempool task
+behind live BMM auction snapshots and records independent health for the tip
+and BMM workers. BMM facts contain slot, transaction id, critical hash and bid
+in satoshis; they are sorted canonically and hashed without their observation
+timestamp, while every poll occurrence remains in `event_observation`. A
+successful empty response is recorded; an RPC error is not converted into an
+empty auction.
 
 ## Reviewed AssumeUTXO bootstrap
 
@@ -61,7 +63,7 @@ and the Betanet artifact matched
 Before touching HOSTKEY:
 
 1. push the enforcer observer branch (the node is the official pinned image);
-2. merge the monitor v4 change and publish the extractor/logger images;
+2. merge the monitor v5 change and publish the extractor/logger images;
 3. run all Rust, Postgres, NATS and deployment static tests;
 4. resolve every image to an immutable `linux/amd64` digest;
 5. confirm neither the active nor audit-reference lock contains a
@@ -109,7 +111,8 @@ Alphanet chainstate directory.
    genesis replay continues in the background.
 7. Start the validator-only enforcer with `just enforcer-up`, then the pipeline
    with `just monitor-up`.
-8. Run `just verify`. It requires contract v4, a successful BMM poll (an empty
+8. Run `just verify`. It requires contract v5, validator mempool synchronization,
+   healthy independent tip/BMM workers, and a successful BMM poll (an empty
    auction is valid), a semantic snapshot, complete global delta coverage and
    complete active-slot history.
 9. Run `just verify-live`, then `just accept`. The marker records snapshot

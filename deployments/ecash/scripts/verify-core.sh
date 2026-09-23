@@ -23,6 +23,8 @@ jq -e '[.services[]?.ports[]?] | length == 0' <<<"${config_json}" >/dev/null ||
 
 require_rpc_cookie_readable
 require_service_running enforcer
+enforcer_mempool_tracking_is_enabled ||
+    die "enforcer is not running the validator mempool synchronization task"
 chain_info="$(enforcer_rpc GetChainInfo)" || die "enforcer RPC is not ready"
 jq -e --arg network "${ENFORCER_API_NETWORK}" '.network == $network' \
     <<<"${chain_info}" >/dev/null ||

@@ -35,12 +35,18 @@ history_slots="$(jq -er '.slots | map(tostring) | join(",")' "${live_result}")"
     die "live verification returned an invalid block hash"
 record_current_run_has_bmm_observation ||
     die "the current extractor run has no successful BMM request observation"
+enforcer_mempool_tracking_is_enabled ||
+    die "the enforcer is not running the validator mempool synchronization task"
+record_current_workers_are_healthy ||
+    die "the current extractor run has an unhealthy or uninitialized worker"
 event_contract_version="$(record_current_event_contract_version)"
-[[ "${event_contract_version}" == 4 ]] ||
-    die "the current extractor uses event contract v${event_contract_version:-unknown}; Betanet requires v4"
+[[ "${event_contract_version}" == 5 ]] ||
+    die "the current extractor uses event contract v${event_contract_version:-unknown}; Betanet requires v5"
 run_capabilities="$(record_current_run_capabilities)"
 jq -e 'index("live_bmm_bid_snapshots") != null' <<<"${run_capabilities}" >/dev/null ||
     die "the active extractor run does not declare live_bmm_bid_snapshots"
+jq -e 'index("mempool_backed_bmm_bid_snapshots") != null' <<<"${run_capabilities}" >/dev/null ||
+    die "the active extractor run does not declare mempool_backed_bmm_bid_snapshots"
 chainstates="$(node_cli getchainstates)" || die "could not read node chainstates"
 history_fully_validated=false
 if node_history_is_fully_validated "${chainstates}"; then
@@ -58,6 +64,7 @@ fi
     printf 'event_contract_version=%s\n' "${event_contract_version}"
     printf 'extractor_run_capabilities=%s\n' "$(jq -c . <<<"${run_capabilities}")"
     printf 'bmm_request_polling_verified=true\n'
+    printf 'bmm_mempool_tracking_enabled=true\n'
     printf 'snapshot_trust_enabled=%s\n' "${TRUST_ASSUMEUTXO_SNAPSHOT}"
     printf 'snapshot_transform=%s\n' "${ECASH_SNAPSHOT_TRANSFORM}"
     printf 'snapshot_height=%s\n' "${ECASH_SNAPSHOT_HEIGHT}"

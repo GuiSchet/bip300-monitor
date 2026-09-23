@@ -69,6 +69,7 @@ services:
       - --node-rpc-cookie-path=/rpc-cookie/.cookie
       - --node-zmq-addr-sequence=tcp://ecash-node:${ECASH_NODE_ZMQ_PORT}
       - --node-blocks-dir=/node-blocks
+      - --enable-mempool
       - --serve-grpc-addr=0.0.0.0:50051
       - --bitcoin-core-expected-version=${ECASH_NODE_EXPECTED_VERSION:?ECASH_NODE_EXPECTED_VERSION must be set by VERSIONS.lock}
       - --log-level=INFO

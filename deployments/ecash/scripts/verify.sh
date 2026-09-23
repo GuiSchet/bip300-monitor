@@ -163,8 +163,24 @@ until record_current_run_has_bmm_observation; do
     sleep 1
 done
 event_contract_version="$(record_current_event_contract_version)"
-[[ "${event_contract_version}" == 4 ]] ||
-    die "the current extractor uses event contract v${event_contract_version:-unknown}; Betanet requires v4"
+[[ "${event_contract_version}" == 5 ]] ||
+    die "the current extractor uses event contract v${event_contract_version:-unknown}; Betanet requires v5"
+run_capabilities="$(record_current_run_capabilities)"
+jq -e '
+    index("live_bmm_bid_snapshots") != null
+    and index("mempool_backed_bmm_bid_snapshots") != null
+    and index("per_worker_health") != null
+' <<<"${run_capabilities}" >/dev/null ||
+    die "the current extractor run does not declare mempool-backed BMM and per-worker health"
+worker_wait_seconds="${WORKER_HEALTH_WAIT_SECONDS:-60}"
+worker_deadline="$((SECONDS + worker_wait_seconds))"
+until record_current_workers_are_healthy; do
+    ((SECONDS < worker_deadline)) || {
+        worker_status="$(record_current_worker_status_json 2>/dev/null || printf 'unavailable')"
+        die "extractor workers were not healthy after ${worker_wait_seconds}s; status=${worker_status}"
+    }
+    sleep 1
+done
 
 snapshot_height="$(record_snapshot_height)"
 [[ "${snapshot_height}" =~ ^[0-9]+$ ]] ||
@@ -198,4 +214,4 @@ final_active_activations="$(active_sidechain_activations)"
 [[ "${final_active_activations}" == "${active_activations}" ]] ||
     die "the active sidechain set changed during verification; run 'just verify' again so the new slot is included"
 
-info "${NETWORK_ID} observation pipeline verification passed (contract=v${event_contract_version}, BMM polling live, snapshot live, global BIP300 and slot histories complete, slots=${observed_sidechains:-none})"
+info "${NETWORK_ID} observation pipeline verification passed (contract=v${event_contract_version}, mempool-backed BMM polling live, workers healthy, snapshot live, global BIP300 and slot histories complete, slots=${observed_sidechains:-none})"

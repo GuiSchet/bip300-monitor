@@ -15,7 +15,9 @@ use shared::protobuf::enforcer_extractor as events;
 use shared::protobuf::event::event::MonitorEvent;
 use shared::protobuf::event::{Event, ObservedBlock};
 use shared::recorder::Recorder;
-use shared::store::{CaptureMethod, SidechainInstanceRef, SnapshotConsistency, SnapshotMetadata};
+use shared::store::{
+    CaptureMethod, ExtractorWorker, SidechainInstanceRef, SnapshotConsistency, SnapshotMetadata,
+};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinSet;
 use tokio::time::Instant;
@@ -720,6 +722,10 @@ async fn prepare_startup(args: &Args) -> Result<PreparedStartup> {
     )
     .await
     .context("connecting the event recorder")?;
+    recorder
+        .initialize_worker_statuses(&[ExtractorWorker::MainchainTip, ExtractorWorker::BmmRequests])
+        .await
+        .context("initializing extractor worker status")?;
 
     Ok(PreparedStartup {
         recorder,
@@ -1142,7 +1148,7 @@ async fn monitor_tip(
         block_tx,
         tip_tx,
         shutdown_rx,
-        move |tip, previous, moved, recovered| {
+        move |tip, previous, moved, _recovered| {
             let recorder = observation_recorder.clone();
             async move {
                 if moved {
@@ -1154,24 +1160,27 @@ async fn monitor_tip(
                             SystemTime::now(),
                         )
                         .await
-                        .context("recording a polled mainchain tip")
-                } else if recovered {
-                    if let Err(error) = recorder.clear_extractor_error().await {
-                        tracing::warn!(
-                            error = %format!("{error:#}"),
-                            "could not clear recovered extractor status"
-                        );
-                    }
-                    Ok(())
-                } else {
-                    Ok(())
+                        .context("recording a polled mainchain tip")?;
                 }
+                if let Err(error) = recorder
+                    .record_worker_success(ExtractorWorker::MainchainTip)
+                    .await
+                {
+                    tracing::warn!(
+                        error = %format!("{error:#}"),
+                        "could not persist healthy mainchain-tip worker status"
+                    );
+                }
+                Ok(())
             }
         },
         move |message| {
             let recorder = error_recorder.clone();
             async move {
-                if let Err(error) = recorder.record_extractor_error(&message).await {
+                if let Err(error) = recorder
+                    .record_worker_failure(ExtractorWorker::MainchainTip, &message, 1)
+                    .await
+                {
                     tracing::warn!(
                         error = %format!("{error:#}"),
                         "could not persist the tip-read error in extractor status"
@@ -1216,12 +1225,13 @@ async fn monitor_bmm_requests(
                     .record_batch_with_method(vec![event], CaptureMethod::Poll)
                     .await
                     .context("recording a live BMM request snapshot")?;
-                if consecutive_failures >= DEGRADED_AFTER_FAILURES
-                    && let Err(error) = recorder.clear_extractor_error().await
+                if let Err(error) = recorder
+                    .record_worker_success(ExtractorWorker::BmmRequests)
+                    .await
                 {
                     tracing::warn!(
                         error = %format!("{error:#}"),
-                        "could not clear recovered BMM polling status"
+                        "could not persist healthy BMM polling status"
                     );
                 }
                 consecutive_failures = 0;
@@ -1229,8 +1239,13 @@ async fn monitor_bmm_requests(
             Err(error) => {
                 consecutive_failures = consecutive_failures.saturating_add(1);
                 let message = format!("live BMM request poll failed: {error:#}");
-                if consecutive_failures == DEGRADED_AFTER_FAILURES
-                    && let Err(status_error) = recorder.record_extractor_error(&message).await
+                if let Err(status_error) = recorder
+                    .record_worker_failure(
+                        ExtractorWorker::BmmRequests,
+                        &message,
+                        DEGRADED_AFTER_FAILURES,
+                    )
+                    .await
                 {
                     tracing::warn!(
                         error = %format!("{status_error:#}"),

@@ -111,7 +111,7 @@ if ! service_is_running nats; then
 fi
 
 if service_is_running postgres; then
-    info "normalized monitor contract and BMM polling"
+    info "normalized monitor contract, BMM polling, and worker health"
     event_contract_version="$(record_current_event_contract_version 2>/dev/null || true)"
     bmm_polling_live=false
     if record_current_run_has_bmm_observation 2>/dev/null; then
@@ -122,6 +122,13 @@ if service_is_running postgres; then
         --argjson bmm_polling_live "${bmm_polling_live}" \
         '{eventContractVersion: $event_contract_version,
           successfulBmmPollInCurrentRun: $bmm_polling_live}'
+
+    if worker_status="$(record_current_worker_status_json 2>/dev/null)" &&
+        jq -e . <<<"${worker_status}" >/dev/null; then
+        jq '{workers: .}' <<<"${worker_status}"
+    else
+        info "extractor worker health is not available yet"
+    fi
 
     info "block history coverage"
     if coverage="$(history_coverage_json 2>/dev/null)" && jq -e . <<<"${coverage}" >/dev/null; then
