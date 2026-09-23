@@ -9,7 +9,7 @@ load_versions
 export COMPOSE_ENV_FILE="${DEPLOYMENT_ROOT}/.env.example"
 load_deployment_env
 
-for command_name in cmp cp dd docker git jq just mktemp od rm shellcheck shfmt stat tr yamllint; do
+for command_name in cmp cp dd diff docker git jq just mktemp od rm shellcheck shfmt stat tr yamllint; do
     require_command "${command_name}"
 done
 
@@ -605,7 +605,10 @@ actual_peer_count="$(grep -c '^addnode=' "${rendered_node_config}")"
     die "rendered node configuration contains an unexpected peer"
 
 [[ "${LOCK_FORMAT}" == 4 ]]
-[[ "${ECASH_SNAPSHOT_TRANSFORM}" == none ]]
+[[ "${NETWORK_ID}" == betanet ]]
+[[ "${ECASH_SNAPSHOT_TRANSFORM}" == network_magic_v2 ]]
+[[ "${ECASH_SNAPSHOT_SOURCE_SHA256}" =~ ^[[:xdigit:]]{64}$ ]]
+[[ "${ECASH_SNAPSHOT_SOURCE_NETWORK_MAGIC}" == f9beb4d9 ]]
 [[ "${ECASH_NETWORK_MAGIC}" =~ ^[[:xdigit:]]{8}$ ]]
 [[ "${ECASH_ACTIVATION_BLOCK_HASH}" =~ ^[[:xdigit:]]{64}$ ]]
 [[ "${ECASH_SNAPSHOT_SHA256}" =~ ^[[:xdigit:]]{64}$ ]]
@@ -623,6 +626,15 @@ legacy_prefix=DRYNET
 if grep -R -n --exclude-dir=data "${legacy_prefix}_" "${DEPLOYMENT_ROOT}"; then
     die "deployment still contains a legacy drynet variable"
 fi
+if grep -qE 'REPLACE_WITH_' \
+    "${DEPLOYMENT_ROOT}/VERSIONS.lock" \
+    "${DEPLOYMENT_ROOT}/VERSIONS.betanet.lock.example"; then
+    die "the promoted Betanet locks contain unresolved placeholders"
+fi
+diff \
+    <(grep -E '^[A-Z][A-Z0-9_]*=' "${DEPLOYMENT_ROOT}/VERSIONS.lock") \
+    <(grep -E '^[A-Z][A-Z0-9_]*=' "${DEPLOYMENT_ROOT}/VERSIONS.betanet.lock.example") ||
+    die "active Betanet lock differs from its reviewed audit reference"
 
 repository_root="$(git -C "${DEPLOYMENT_ROOT}" rev-parse --show-toplevel)"
 if grep -Fq "hashFiles('deployments/ecash" \

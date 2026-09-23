@@ -1,75 +1,68 @@
 # shellcheck shell=bash
-# Reproducible eCash network, image, tool, and snapshot lock.
+# Reproducible eCash Betanet network, image, tool, and snapshot lock.
 LOCK_FORMAT=4
-LOCKED_AT=2026-09-15
+LOCKED_AT=2026-09-22
 
-NETWORK_ID=alphanet
+NETWORK_ID=betanet
 ECASH_NODE_CHAIN=main
-# Descriptive only: no RPC exposes the wire magic, so nothing here can assert
-# it. Network identity is proven by require_activation_block (exact block hash
-# at the fork height) plus require_node_peer, which only succeeds when the
-# node's compiled-in magic matches its peers.
-ECASH_NETWORK_MAGIC=eca5a104
+ECASH_NETWORK_MAGIC=eca5b104
 ECASH_NODE_P2P_PORT=8533
 ECASH_NODE_RPC_PORT=8532
 ECASH_NODE_ZMQ_PORT=29000
-ECASH_PUBLIC_PEERS=seed.alpha.ecash.ninja:8533,seed.alpha.bip300.xyz:8533,seed.alpha.ecash.drivecha.in:8533,seed.alpha.ecash.zuexeuz.net:8533
-ECASH_TIP_HEIGHT_URL=https://esplora.alpha.ecash.ninja/blocks/tip/height
+ECASH_PUBLIC_PEERS=seed.beta.ecash.ninja:8533,seed.beta.bip300.xyz:8533,seed.beta.ecash.drivecha.in:8533,seed.beta.ecash.zuexeuz.net:8533
+ECASH_TIP_HEIGHT_URL=https://esplora.beta.ecash.ninja/blocks/tip/height
 ECASH_EXPECTED_DATA_BYTES=1200000000000
 ECASH_MIN_FREE_PERCENT=20
 
-# The node, NATS and Postgres are pinned to multi-architecture index digests,
-# which is what `docker pull <tag>` reports. The reviewed observer enforcer and
-# monitor images are built only for linux/amd64, so their tags resolve straight
-# to single manifests. preflight.sh validates both shapes and rejects a pin
-# without exactly one linux/amd64 runtime.
+# Official Betanet source and image reviewed on 2026-09-22. This build already
+# contains Bitcoin Core's height-935000 AssumeUTXO commitment, so no custom
+# consensus fork is required.
 ECASH_NODE_REPO=https://github.com/ecash-com/bitcoin.git
-ECASH_NODE_BRANCH=alphanet
-ECASH_NODE_COMMIT=e9267a1f88f1856789348a61f04718529e1bd063
-ECASH_NODE_IMAGE=ghcr.io/ecash-com/bitcoin:alphanet@sha256:22698f3306b4b6658a64beb33c506442b2385aae8b7fb786986ac1c5e8843304
+ECASH_NODE_BRANCH=betanet
+ECASH_NODE_COMMIT=ca64033c137457a3c8ca394186759819a2ab0694
+ECASH_NODE_IMAGE=ghcr.io/ecash-com/bitcoin:betanet@sha256:b98407f8853d2d7f6c060e6c4b99641402ede40d9227730474bfa2beea239f52
 ECASH_NODE_EXPECTED_VERSION=31
 
 ENFORCER_REPO=https://github.com/GuiSchet/bip300301_enforcer.git
-ENFORCER_BRANCH=feature/bip300-monitor-block-delta
-ENFORCER_COMMIT=2ea92c062869199bfec21dd21fdd6192a87dafec
-ENFORCER_IMAGE=ghcr.io/guischet/bip300301_enforcer:sha-2ea92c062869@sha256:0fe3c397f205eb016c95858a2395013c32233d127fadc7c2a8ad25b342aa3065
-# Reviewed observer fork. This commit is based directly on
-# ENFORCER_BASE_COMMIT and adds only the read-only GetBip300BlockDelta contract
-# and implementation. The runtime commit and immutable image pin are the exact
-# observer build; the official base remains recorded separately for provenance.
-ENFORCER_BASE_COMMIT=7958ceffa997ffa905f046de71c8e3cf33437c2d
-ENFORCER_OBSERVER_COMMIT=2ea92c062869199bfec21dd21fdd6192a87dafec
-ENFORCER_NETWORK_PRESET=alphanet
+ENFORCER_BRANCH=feature/betanet-monitor-observer
+ENFORCER_BASE_COMMIT=0e27251ef351a522c72ab9ef079f75e06075390f
+ENFORCER_OBSERVER_COMMIT=0740a39380b39885fe8655f79f78150001d8a15b
+ENFORCER_COMMIT=0740a39380b39885fe8655f79f78150001d8a15b
+ENFORCER_IMAGE=ghcr.io/guischet/bip300301_enforcer:sha-0740a39380b3@sha256:6dcbc506f7c110d26018bac5be93924b5b9788b9948d53e2d1fbb2bd70d3990d
+ENFORCER_NETWORK_PRESET=betanet
 ENFORCER_API_NETWORK=NETWORK_MAINNET
 
 NATS_IMAGE=docker.io/library/nats:2.14.3-alpine@sha256:c11af972c99ae542de8925e6a7d9c533aa1eb039660420d2074beed6089b3bf0
-
-# Postgres is the authoritative record. NATS stays as best-effort live fan-out,
-# so losing a message there costs nothing once the row is committed.
 POSTGRES_IMAGE=docker.io/library/postgres:18.2-alpine@sha256:035b9ab53cfa147d7202b61f5f7782b939ae815b7d6bc81c96b7b42ff1fca950
 POSTGRES_DB=bip300_monitor
 POSTGRES_USER=bip300_monitor
 
-MONITOR_IMAGE_COMMIT=29956711578b33ed45f828691d038bfa0babd2f4
-ENFORCER_EXTRACTOR_IMAGE=docker.io/guischet/bip300-enforcer-extractor:sha-29956711578b@sha256:91e06a9302977fcca0cf499725b3ba80e73a65dc2b84cae1e6533094495b964b
-EVENT_LOGGER_IMAGE=docker.io/guischet/bip300-event-logger:sha-29956711578b@sha256:4e1f298b2fde8eafe011b9cfc1bf61ce0ffc4ed2e2ef529715e7a5b70a16bc51
+# Source commit from which the v4 extractor/logger images were built.
+MONITOR_IMAGE_COMMIT=490cdfa6cb87498a91f6f4c91f0a2c33ac486856
+ENFORCER_EXTRACTOR_IMAGE=docker.io/guischet/bip300-enforcer-extractor:sha-490cdfa6cb87@sha256:c118b153826a11ad2850b281abfb4d2e951c74e4d476beefd58949d0b614e804
+EVENT_LOGGER_IMAGE=docker.io/guischet/bip300-event-logger:sha-490cdfa6cb87@sha256:82b560db0baa31e871fe775da973fdbc978f171e51c9a96f2fe0bc422d119217
 
 JUST_VERSION=1.57.0
 JUST_TARGET=x86_64-unknown-linux-musl
 JUST_SHA256=45b548094283cb9739af8f13273b8cddeee869f5b4ef2bb631b1f311cb566155
 
-ECASH_ACTIVATION_HEIGHT=963648
-ECASH_ACTIVATION_BLOCK_HASH=0000000000b360c17636b7a6c366e3effbe91a847eb5d61b7a7b29476439e924
-ECASH_SNAPSHOT_URL=https://data.drivechain.dev/alphanet/utxo-963648.dat
-ECASH_SNAPSHOT_CHECKSUMS_URL=https://data.drivechain.dev/alphanet/SHA256SUMS
-ECASH_SNAPSHOT_FILE=utxo-963648.dat
-ECASH_SNAPSHOT_HEIGHT=963648
-ECASH_SNAPSHOT_BLOCK_HASH=0000000000b360c17636b7a6c366e3effbe91a847eb5d61b7a7b29476439e924
-ECASH_SNAPSHOT_TRANSFORM=none
-# Commitment compiled into the pinned node. These two values are provenance
-# inputs for reviewing a future network-specific node build; loadtxoutset is
-# the runtime authority that recomputes and enforces them.
-ECASH_SNAPSHOT_UTXO_HASH=9dcc897da984d93eda56e5c4d0c4d6b54e75df7d03f5c8ae1459f511fadf7210
-ECASH_SNAPSHOT_CHAIN_TX_COUNT=1423154850
-ECASH_SNAPSHOT_SIZE=9468026932
-ECASH_SNAPSHOT_SHA256=ca4ea635bfd26fbfeb2fa38cc38298ce916b61a9411e4926fe248292d0b1fd31
+# The official node commits to the Bitcoin height-935000 UTXO set. The UTXO
+# contents are shared history, but snapshot format v2 embeds Bitcoin's network
+# magic. snapshot.sh verifies the source and rewrites only those four metadata
+# bytes before loadtxoutset validates the compiled UTXO commitment.
+ECASH_ACTIVATION_HEIGHT=967680
+ECASH_ACTIVATION_BLOCK_HASH=00000000000000030101ba5cfea54b22becc79f95dc6040beb76e01dd9d04042
+ECASH_SNAPSHOT_HEIGHT=935000
+ECASH_SNAPSHOT_BLOCK_HASH=0000000000000000000147034958af1652b2b91bba607beacc5e72a56f0fb5ee
+ECASH_SNAPSHOT_TRANSFORM=network_magic_v2
+ECASH_SNAPSHOT_URL=https://achow101.com/files/utxo-snapshots/mainnet-935000-utxos.dat
+ECASH_SNAPSHOT_MIRROR_URL=https://files-vps02.jaonoctus.dev/utxo-935000.dat
+ECASH_SNAPSHOT_SOURCE_FILE=mainnet-935000-utxos.dat
+ECASH_SNAPSHOT_SOURCE_SIZE=9387990306
+ECASH_SNAPSHOT_SOURCE_SHA256=e572ddbe456d254f05fb004cebe225bdb3656074b66f0e9b1c7fa83e1301d486
+ECASH_SNAPSHOT_SOURCE_NETWORK_MAGIC=f9beb4d9
+ECASH_SNAPSHOT_FILE=utxo-935000-betanet.dat
+ECASH_SNAPSHOT_UTXO_HASH=e4b90ef9eae834f56c4b64d2d50143cee10ad87994c614d7d04125e2a6025050
+ECASH_SNAPSHOT_CHAIN_TX_COUNT=1305397408
+ECASH_SNAPSHOT_SIZE=9387990306
+ECASH_SNAPSHOT_SHA256=dd38115648221d796a42685d449b84e7ebf352a57bdda37679cece5f6137d1e0

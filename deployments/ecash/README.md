@@ -1,19 +1,19 @@
 # eCash deployment
 
 Single-VM infrastructure for exercising `bip300-monitor` against a pinned
-eCash/Drivechain network. The active lock targets **Alphanet** and deploys its
+eCash/Drivechain network. The active lock targets **Betanet** and deploys its
 L1 node, validator enforcer, Postgres record, Core NATS transport, enforcer
 extractor, and event logger. Network-specific values live in `VERSIONS.lock` and
 the node configuration is generated from those values plus
 `config/ecash.conf.template`. The scripts and Compose topology are shared so a
 future Beta or Mainnet transition does not require another deployment copy.
 
-The reviewed, fail-closed HOSTKEY transition procedure is in
+The reviewed, fail-closed HOSTKEY transition procedure and its Alphanet
+preservation gates are in
 [`docs/betanet-migration.md`](../../docs/betanet-migration.md). The active lock
-is not promoted until the transformed Betanet snapshot hash and all image
-digests are available.
+contains the reproduced snapshot hash and immutable image digests.
 
-Alphanet is experimental. Use a dedicated data directory and no real funds.
+Betanet is experimental. Use a dedicated data directory and no real funds.
 
 The lock pins the reviewed observer fork that adds `GetBip300BlockDelta`, while
 recording its official base commit separately for provenance. The observer
@@ -89,7 +89,7 @@ wallet and mining disabled and does not need Core's transaction index.
 The default `.env.example` deliberately sets
 `TRUST_ASSUMEUTXO_SNAPSHOT=true`. With that policy, `just enforcer-up` accepts
 either a fully validated chainstate or exactly two chainstates whose active one
-is backed by the pinned activation block. It never accepts an arbitrary
+is backed by the pinned snapshot block. It never accepts an arbitrary
 snapshot: the downloaded file must match the size and SHA-256 in
 `VERSIONS.lock`, and `loadtxoutset` must deserialize it and match its UTXO hash
 to the AssumeUTXO commitment compiled into the pinned node image.
@@ -102,7 +102,7 @@ snapshot is never confused with finishing that replay. Set
 `TRUST_ASSUMEUTXO_SNAPSHOT=false` to restore the full-history gate.
 
 This is an explicit trust tradeoff: before the replay finishes, the deployment
-trusts the locked node build and snapshot commitments. Alphanet is experimental
+trusts the locked node build and snapshot commitments. Betanet is experimental
 and must not carry real funds. The enforcer also performs its own initial block
 sync, so its first startup can still take time even though node history no
 longer blocks it.
@@ -177,12 +177,12 @@ from `.env.example`.
 
 ## Network configuration
 
-The current Alphanet lock uses fork height `963648`, P2P port `8533`, internal
-RPC port `8532`, and the public peers published by the node project. Preflight
-checks every peer dynamically from the single locked list. The public Esplora
-tip is informational and an outage there does not block verification. The
-snapshot is the fork-point `utxo-963648.dat` listed in the upstream
-[`SHA256SUMS`](https://data.drivechain.dev/alphanet/SHA256SUMS).
+The current Betanet lock uses activation height `967680`, P2P port `8533`,
+internal RPC port `8532`, and the public peers published by the node project.
+Preflight checks every peer dynamically from the single locked list. The public
+Esplora tip is informational and an outage there does not block verification.
+The snapshot is the reviewed height-`935000` artifact whose source and
+transformed hashes are both pinned in the lock.
 
 Moving to another network requires an intentional change to the network lock.
 The project name, generated node configuration, and fresh data root then follow
@@ -230,11 +230,12 @@ Two different gaps follow from that, and only one of them is about transport:
 The Compose limits are 512 MiB for the extractor and 1 GiB for Postgres so a bad
 response cannot turn into host-wide memory pressure.
 
-For the planned clean rebuild, `just reset-record alphanet` first creates a
-checksummed `pg_dump`, stops only the extractor and Postgres, moves the old
-cluster and acceptance marker into a timestamped recoverable backup, and creates
-an empty Postgres directory. It never removes the node or enforcer directories.
-Run `just monitor-up` afterwards to migrate and start the full import.
+For an intentional Betanet record rebuild, `just reset-record betanet` first
+creates a checksummed `pg_dump`, stops only the extractor and Postgres, moves
+the old cluster and acceptance marker into a timestamped recoverable backup,
+and creates an empty Postgres directory. It never removes the node or enforcer
+directories. Run `just monitor-up` afterwards to migrate and start the full
+import.
 
 ## Deploying a new monitor build
 

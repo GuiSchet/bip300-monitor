@@ -1,8 +1,8 @@
 # shellcheck shell=bash
-# Betanet promotion candidate. This file is documentation and MUST NOT be used
-# as VERSIONS.lock while any REPLACE_WITH_* value remains.
+# Reviewed Betanet lock retained as a promotion/audit reference. The active
+# VERSIONS.lock must match these immutable network and artifact values.
 LOCK_FORMAT=4
-LOCKED_AT=REPLACE_WITH_PROMOTION_DATE
+LOCKED_AT=2026-09-22
 
 NETWORK_ID=betanet
 ECASH_NODE_CHAIN=main
@@ -29,7 +29,7 @@ ENFORCER_BRANCH=feature/betanet-monitor-observer
 ENFORCER_BASE_COMMIT=0e27251ef351a522c72ab9ef079f75e06075390f
 ENFORCER_OBSERVER_COMMIT=0740a39380b39885fe8655f79f78150001d8a15b
 ENFORCER_COMMIT=0740a39380b39885fe8655f79f78150001d8a15b
-ENFORCER_IMAGE=REPLACE_WITH_IMMUTABLE_ENFORCER_IMAGE_DIGEST
+ENFORCER_IMAGE=ghcr.io/guischet/bip300301_enforcer:sha-0740a39380b3@sha256:6dcbc506f7c110d26018bac5be93924b5b9788b9948d53e2d1fbb2bd70d3990d
 ENFORCER_NETWORK_PRESET=betanet
 ENFORCER_API_NETWORK=NETWORK_MAINNET
 
@@ -39,9 +39,9 @@ POSTGRES_DB=bip300_monitor
 POSTGRES_USER=bip300_monitor
 
 # Source commit from which the v4 extractor/logger images must be built.
-MONITOR_IMAGE_COMMIT=5d7290fe4103906cec1112b11a532e555a590015
-ENFORCER_EXTRACTOR_IMAGE=REPLACE_WITH_IMMUTABLE_EXTRACTOR_IMAGE_DIGEST
-EVENT_LOGGER_IMAGE=REPLACE_WITH_IMMUTABLE_LOGGER_IMAGE_DIGEST
+MONITOR_IMAGE_COMMIT=490cdfa6cb87498a91f6f4c91f0a2c33ac486856
+ENFORCER_EXTRACTOR_IMAGE=docker.io/guischet/bip300-enforcer-extractor:sha-490cdfa6cb87@sha256:c118b153826a11ad2850b281abfb4d2e951c74e4d476beefd58949d0b614e804
+EVENT_LOGGER_IMAGE=docker.io/guischet/bip300-event-logger:sha-490cdfa6cb87@sha256:82b560db0baa31e871fe775da973fdbc978f171e51c9a96f2fe0bc422d119217
 
 JUST_VERSION=1.57.0
 JUST_TARGET=x86_64-unknown-linux-musl
