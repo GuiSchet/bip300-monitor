@@ -14,8 +14,8 @@ Only the read-only `ValidatorService` contract and its direct CUSF message
 dependencies are vendored. The monitor does not link to the enforcer
 implementation. The observer commit is based directly on the latest reviewed
 upstream commit, retains upstream `GetSeenBmmRequests`, and adds only
-`GetBip300BlockDelta`. The Betanet candidate lock pins that exact runtime
-commit and, after artifact promotion, its immutable OCI image.
+`GetBip300BlockDelta`. The active Betanet lock pins that exact runtime commit
+and its immutable OCI image.
 
 `validator-observer.patch` is the reproducible delta from the official
 `validator.proto` to the vendored observer contract. This lets CI reconstruct
@@ -37,9 +37,9 @@ licensed under MIT.
 
 The base and observer commits above must equal `ENFORCER_BASE_COMMIT` and
 `ENFORCER_OBSERVER_COMMIT` in the deployment lock selected through
-`BIP300_MONITOR_PROTO_VERSIONS_FILE`. While Betanet is staged, CI selects
-`deployments/ecash/VERSIONS.betanet.lock.example`; after promotion the same
-values move into `VERSIONS.lock`. `.github/scripts/check-proto-vendor.sh`
+`BIP300_MONITOR_PROTO_VERSIONS_FILE`. CI also selects
+`deployments/ecash/VERSIONS.betanet.lock.example` to prove its audit reference
+has not drifted from the active lock. `.github/scripts/check-proto-vendor.sh`
 enforces that, re-checks the checksums against disk, downloads the official
 base, applies the checked-in observer patch and confirms the reconstructed API
 byte for byte. If the sibling

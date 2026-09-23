@@ -1,9 +1,9 @@
 # HOSTKEY migration from Alphanet to Betanet
 
-This is the release gate for replacing the existing single-VM Alphanet pilot.
-The active `VERSIONS.lock` deliberately remains Alphanet until every immutable
-Betanet value is available. `deployments/ecash/VERSIONS.betanet.lock.example`
-contains the reviewed network values and fail-closed placeholders.
+This is the release and operational gate for replacing the existing single-VM
+Alphanet pilot. The promoted `VERSIONS.lock` contains every immutable Betanet
+value. `deployments/ecash/VERSIONS.betanet.lock.example` retains the same
+assignments as an audit reference.
 
 ## Reviewed source baseline
 
@@ -64,7 +64,8 @@ Before touching HOSTKEY:
 2. merge the monitor v4 change and publish the extractor/logger images;
 3. run all Rust, Postgres, NATS and deployment static tests;
 4. resolve every image to an immutable `linux/amd64` digest;
-5. replace every `REPLACE_WITH_*` value in the candidate lock;
+5. confirm neither the active nor audit-reference lock contains a
+   `REPLACE_WITH_*` value;
 6. verify the node digest belongs to the recorded official commit, enforcer
    commit is the reviewed observer commit, and monitor images were built from
    `MONITOR_IMAGE_COMMIT`;
