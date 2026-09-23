@@ -53,6 +53,7 @@ for invalid_assignment in \
     'LIVE_EVENT_WAIT_SECONDS=invalid' \
     'HISTORY_WAIT_SECONDS=0' \
     'BMM_REQUEST_WAIT_SECONDS=0' \
+    'WORKER_HEALTH_WAIT_SECONDS=0' \
     'BIP300_MONITOR_REQUEST_TIMEOUT_SECONDS=0' \
     'BIP300_MONITOR_REQUEST_TIMEOUT_SECONDS=invalid' \
     'BIP300_MONITOR_BACKFILL_PAGE_BLOCKS=0' \
@@ -164,6 +165,24 @@ if (
     die "snapshot conversion accepted the wrong source network magic"
 fi
 
+# An interrupted transform can leave the promoted destination and both source
+# paths behind. A retry must reclaim them without touching the destination.
+cleanup_fixture_destination="${snapshot_fixture_root}/promoted.dat"
+cleanup_fixture_source="${snapshot_fixture_root}/source-leftover.dat"
+cleanup_fixture_partial="${cleanup_fixture_source}.part"
+cp "${snapshot_target_fixture}" "${cleanup_fixture_destination}"
+cp "${snapshot_source_fixture}" "${cleanup_fixture_source}"
+cp "${snapshot_source_fixture}" "${cleanup_fixture_partial}"
+cleanup_transformed_snapshot_source \
+    "${cleanup_fixture_destination}" \
+    "${cleanup_fixture_source}" \
+    "${cleanup_fixture_partial}" ||
+    die "snapshot source cleanup rejected a promoted destination"
+[[ -f "${cleanup_fixture_destination}" ]] ||
+    die "snapshot source cleanup removed the promoted destination"
+[[ ! -e "${cleanup_fixture_source}" && ! -e "${cleanup_fixture_partial}" ]] ||
+    die "snapshot source cleanup left reproducible source files behind"
+
 # The enforcer reads a cookie the node image creates, so the check has to accept
 # owner, group, and world readability and reject the root:root 0600 case.
 mkdir -p "${cookie_root}/rpc-cookie"
@@ -230,6 +249,12 @@ grep -Fq 'record_bip300_history_is_complete' "${DEPLOYMENT_ROOT}/scripts/verify.
     die "verify.sh does not assert complete global BIP300 history"
 grep -Fq 'record_current_run_has_bmm_observation' "${DEPLOYMENT_ROOT}/scripts/verify.sh" ||
     die "verify.sh does not assert a successful BMM request poll"
+grep -Fq 'record_current_workers_are_healthy' "${DEPLOYMENT_ROOT}/scripts/verify.sh" ||
+    die "verify.sh does not assert per-worker extractor health"
+grep -Fq 'mempool_backed_bmm_bid_snapshots' "${DEPLOYMENT_ROOT}/scripts/accept.sh" ||
+    die "accept.sh does not require mempool-backed BMM capability"
+grep -Fq 'bmm_mempool_tracking_enabled=true' "${DEPLOYMENT_ROOT}/scripts/accept.sh" ||
+    die "accept.sh does not record the verified BMM mempool mode"
 grep -Fq 'event_contract_version' "${DEPLOYMENT_ROOT}/scripts/accept.sh" ||
     die "accept.sh does not record the normalized event contract"
 grep -Fq 'history_fully_validated' "${DEPLOYMENT_ROOT}/scripts/accept.sh" ||
@@ -442,8 +467,15 @@ jq -e '[.services.enforcer.volumes[] | select(.target == "/rpc-cookie" and .read
 jq -e '[.services.enforcer.volumes[] | select(.target == "/node-blocks" and .read_only == true)] | length == 1' \
     <<<"${config_json}" >/dev/null
 jq -e '.services.enforcer.user == "1000:1000"' <<<"${config_json}" >/dev/null
-jq -e '.services.enforcer.command | all(. != "--enable-wallet" and . != "--enable-mempool")' \
+jq -e '.services.enforcer.command
+    | index("--enable-mempool") != null and all(. != "--enable-wallet")' \
     <<<"${config_json}" >/dev/null
+for forbidden_enforcer_argument in --enable-block-template-server --coinbase-recipient; do
+    jq -e --arg argument "${forbidden_enforcer_argument}" \
+        '.services.enforcer.command | all(startswith($argument) | not)' \
+        <<<"${config_json}" >/dev/null ||
+        die "enforcer must not enable mining argument ${forbidden_enforcer_argument}"
+done
 jq -e '.services.enforcer.healthcheck.test | any(contains("GetChainTip"))' \
     <<<"${config_json}" >/dev/null
 jq -e --arg source "${ECASH_DATA_ROOT}/config/ecash.conf" \

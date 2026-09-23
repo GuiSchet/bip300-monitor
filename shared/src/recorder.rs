@@ -17,7 +17,8 @@ use crate::nats::{EventPublisher, NatsArgs};
 use crate::nats_subjects::Subject;
 use crate::protobuf::event::{Event, ObservedBlock};
 use crate::store::{
-    CaptureMethod, DatasetManifest, PostgresArgs, SidechainInstanceRef, SnapshotMetadata, Store,
+    CaptureMethod, DatasetManifest, ExtractorWorker, PostgresArgs, SidechainInstanceRef,
+    SnapshotMetadata, Store,
 };
 use std::time::SystemTime;
 
@@ -178,14 +179,26 @@ impl Recorder {
             .await
     }
 
-    /// Persist a best-effort operational error for status consumers.
-    pub async fn record_extractor_error(&self, error: &str) -> Result<()> {
-        self.store.record_extractor_error(error).await
+    /// Initialize independent durable worker-health rows for this run.
+    pub async fn initialize_worker_statuses(&self, workers: &[ExtractorWorker]) -> Result<()> {
+        self.store.initialize_worker_statuses(workers).await
     }
 
-    /// Clear a best-effort operational error after the source recovers.
-    pub async fn clear_extractor_error(&self) -> Result<()> {
-        self.store.clear_extractor_error().await
+    /// Persist a worker failure and return its durable consecutive count.
+    pub async fn record_worker_failure(
+        &self,
+        worker: ExtractorWorker,
+        error: &str,
+        degraded_after: u32,
+    ) -> Result<u32> {
+        self.store
+            .record_worker_failure(worker, error, degraded_after)
+            .await
+    }
+
+    /// Mark exactly one worker healthy.
+    pub async fn record_worker_success(&self, worker: ExtractorWorker) -> Result<()> {
+        self.store.record_worker_success(worker).await
     }
 
     /// Mark the current extractor run as cleanly finished or failed.

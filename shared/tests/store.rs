@@ -17,8 +17,8 @@ use shared::protobuf::enforcer_extractor as events;
 use shared::protobuf::event::{Event, ObservedBlock, event::MonitorEvent};
 use shared::recorder::Recorder;
 use shared::store::{
-    CaptureMethod, DatasetManifest, HistoryPage, HistoryStatus, PostgresArgs, SidechainInstanceRef,
-    Store, sidechain_instance_ref,
+    CaptureMethod, DatasetManifest, ExtractorWorker, HistoryPage, HistoryStatus, PostgresArgs,
+    SidechainInstanceRef, Store, sidechain_instance_ref,
 };
 
 /// Each test owns a database of its own so they can run concurrently.
@@ -319,15 +319,30 @@ async fn invalid_publisher_configuration_does_not_create_an_extractor_run() {
 }
 
 #[tokio::test]
-async fn extractor_status_reports_and_clears_operational_errors() {
-    let test = "extractor_status_error";
+async fn worker_errors_are_isolated_and_aggregated() {
+    let test = "worker_status_isolation";
     let store = store_for(test, "enforcer").await;
     let client = query_client(test).await;
+    store
+        .initialize_worker_statuses(&[ExtractorWorker::MainchainTip, ExtractorWorker::BmmRequests])
+        .await
+        .expect("initialize worker statuses");
 
     store
-        .record_extractor_error("tip RPC unavailable")
+        .record_worker_failure(ExtractorWorker::MainchainTip, "tip RPC unavailable", 1)
         .await
-        .expect("record operational error");
+        .expect("record tip worker error");
+    for attempt in 1..=3 {
+        let failures = store
+            .record_worker_failure(
+                ExtractorWorker::BmmRequests,
+                &format!("BMM RPC unavailable attempt {attempt}"),
+                3,
+            )
+            .await
+            .expect("record BMM worker error");
+        assert_eq!(failures, attempt);
+    }
     let recorded: Option<String> = client
         .query_one(
             "SELECT last_error FROM extractor_status WHERE source = 'enforcer'",
@@ -336,19 +351,88 @@ async fn extractor_status_reports_and_clears_operational_errors() {
         .await
         .expect("query extractor error")
         .get(0);
-    assert_eq!(recorded.as_deref(), Some("tip RPC unavailable"));
+    assert_eq!(
+        recorded.as_deref(),
+        Some("bmm_requests: BMM RPC unavailable attempt 3; mainchain_tip: tip RPC unavailable")
+    );
 
     store
-        .clear_extractor_error()
+        .record_worker_success(ExtractorWorker::MainchainTip)
         .await
-        .expect("clear recovered error");
+        .expect("recover tip worker");
+    let bmm_only: Option<String> = client
+        .query_one(
+            "SELECT last_error FROM extractor_status WHERE source = 'enforcer'",
+            &[],
+        )
+        .await
+        .expect("query BMM-only extractor status")
+        .get(0);
+    assert_eq!(
+        bmm_only.as_deref(),
+        Some("bmm_requests: BMM RPC unavailable attempt 3")
+    );
+
+    let tip = ObservedBlock::at_height(vec![0x44; 32], 200);
+    store
+        .record_tip_observation(
+            &tip,
+            None,
+            CaptureMethod::Poll,
+            std::time::SystemTime::now(),
+        )
+        .await
+        .expect("record tip without changing worker errors");
+    let after_tip: Option<String> = client
+        .query_one(
+            "SELECT last_error FROM extractor_status WHERE source = 'enforcer'",
+            &[],
+        )
+        .await
+        .expect("query extractor status after tip")
+        .get(0);
+    assert_eq!(after_tip, bmm_only, "tip writes must not clear BMM health");
+
+    store
+        .record_worker_failure(
+            ExtractorWorker::BmmRequests,
+            "BMM RPC unavailable attempt 4",
+            3,
+        )
+        .await
+        .expect("rewrite sustained BMM error");
+    let worker_row = client
+        .query_one(
+            "SELECT consecutive_failures, last_error,
+                    last_success_at IS NULL, last_failure_at IS NOT NULL
+               FROM extractor_worker_status
+              WHERE worker = 'bmm_requests'",
+            &[],
+        )
+        .await
+        .expect("query sustained BMM failure");
+    let worker: (i32, Option<String>, bool, bool) = (
+        worker_row.get(0),
+        worker_row.get(1),
+        worker_row.get(2),
+        worker_row.get(3),
+    );
+    assert_eq!(worker.0, 4);
+    assert_eq!(worker.1.as_deref(), Some("BMM RPC unavailable attempt 4"));
+    assert!(worker.2);
+    assert!(worker.3);
+
+    store
+        .record_worker_success(ExtractorWorker::BmmRequests)
+        .await
+        .expect("recover BMM worker");
     let cleared: Option<String> = client
         .query_one(
             "SELECT last_error FROM extractor_status WHERE source = 'enforcer'",
             &[],
         )
         .await
-        .expect("query recovered extractor status")
+        .expect("query recovered aggregate status")
         .get(0);
     assert_eq!(cleared, None);
 }
@@ -1226,4 +1310,23 @@ async fn live_bmm_changes_share_a_parent_without_aliasing_facts() {
         .get(0);
     assert_eq!(fact_count, 2);
     assert_eq!(observation_count, 3);
+
+    let latest_row = client
+        .query_one(
+            "SELECT (fact.payload #>>
+                        '{monitor_event,Enforcer,event,BmmRequests,requests,0,bid_sats}')::bigint,
+                    (extract(epoch FROM observation.observed_at) * 1000)::bigint
+               FROM event_observation observation
+               JOIN event fact ON fact.id = observation.event_id
+              WHERE observation.dataset_id = fact.dataset_id
+                AND fact.kind = 'bmm_requests'
+                AND fact.block_hash = $1
+              ORDER BY observation.observed_at DESC, observation.observation_id DESC
+              LIMIT 1",
+            &[&anchor.hash],
+        )
+        .await
+        .expect("query latest BMM observation");
+    let latest: (i64, i64) = (latest_row.get(0), latest_row.get(1));
+    assert_eq!(latest, (10, 1_700_000_010_000));
 }

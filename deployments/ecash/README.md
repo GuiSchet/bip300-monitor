@@ -121,11 +121,24 @@ slot. It also requires complete per-instance `block` coverage and global
 `bip300_delta` coverage even when there are zero active slots. Repeated captures
 belong in `event_observation`, not as duplicate facts.
 
-Contract v4 additionally requires a successful live BMM-request poll from the
-current extractor run. An empty request list is recorded as an observed fact;
-an RPC failure is never treated as an empty auction. Distinct auction states at
-the same parent block are separate facts, while a repeated state adds only a
-new observation occurrence.
+Contract v5 additionally requires the enforcer's validator mempool task and a
+successful live BMM-request poll from the current extractor run. An empty
+request list is recorded as an observed fact; an RPC failure is never treated
+as an empty auction. Distinct auction states at the same parent block are
+separate facts, while a repeated state adds only a new observation occurrence.
+The latest auction must therefore be selected through its occurrence, not the
+fact's first-seen timestamp:
+
+```sql
+SELECT observation.observed_at, fact.payload
+  FROM event_observation observation
+  JOIN event fact ON fact.id = observation.event_id
+ WHERE observation.dataset_id = $1
+   AND fact.dataset_id = observation.dataset_id
+   AND fact.kind = 'bmm_requests'
+ ORDER BY observation.observed_at DESC, observation.observation_id DESC
+ LIMIT 1;
+```
 
 Rows outlive a container, and the block is what scopes them — a previous run's
 rows are anchored at a previous block. Scoping by time instead would be wrong in
@@ -153,7 +166,8 @@ Timeouts can be adjusted in `.env`. `SNAPSHOT_RPC_WAIT_SECONDS` lets the
 snapshot command remain parked while a recovering node keeps RPC in warmup,
 instead of exiting and re-hashing the 9.5 GB file on every service retry.
 `SNAPSHOT_ACTIVATION_WAIT_SECONDS` bounds recovery of the raw activation block
-from a synced outbound peer. All
+from a synced outbound peer. `WORKER_HEALTH_WAIT_SECONDS` bounds the wait for
+both independent extractor workers to report a successful cycle. All
 values in `VERSIONS.lock` are repository-owned pins and cannot be overridden
 there. `just down` stops the stack without deleting `${ECASH_DATA_ROOT}`.
 

@@ -16,6 +16,12 @@ snapshot_dir="${resolved_data_root}/snapshots"
 snapshot_path="${snapshot_dir}/${ECASH_SNAPSHOT_FILE}"
 partial_path="${snapshot_path}.part"
 mkdir -p -- "${snapshot_dir}"
+source_path=''
+source_partial_path=''
+if [[ "${ECASH_SNAPSHOT_TRANSFORM}" == network_magic_v2 ]]; then
+    source_path="${snapshot_dir}/${ECASH_SNAPSHOT_SOURCE_FILE}"
+    source_partial_path="${source_path}.part"
+fi
 
 verify_file() {
     local path="$1"
@@ -107,9 +113,6 @@ if [[ -f "${snapshot_path}" ]]; then
     info "verifying existing snapshot"
     verify_snapshot "${snapshot_path}" || die "existing snapshot failed verification"
 elif [[ "${ECASH_SNAPSHOT_TRANSFORM}" == network_magic_v2 ]]; then
-    source_path="${snapshot_dir}/${ECASH_SNAPSHOT_SOURCE_FILE}"
-    source_partial_path="${source_path}.part"
-
     # A transformation is deterministic but not resumable. Keep a verified
     # source instead, and always rebuild an incomplete/invalid destination.
     if [[ -f "${partial_path}" ]]; then
@@ -141,10 +144,6 @@ elif [[ "${ECASH_SNAPSHOT_TRANSFORM}" == network_magic_v2 ]]; then
         }
         mv -- "${partial_path}" "${snapshot_path}"
     fi
-    # A previous interrupted run may already have promoted the transformed
-    # artifact. Once that artifact verifies, its reproducible source copy is
-    # no longer needed.
-    rm -f -- "${source_path}" "${source_partial_path}"
 else
     download_verified_file \
         "${snapshot_path}" \
@@ -153,6 +152,14 @@ else
         "${ECASH_SNAPSHOT_SHA256}" \
         "${NETWORK_ID} snapshot" \
         "${ECASH_SNAPSHOT_URL}"
+fi
+
+if [[ "${ECASH_SNAPSHOT_TRANSFORM}" == network_magic_v2 ]]; then
+    # This also covers recovery after an interruption between promoting the
+    # transformed artifact and deleting its reproducible source copy.
+    cleanup_transformed_snapshot_source \
+        "${snapshot_path}" "${source_path}" "${source_partial_path}" ||
+        die "refusing to clean transformed snapshot sources before promotion"
 fi
 
 service_is_running ecash-node || die "ecash-node is not running; run 'just up' first"

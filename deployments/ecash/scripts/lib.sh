@@ -258,6 +258,8 @@ load_deployment_env() {
     require_positive_integer \
         BMM_REQUEST_WAIT_SECONDS "${BMM_REQUEST_WAIT_SECONDS:-30}"
     require_positive_integer \
+        WORKER_HEALTH_WAIT_SECONDS "${WORKER_HEALTH_WAIT_SECONDS:-60}"
+    require_positive_integer \
         LIVE_BLOCK_WAIT_SECONDS "${LIVE_BLOCK_WAIT_SECONDS:-3600}"
     require_positive_integer \
         LIVE_EVENT_WAIT_SECONDS "${LIVE_EVENT_WAIT_SECONDS:-60}"
@@ -315,6 +317,17 @@ data_root() {
     printf '%s\n' "${ECASH_DATA_ROOT}"
 }
 
+# Remove reproducible transform inputs only after the caller has verified that
+# the promoted destination exists and is valid.
+cleanup_transformed_snapshot_source() {
+    local snapshot_path="$1"
+    local source_path="$2"
+    local source_partial_path="$3"
+
+    [[ -f "${snapshot_path}" ]] || return 1
+    rm -f -- "${source_path}" "${source_partial_path}"
+}
+
 compose() {
     local env_file
     env_file="$(deployment_env_file)"
@@ -347,6 +360,19 @@ service_started_at() {
     container_id="$(compose ps --status running --quiet "$1")"
     [[ -n "${container_id}" ]] || die "$1 is not running"
     docker inspect --format '{{.State.StartedAt}}' "${container_id}"
+}
+
+enforcer_mempool_tracking_is_enabled() {
+    local command_json
+    local container_id
+    local enforcer_logs
+
+    container_id="$(compose ps --status running --quiet enforcer)"
+    [[ -n "${container_id}" ]] || return 1
+    command_json="$(docker inspect --format '{{json .Config.Cmd}}' "${container_id}")" || return 1
+    jq -e 'index("--enable-mempool") != null' <<<"${command_json}" >/dev/null || return 1
+    enforcer_logs="$(compose logs --no-color enforcer 2>/dev/null)" || return 1
+    grep -Fq 'mempool sync task w/validator: starting' <<<"${enforcer_logs}"
 }
 
 enforcer_rpc() {
@@ -676,6 +702,56 @@ record_current_run_capabilities() {
           WHERE source = 'enforcer' AND status = 'running'
           ORDER BY started_at DESC, run_id DESC
           LIMIT 1"
+}
+
+record_current_worker_status_json() {
+    postgres_query \
+        "WITH current_run AS (
+             SELECT run_id
+               FROM extractor_run
+              WHERE source = 'enforcer' AND status = 'running'
+              ORDER BY started_at DESC, run_id DESC
+              LIMIT 1
+         )
+         SELECT COALESCE(
+             jsonb_agg(
+                 jsonb_build_object(
+                     'worker', worker.worker,
+                     'consecutive_failures', worker.consecutive_failures,
+                     'last_error', worker.last_error,
+                     'last_success_at', worker.last_success_at,
+                     'last_failure_at', worker.last_failure_at,
+                     'updated_at', worker.updated_at
+                 ) ORDER BY worker.worker
+             ),
+             '[]'::jsonb
+         )
+           FROM current_run
+           JOIN extractor_worker_status worker USING (run_id)"
+}
+
+record_current_workers_are_healthy() {
+    local result
+
+    result="$(
+        postgres_query \
+            "WITH current_run AS (
+                 SELECT run_id
+                   FROM extractor_run
+                  WHERE source = 'enforcer' AND status = 'running'
+                  ORDER BY started_at DESC, run_id DESC
+                  LIMIT 1
+             )
+             SELECT count(*) = 2
+                    AND count(*) FILTER (
+                        WHERE worker.worker IN ('mainchain_tip', 'bmm_requests')
+                          AND worker.last_success_at IS NOT NULL
+                          AND worker.last_error IS NULL
+                    ) = 2
+               FROM current_run
+               JOIN extractor_worker_status worker USING (run_id)"
+    )" || return 1
+    [[ "${result}" == t ]]
 }
 
 # Whether the record holds one specific block for one slot, by hash.

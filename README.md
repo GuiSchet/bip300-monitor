@@ -58,11 +58,12 @@ path.
 ## Event contract
 
 The monitor publishes a versioned normalized protobuf contract rather than
-forwarding raw enforcer responses. Event contract v4 adds normalized live BMM
-request snapshots, and PostgreSQL schema v5 permits multiple auction states at
-one parent block without duplicating repeated observations. Schema v4 binds
-each fact and occurrence to a dataset and extractor run, preserves `A -> B ->
-A` tip order, tracks sidechain instances and retains coverage revisions. See
+forwarding raw enforcer responses. Event contract v5 adds mempool-backed live
+BMM request snapshots. PostgreSQL schema v5 permits multiple auction states at
+one parent block without duplicating repeated observations, and schema v6 adds
+independent worker health plus observation-ordered lookup. Schema v4 binds each
+fact and occurrence to a dataset and extractor run, preserves `A -> B -> A` tip
+order, tracks sidechain instances and retains coverage revisions. See
 [event schema and semantics](proto/README.md) for event variants, byte order,
 snapshot semantics, idempotency and reorg handling.
 
