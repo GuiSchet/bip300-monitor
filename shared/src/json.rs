@@ -24,6 +24,7 @@ pub const BYTE_FIELDS: &[&str] = &[
     "bmm_commitment",
     "chain_work",
     "coinbase_txid",
+    "critical_hash",
     "description",
     "description_hash",
     "downvoted_m6ids",

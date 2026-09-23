@@ -310,6 +310,8 @@ jobs:
           persist-credentials: false
 
       - name: Verify the vendored enforcer API
+        env:
+          BIP300_MONITOR_PROTO_VERSIONS_FILE: deployments/ecash/VERSIONS.betanet.lock.example
         run: ./.github/scripts/check-proto-vendor.sh --online
 
   # Deployment checks live under deployments/ecash. Keeping the

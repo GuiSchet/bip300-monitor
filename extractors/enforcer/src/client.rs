@@ -147,6 +147,23 @@ impl EnforcerClient {
             .map(tonic::Response::into_inner)
     }
 
+    /// Fetch the current unconfirmed BMM bids built on one mainchain parent.
+    pub async fn get_seen_bmm_requests(
+        &mut self,
+        previous_mainchain_block_hash: impl Into<String>,
+        sidechain_number: Option<u8>,
+    ) -> Result<mainchain::GetSeenBmmRequestsResponse> {
+        let request = mainchain::GetSeenBmmRequestsRequest {
+            prev_block_hash: Some(reverse_hex(previous_mainchain_block_hash)),
+            sidechain_number: sidechain_number.map(u32::from),
+        };
+        self.inner
+            .get_seen_bmm_requests(self.unary_request(request))
+            .await
+            .context("calling ValidatorService.GetSeenBmmRequests")
+            .map(tonic::Response::into_inner)
+    }
+
     /// Fetch the withdrawal bundles of one sidechain slot that are still being
     /// voted on.
     ///

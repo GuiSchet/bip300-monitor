@@ -93,6 +93,21 @@ fn summarize(payload: &events::enforcer_event::Event) -> Result<String> {
                 delta.confirmed_bmm_requests.len()
             ))
         }
+        events::enforcer_event::Event::BmmRequests(snapshot) => {
+            validate_bmm_requests(snapshot)?;
+            let max_bid_sats = snapshot
+                .requests
+                .iter()
+                .map(|request| request.bid_sats)
+                .max()
+                .unwrap_or(0);
+            Ok(format!(
+                "parent_hash={} request_count={} max_bid_sats={}",
+                hex::encode(&snapshot.previous_mainchain_block_hash),
+                snapshot.requests.len(),
+                max_bid_sats
+            ))
+        }
         events::enforcer_event::Event::SidechainProposals(snapshot) => {
             for proposal in &snapshot.proposals {
                 validate_proposal(proposal)?;
@@ -242,6 +257,24 @@ fn validate_bip300_delta(delta: &events::Bip300BlockDelta) -> Result<()> {
         if request.transaction.is_empty() {
             bail!("confirmed BMM request has an empty transaction");
         }
+    }
+    Ok(())
+}
+
+fn validate_bmm_requests(snapshot: &events::BmmRequestsSnapshot) -> Result<()> {
+    require_32_bytes(
+        &snapshot.previous_mainchain_block_hash,
+        "bmm_requests.previous_mainchain_block_hash",
+    )?;
+    for request in &snapshot.requests {
+        if request.sidechain_number > u32::from(u8::MAX) {
+            bail!(
+                "BMM request sidechain {} is outside 0..=255",
+                request.sidechain_number
+            );
+        }
+        require_32_bytes(&request.txid, "bmm_request.txid")?;
+        require_32_bytes(&request.critical_hash, "bmm_request.critical_hash")?;
     }
     Ok(())
 }

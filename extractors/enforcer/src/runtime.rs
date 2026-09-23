@@ -242,6 +242,14 @@ pub async fn run(args: Args, mut shutdown_rx: watch::Receiver<bool>) -> Result<(
             tip_tx,
             shutdown_rx.clone(),
         ));
+        workers.spawn(monitor_bmm_requests(
+            client.clone(),
+            recorder.clone(),
+            snapshot.anchor.clone(),
+            args.bmm_request_poll_interval(),
+            tip_rx.clone(),
+            shutdown_rx.clone(),
+        ));
         workers.spawn(monitor_state(
             client.clone(),
             recorder.clone(),
@@ -1176,6 +1184,82 @@ async fn monitor_tip(
 
     tracing::info!("stopped mainchain tip worker");
     Ok(())
+}
+
+/// Sample the live, unconfirmed BMM auction independently of block cadence.
+///
+/// A successful empty response is evidence that the auction was observed and
+/// is recorded as such. RPC failures never manufacture an empty snapshot.
+async fn monitor_bmm_requests(
+    mut client: EnforcerClient,
+    recorder: Recorder,
+    mut parent: ObservedBlock,
+    interval: Duration,
+    mut tip_rx: watch::Receiver<ObservedBlock>,
+    mut shutdown_rx: watch::Receiver<bool>,
+) -> Result<()> {
+    const DEGRADED_AFTER_FAILURES: u32 = 3;
+
+    tracing::info!(
+        interval_seconds = interval.as_secs(),
+        "started live BMM request worker"
+    );
+    let mut consecutive_failures = 0_u32;
+    loop {
+        let parent_hex = hex::encode(&parent.hash);
+        match client.get_seen_bmm_requests(parent_hex, None).await {
+            Ok(response) => {
+                let payload = convert::bmm_requests(parent.hash.clone(), response)
+                    .context("converting live BMM requests")?;
+                let event = envelope(payload, parent.clone())?;
+                recorder
+                    .record_batch_with_method(vec![event], CaptureMethod::Poll)
+                    .await
+                    .context("recording a live BMM request snapshot")?;
+                if consecutive_failures >= DEGRADED_AFTER_FAILURES
+                    && let Err(error) = recorder.clear_extractor_error().await
+                {
+                    tracing::warn!(
+                        error = %format!("{error:#}"),
+                        "could not clear recovered BMM polling status"
+                    );
+                }
+                consecutive_failures = 0;
+            }
+            Err(error) => {
+                consecutive_failures = consecutive_failures.saturating_add(1);
+                let message = format!("live BMM request poll failed: {error:#}");
+                if consecutive_failures == DEGRADED_AFTER_FAILURES
+                    && let Err(status_error) = recorder.record_extractor_error(&message).await
+                {
+                    tracing::warn!(
+                        error = %format!("{status_error:#}"),
+                        "could not persist degraded BMM polling status"
+                    );
+                }
+                tracing::warn!(
+                    consecutive_failures,
+                    error = %format!("{error:#}"),
+                    "could not sample live BMM requests; retrying"
+                );
+            }
+        }
+
+        tokio::select! {
+            biased;
+            () = wait_for_shutdown(&mut shutdown_rx) => {
+                tracing::info!("stopped live BMM request worker");
+                return Ok(());
+            }
+            changed = tip_rx.changed() => {
+                if changed.is_err() {
+                    bail!("mainchain tip observer stopped while BMM polling was running");
+                }
+                parent = tip_rx.borrow_and_update().clone();
+            }
+            () = tokio::time::sleep(interval) => {}
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

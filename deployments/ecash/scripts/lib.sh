@@ -35,10 +35,14 @@ require_boolean() {
 
 load_versions() {
     [[ -f "${VERSIONS_FILE}" ]] || die "missing ${VERSIONS_FILE}"
+    if grep -qE '^[A-Z][A-Z0-9_]*=REPLACE_WITH_' "${VERSIONS_FILE}"; then
+        die "${VERSIONS_FILE} contains unresolved promotion placeholders"
+    fi
     # This file is tracked in the repository and contains assignments only.
     # shellcheck disable=SC1090
     source "${VERSIONS_FILE}"
 
+    : "${LOCK_FORMAT:?LOCK_FORMAT must be locked}"
     : "${NETWORK_ID:?NETWORK_ID must be locked}"
     : "${ECASH_NODE_CHAIN:?ECASH_NODE_CHAIN must be locked}"
     : "${ECASH_NETWORK_MAGIC:?ECASH_NETWORK_MAGIC must be locked}"
@@ -53,8 +57,12 @@ load_versions() {
     : "${ECASH_ACTIVATION_HEIGHT:?ECASH_ACTIVATION_HEIGHT must be locked}"
     : "${ECASH_ACTIVATION_BLOCK_HASH:?ECASH_ACTIVATION_BLOCK_HASH must be locked}"
     : "${ECASH_SNAPSHOT_FILE:?ECASH_SNAPSHOT_FILE must be locked}"
+    : "${ECASH_SNAPSHOT_HEIGHT:?ECASH_SNAPSHOT_HEIGHT must be locked}"
+    : "${ECASH_SNAPSHOT_BLOCK_HASH:?ECASH_SNAPSHOT_BLOCK_HASH must be locked}"
+    : "${ECASH_SNAPSHOT_UTXO_HASH:?ECASH_SNAPSHOT_UTXO_HASH must be locked}"
+    : "${ECASH_SNAPSHOT_CHAIN_TX_COUNT:?ECASH_SNAPSHOT_CHAIN_TX_COUNT must be locked}"
+    : "${ECASH_SNAPSHOT_TRANSFORM:?ECASH_SNAPSHOT_TRANSFORM must be locked}"
     : "${ECASH_SNAPSHOT_URL:?ECASH_SNAPSHOT_URL must be locked}"
-    : "${ECASH_SNAPSHOT_CHECKSUMS_URL:?ECASH_SNAPSHOT_CHECKSUMS_URL must be locked}"
     : "${ECASH_SNAPSHOT_SIZE:?ECASH_SNAPSHOT_SIZE must be locked}"
     : "${ECASH_SNAPSHOT_SHA256:?ECASH_SNAPSHOT_SHA256 must be locked}"
     : "${ENFORCER_NETWORK_PRESET:?ENFORCER_NETWORK_PRESET must be locked}"
@@ -63,6 +71,7 @@ load_versions() {
     : "${POSTGRES_DB:?POSTGRES_DB must be locked}"
     : "${POSTGRES_USER:?POSTGRES_USER must be locked}"
 
+    [[ "${LOCK_FORMAT}" == 4 ]] || die "unsupported LOCK_FORMAT=${LOCK_FORMAT}"
     [[ "${NETWORK_ID}" =~ ^[a-z0-9][a-z0-9-]*$ ]] ||
         die "NETWORK_ID has an invalid format"
     # Both end up unquoted inside psql invocations and the healthcheck.
@@ -72,6 +81,36 @@ load_versions() {
         die "POSTGRES_USER has an invalid format"
     [[ "${ECASH_ACTIVATION_BLOCK_HASH}" =~ ^[[:xdigit:]]{64}$ ]] ||
         die "ECASH_ACTIVATION_BLOCK_HASH must contain 64 hexadecimal characters"
+    [[ "${ECASH_SNAPSHOT_BLOCK_HASH}" =~ ^[[:xdigit:]]{64}$ ]] ||
+        die "ECASH_SNAPSHOT_BLOCK_HASH must contain 64 hexadecimal characters"
+    [[ "${ECASH_SNAPSHOT_UTXO_HASH}" =~ ^[[:xdigit:]]{64}$ ]] ||
+        die "ECASH_SNAPSHOT_UTXO_HASH must contain 64 hexadecimal characters"
+    [[ "${ECASH_SNAPSHOT_SHA256}" =~ ^[[:xdigit:]]{64}$ ]] ||
+        die "ECASH_SNAPSHOT_SHA256 must contain 64 hexadecimal characters"
+    case "${ECASH_SNAPSHOT_TRANSFORM}" in
+    none)
+        : "${ECASH_SNAPSHOT_CHECKSUMS_URL:?ECASH_SNAPSHOT_CHECKSUMS_URL must be locked for a direct snapshot}"
+        ;;
+    network_magic_v2)
+        : "${ECASH_SNAPSHOT_MIRROR_URL:?ECASH_SNAPSHOT_MIRROR_URL must be locked for a transformed snapshot}"
+        : "${ECASH_SNAPSHOT_SOURCE_FILE:?ECASH_SNAPSHOT_SOURCE_FILE must be locked for a transformed snapshot}"
+        : "${ECASH_SNAPSHOT_SOURCE_SIZE:?ECASH_SNAPSHOT_SOURCE_SIZE must be locked for a transformed snapshot}"
+        : "${ECASH_SNAPSHOT_SOURCE_SHA256:?ECASH_SNAPSHOT_SOURCE_SHA256 must be locked for a transformed snapshot}"
+        : "${ECASH_SNAPSHOT_SOURCE_NETWORK_MAGIC:?ECASH_SNAPSHOT_SOURCE_NETWORK_MAGIC must be locked for a transformed snapshot}"
+        [[ "${ECASH_SNAPSHOT_SOURCE_FILE}" != "${ECASH_SNAPSHOT_FILE}" ]] ||
+            die "source and transformed snapshot filenames must differ"
+        [[ "${ECASH_SNAPSHOT_SOURCE_SHA256}" =~ ^[[:xdigit:]]{64}$ ]] ||
+            die "ECASH_SNAPSHOT_SOURCE_SHA256 must contain 64 hexadecimal characters"
+        [[ "${ECASH_SNAPSHOT_SOURCE_NETWORK_MAGIC}" =~ ^[[:xdigit:]]{8}$ ]] ||
+            die "ECASH_SNAPSHOT_SOURCE_NETWORK_MAGIC must contain 8 hexadecimal characters"
+        require_positive_integer ECASH_SNAPSHOT_SOURCE_SIZE "${ECASH_SNAPSHOT_SOURCE_SIZE}"
+        [[ "${ECASH_SNAPSHOT_SOURCE_SIZE}" == "${ECASH_SNAPSHOT_SIZE}" ]] ||
+            die "a network-magic rewrite must preserve the snapshot size"
+        ;;
+    *)
+        die "unsupported ECASH_SNAPSHOT_TRANSFORM=${ECASH_SNAPSHOT_TRANSFORM}"
+        ;;
+    esac
     require_positive_integer ECASH_NODE_P2P_PORT "${ECASH_NODE_P2P_PORT}"
     require_positive_integer ECASH_NODE_RPC_PORT "${ECASH_NODE_RPC_PORT}"
     require_positive_integer ECASH_NODE_ZMQ_PORT "${ECASH_NODE_ZMQ_PORT}"
@@ -79,9 +118,13 @@ load_versions() {
     require_positive_integer ECASH_EXPECTED_DATA_BYTES "${ECASH_EXPECTED_DATA_BYTES}"
     require_positive_integer ECASH_MIN_FREE_PERCENT "${ECASH_MIN_FREE_PERCENT}"
     require_positive_integer ECASH_ACTIVATION_HEIGHT "${ECASH_ACTIVATION_HEIGHT}"
+    require_positive_integer ECASH_SNAPSHOT_HEIGHT "${ECASH_SNAPSHOT_HEIGHT}"
+    require_positive_integer ECASH_SNAPSHOT_CHAIN_TX_COUNT "${ECASH_SNAPSHOT_CHAIN_TX_COUNT}"
     require_positive_integer ECASH_SNAPSHOT_SIZE "${ECASH_SNAPSHOT_SIZE}"
     ((ECASH_MIN_FREE_PERCENT < 100)) ||
         die "ECASH_MIN_FREE_PERCENT must be less than 100"
+    ((ECASH_SNAPSHOT_HEIGHT <= ECASH_ACTIVATION_HEIGHT)) ||
+        die "ECASH_SNAPSHOT_HEIGHT must not be after ECASH_ACTIVATION_HEIGHT; otherwise activation-era block bodies can be skipped"
     network_peers >/dev/null
 }
 
@@ -180,6 +223,7 @@ deployment_env_file() {
 }
 
 load_deployment_env() {
+    local bmm_poll_interval_seconds
     local env_file
     local resolved_data_base
     local stream_stall_timeout_seconds
@@ -206,9 +250,13 @@ load_deployment_env() {
     require_positive_integer \
         SNAPSHOT_HEADER_WAIT_SECONDS "${SNAPSHOT_HEADER_WAIT_SECONDS:-1800}"
     require_positive_integer \
+        SNAPSHOT_ACTIVATION_WAIT_SECONDS "${SNAPSHOT_ACTIVATION_WAIT_SECONDS:-86400}"
+    require_positive_integer \
         MONITOR_STARTUP_WAIT_SECONDS "${MONITOR_STARTUP_WAIT_SECONDS:-60}"
     require_positive_integer \
         MONITOR_EVENT_WAIT_SECONDS "${MONITOR_EVENT_WAIT_SECONDS:-60}"
+    require_positive_integer \
+        BMM_REQUEST_WAIT_SECONDS "${BMM_REQUEST_WAIT_SECONDS:-30}"
     require_positive_integer \
         LIVE_BLOCK_WAIT_SECONDS "${LIVE_BLOCK_WAIT_SECONDS:-3600}"
     require_positive_integer \
@@ -226,10 +274,16 @@ load_deployment_env() {
     [[ "${BIP300_MONITOR_BACKFILL_PAGE_PAUSE_MS:-100}" =~ ^[0-9]+$ ]] ||
         die "BIP300_MONITOR_BACKFILL_PAGE_PAUSE_MS must be numeric"
     tip_poll_interval_seconds="${BIP300_MONITOR_TIP_POLL_INTERVAL_SECONDS:-30}"
+    bmm_poll_interval_seconds="${BIP300_MONITOR_BMM_REQUEST_POLL_INTERVAL_SECONDS:-5}"
     stream_stall_timeout_seconds="${BIP300_MONITOR_STREAM_STALL_TIMEOUT_SECONDS:-60}"
     require_positive_integer \
         BIP300_MONITOR_TIP_POLL_INTERVAL_SECONDS \
         "${tip_poll_interval_seconds}"
+    require_positive_integer \
+        BIP300_MONITOR_BMM_REQUEST_POLL_INTERVAL_SECONDS \
+        "${bmm_poll_interval_seconds}"
+    ((bmm_poll_interval_seconds <= 60)) ||
+        die "BIP300_MONITOR_BMM_REQUEST_POLL_INTERVAL_SECONDS must not exceed 60"
     require_positive_integer \
         BIP300_MONITOR_STREAM_STALL_TIMEOUT_SECONDS \
         "${stream_stall_timeout_seconds}"
@@ -573,6 +627,57 @@ record_event_count_at() {
     postgres_query "SELECT count(*) FROM event WHERE ${predicate}" "${filters[@]}"
 }
 
+# Whether the newest running enforcer extractor has completed at least one
+# successful BMM poll. Empty request lists are facts too, so this checks the
+# observation occurrence instead of requiring a non-empty request array.
+record_current_run_has_bmm_observation() {
+    local result
+
+    result="$(
+        postgres_query \
+            "WITH current_run AS (
+                 SELECT run_id, dataset_id, event_contract_version
+                   FROM extractor_run
+                  WHERE source = 'enforcer' AND status = 'running'
+                  ORDER BY started_at DESC, run_id DESC
+                  LIMIT 1
+             )
+             SELECT EXISTS (
+                 SELECT 1
+                   FROM current_run
+                   JOIN event_observation observation
+                     ON observation.run_id = current_run.run_id
+                    AND observation.dataset_id = current_run.dataset_id
+                   JOIN event
+                     ON event.id = observation.event_id
+                    AND event.dataset_id = current_run.dataset_id
+                    AND event.event_contract_version = current_run.event_contract_version
+                  WHERE observation.capture_method = 'poll'
+                    AND event.source = 'enforcer'
+                    AND event.kind = 'bmm_requests'
+             )"
+    )" || return 1
+    [[ "${result}" == t ]]
+}
+
+record_current_event_contract_version() {
+    postgres_query \
+        "SELECT event_contract_version
+           FROM extractor_run
+          WHERE source = 'enforcer' AND status = 'running'
+          ORDER BY started_at DESC, run_id DESC
+          LIMIT 1"
+}
+
+record_current_run_capabilities() {
+    postgres_query \
+        "SELECT capabilities::text
+           FROM extractor_run
+          WHERE source = 'enforcer' AND status = 'running'
+          ORDER BY started_at DESC, run_id DESC
+          LIMIT 1"
+}
+
 # Whether the record holds one specific block for one slot, by hash.
 record_has_block() {
     local kind="$1"
@@ -822,6 +927,86 @@ require_activation_block() {
         die "unexpected block at height ${ECASH_ACTIVATION_HEIGHT}: ${activation_hash}"
 }
 
+require_activation_block_data() {
+    node_cli getblock "${ECASH_ACTIVATION_BLOCK_HASH}" 0 >/dev/null 2>&1 ||
+        die "raw ${NETWORK_ID} activation block ${ECASH_ACTIVATION_BLOCK_HASH} is unavailable"
+}
+
+# AssumeUTXO needs only the base UTXO set to follow the active tip, but the
+# observer reads raw BIP300 messages beginning at activation. Fetch that one
+# block explicitly when a fresh snapshot chainstate does not yet have it.
+ensure_activation_block_data() {
+    local deadline
+    local last_request_seconds
+    local peer_id
+    local wait_seconds="${SNAPSHOT_ACTIVATION_WAIT_SECONDS:-86400}"
+
+    if node_cli getblock "${ECASH_ACTIVATION_BLOCK_HASH}" 0 >/dev/null 2>&1; then
+        return 0
+    fi
+    deadline="$((SECONDS + wait_seconds))"
+    last_request_seconds="$((SECONDS - 60))"
+    info "waiting up to ${wait_seconds}s for raw ${NETWORK_ID} activation block data"
+    until node_cli getblock "${ECASH_ACTIVATION_BLOCK_HASH}" 0 >/dev/null 2>&1; do
+        ((SECONDS < deadline)) ||
+            die "activation block body was not received within ${wait_seconds}s"
+        peer_id="$(
+            node_cli getpeerinfo 2>/dev/null |
+                jq -er --argjson height "${ECASH_ACTIVATION_HEIGHT}" '
+                    [.[] | select(.inbound == false and (.synced_blocks // -1) >= $height)]
+                    | first.id
+                ' 2>/dev/null
+        )" || peer_id=
+        if [[ -n "${peer_id}" ]] && ((SECONDS - last_request_seconds >= 60)); then
+            info "requesting raw activation block ${ECASH_ACTIVATION_BLOCK_HASH} from peer ${peer_id}"
+            node_cli getblockfrompeer \
+                "${ECASH_ACTIVATION_BLOCK_HASH}" "${peer_id}" >/dev/null 2>&1 || true
+            last_request_seconds="${SECONDS}"
+        fi
+        sleep 10
+    done
+}
+
+snapshot_v2_header_hex() {
+    local path="$1"
+
+    od -An -tx1 -N11 -- "${path}" | tr -d '[:space:]'
+}
+
+# Rewrite only the four network-magic bytes in a version-2 UTXO snapshot.
+# The caller separately verifies source and destination size/SHA-256. Comparing
+# both the prefix and everything after the metadata magic makes this helper
+# fail if any other byte changes during the copy or rewrite.
+rewrite_snapshot_network_magic_v2() {
+    local destination="$2"
+    local expected_destination_header
+    local expected_source_header
+    local source="$1"
+    local source_magic="$3"
+    local target_magic="$4"
+
+    [[ "${source_magic}" =~ ^[[:xdigit:]]{8}$ ]] ||
+        die "source snapshot network magic must contain 8 hexadecimal characters"
+    [[ "${target_magic}" =~ ^[[:xdigit:]]{8}$ ]] ||
+        die "target snapshot network magic must contain 8 hexadecimal characters"
+    expected_source_header="7574786fff0200${source_magic,,}"
+    expected_destination_header="7574786fff0200${target_magic,,}"
+    [[ "$(snapshot_v2_header_hex "${source}")" == "${expected_source_header}" ]] ||
+        die "source snapshot is not version 2 with network magic ${source_magic}"
+
+    cp --reflink=auto -- "${source}" "${destination}"
+    printf '%b' \
+        "\\x${target_magic:0:2}\\x${target_magic:2:2}\\x${target_magic:4:2}\\x${target_magic:6:2}" |
+        dd of="${destination}" bs=1 seek=7 conv=notrunc status=none
+
+    [[ "$(snapshot_v2_header_hex "${destination}")" == "${expected_destination_header}" ]] ||
+        die "transformed snapshot does not contain network magic ${target_magic}"
+    cmp --silent --bytes=7 -- "${source}" "${destination}" ||
+        die "snapshot transformation changed bytes before the network magic"
+    cmp --silent --ignore-initial=11 -- "${source}" "${destination}" ||
+        die "snapshot transformation changed bytes after the network magic"
+}
+
 require_rpc_cookie_readable() {
     local cookie
     local cookie_gid
@@ -947,6 +1132,7 @@ require_node_ready() {
         die "ecash-node is still in initial block download"
 
     require_activation_block
+    require_activation_block_data
     require_node_peer
 }
 
@@ -975,10 +1161,11 @@ node_trusted_snapshot_is_ready() {
 
     # loadtxoutset only activates a snapshot after the node has deserialized it
     # and matched its UTXO hash against the commitment compiled into the pinned
-    # node image. Tie that active state back to our separately pinned activation
-    # block before allowing monitoring to start ahead of the historical replay.
+    # node image. Tie that active state back to the separately pinned snapshot
+    # base before allowing monitoring to start ahead of the historical replay.
     jq -e \
-        --arg snapshot_hash "${ECASH_ACTIVATION_BLOCK_HASH}" \
+        --arg snapshot_hash "${ECASH_SNAPSHOT_BLOCK_HASH}" \
+        --argjson snapshot_height "${ECASH_SNAPSHOT_HEIGHT}" \
         --argjson activation_height "${ECASH_ACTIVATION_HEIGHT}" '
         (.headers | type == "number")
         and (.chainstates | type == "array")
@@ -986,6 +1173,7 @@ node_trusted_snapshot_is_ready() {
         and ((.chainstates[0] | has("snapshot_blockhash")) | not)
         and (.chainstates[0].validated == true)
         and (.chainstates[-1].snapshot_blockhash == $snapshot_hash)
+        and (.chainstates[-1].blocks >= $snapshot_height)
         and (.chainstates[-1].blocks >= $activation_height)
         and (.headers >= .chainstates[-1].blocks)
     ' <<<"${chainstates}" >/dev/null 2>&1
@@ -1024,12 +1212,12 @@ require_node_monitoring_ready() {
         return 0
     fi
     if node_trusted_snapshot_is_ready "${chainstates}"; then
-        info "accepting the pinned AssumeUTXO snapshot at ${ECASH_ACTIVATION_BLOCK_HASH}; historical validation continues in the background"
+        info "accepting the pinned AssumeUTXO snapshot at ${ECASH_SNAPSHOT_BLOCK_HASH}; historical validation continues in the background"
         return 0
     fi
 
     chainstate_count="$(jq -r '.chainstates | length' <<<"${chainstates}")"
     historical_blocks="$(jq -r '.chainstates[0].blocks // "unavailable"' <<<"${chainstates}")"
     active_blocks="$(jq -r '.chainstates[-1].blocks // "unavailable"' <<<"${chainstates}")"
-    die "ecash-node is not ready for monitoring (chainstates=${chainstate_count}, historical_blocks=${historical_blocks}, active_blocks=${active_blocks}); require one fully validated chainstate or set TRUST_ASSUMEUTXO_SNAPSHOT=true and load the pinned snapshot at ${ECASH_ACTIVATION_BLOCK_HASH}"
+    die "ecash-node is not ready for monitoring (chainstates=${chainstate_count}, historical_blocks=${historical_blocks}, active_blocks=${active_blocks}); require one fully validated chainstate or set TRUST_ASSUMEUTXO_SNAPSHOT=true and load the pinned snapshot at ${ECASH_SNAPSHOT_BLOCK_HASH}"
 }

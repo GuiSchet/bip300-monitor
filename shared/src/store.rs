@@ -35,6 +35,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../schema/0002_event_identity_nulls.sql"),
     include_str!("../schema/0003_history_coverage.sql"),
     include_str!("../schema/0004_observation_provenance.sql"),
+    include_str!("../schema/0005_event_fact_identity.sql"),
 ];
 
 /// Advisory-lock key that serializes the migration of one record.
@@ -1533,6 +1534,10 @@ async fn insert(
     let payload = json::render(event).context("rendering an event payload as JSON")?;
     let envelope = event.encode_to_vec();
     let envelope_sha256 = Sha256::digest(&envelope).to_vec();
+    let fact_sha256 = match event.monitor_event.as_ref() {
+        Some(MonitorEvent::Enforcer(payload)) => Sha256::digest(payload.encode_to_vec()).to_vec(),
+        None => bail!("event envelope does not contain a monitor event"),
+    };
     let observed_at = SystemTime::UNIX_EPOCH + Duration::from_millis(event.timestamp);
     update_sidechain_instances(transaction, dataset_id, event, observed_at, instance_cache).await?;
     let sidechain_instance_id = match (
@@ -1581,9 +1586,9 @@ async fn insert(
                  INSERT INTO event
                      (dataset_id, observed_at, source, kind, sidechain, block_hash,
                       height, envelope, payload, envelope_sha256,
-                      sidechain_instance_id, event_contract_version)
+                      sidechain_instance_id, event_contract_version, fact_sha256)
                  VALUES ($1::text::uuid, $2, $3, $4, $5, $6, $7, $8, $9,
-                         $10, $11, $12)
+                         $10, $11, $12, $17)
                  ON CONFLICT ON CONSTRAINT event_identity DO NOTHING
                  RETURNING id
              ), resolved_fact AS MATERIALIZED (
@@ -1597,6 +1602,7 @@ async fn insert(
                     AND sidechain IS NOT DISTINCT FROM $5
                     AND block_hash IS NOT DISTINCT FROM $6
                     AND sidechain_instance_id IS NOT DISTINCT FROM $11
+                    AND fact_sha256 = $17
                     AND NOT EXISTS (SELECT 1 FROM inserted_fact)
              ), inserted_observation AS (
                  INSERT INTO event_observation
@@ -1628,6 +1634,7 @@ async fn insert(
                 &capture_seq,
                 &method.as_str(),
                 &snapshot_group_id,
+                &fact_sha256,
             ],
         )
         .await

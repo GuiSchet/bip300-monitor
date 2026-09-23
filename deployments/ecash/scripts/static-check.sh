@@ -9,7 +9,7 @@ load_versions
 export COMPOSE_ENV_FILE="${DEPLOYMENT_ROOT}/.env.example"
 load_deployment_env
 
-for command_name in cmp docker git jq just mktemp shellcheck shfmt stat yamllint; do
+for command_name in cmp cp dd docker git jq just mktemp od rm shellcheck shfmt stat tr yamllint; do
     require_command "${command_name}"
 done
 
@@ -24,8 +24,9 @@ just --justfile "${DEPLOYMENT_ROOT}/justfile" --fmt --check
 override_env="$(mktemp)"
 rendered_node_config="$(mktemp)"
 cookie_root="$(mktemp -d)"
+snapshot_fixture_root="$(mktemp -d)"
 trap 'rm -f -- "${override_env}" "${rendered_node_config}"
-    rm -rf -- "${cookie_root}"' EXIT
+    rm -rf -- "${cookie_root}" "${snapshot_fixture_root}"' EXIT
 for override in \
     'ENFORCER_IMAGE=example.invalid/unpinned:latest' \
     'NETWORK_ID=unreviewed-network' \
@@ -51,6 +52,7 @@ for invalid_assignment in \
     'LIVE_EVENT_WAIT_SECONDS=0' \
     'LIVE_EVENT_WAIT_SECONDS=invalid' \
     'HISTORY_WAIT_SECONDS=0' \
+    'BMM_REQUEST_WAIT_SECONDS=0' \
     'BIP300_MONITOR_REQUEST_TIMEOUT_SECONDS=0' \
     'BIP300_MONITOR_REQUEST_TIMEOUT_SECONDS=invalid' \
     'BIP300_MONITOR_BACKFILL_PAGE_BLOCKS=0' \
@@ -58,11 +60,15 @@ for invalid_assignment in \
     'BIP300_MONITOR_BACKFILL_PAGE_PAUSE_MS=invalid' \
     'BIP300_MONITOR_TIP_POLL_INTERVAL_SECONDS=0' \
     'BIP300_MONITOR_TIP_POLL_INTERVAL_SECONDS=61' \
+    'BIP300_MONITOR_BMM_REQUEST_POLL_INTERVAL_SECONDS=0' \
+    'BIP300_MONITOR_BMM_REQUEST_POLL_INTERVAL_SECONDS=61' \
     'BIP300_MONITOR_STREAM_STALL_TIMEOUT_SECONDS=0' \
     'BIP300_MONITOR_STREAM_STALL_TIMEOUT_SECONDS=29' \
     'BIP300_MONITOR_BACKFILL_MAX_BLOCKS=2000' \
     'SNAPSHOT_RPC_WAIT_SECONDS=0' \
     'SNAPSHOT_RPC_WAIT_SECONDS=invalid' \
+    'SNAPSHOT_ACTIVATION_WAIT_SECONDS=0' \
+    'SNAPSHOT_ACTIVATION_WAIT_SECONDS=invalid' \
     'TRUST_ASSUMEUTXO_SNAPSHOT=1' \
     'TRUST_ASSUMEUTXO_SNAPSHOT=yes'; do
     cp "${DEPLOYMENT_ROOT}/.env.example" "${override_env}"
@@ -77,10 +83,10 @@ done
 
 ready_chainstates='{"headers":996259,"chainstates":[{"blocks":996259,"validated":true}]}'
 pre_activation_chainstate='{"headers":996259,"chainstates":[{"blocks":564987,"validated":true}]}'
-syncing_chainstates="{\"headers\":996259,\"chainstates\":[{\"blocks\":763703,\"validated\":true},{\"blocks\":996259,\"snapshot_blockhash\":\"${ECASH_ACTIVATION_BLOCK_HASH}\",\"validated\":false}]}"
+syncing_chainstates="{\"headers\":996259,\"chainstates\":[{\"blocks\":763703,\"validated\":true},{\"blocks\":996259,\"snapshot_blockhash\":\"${ECASH_SNAPSHOT_BLOCK_HASH}\",\"validated\":false}]}"
 wrong_snapshot_chainstates='{"headers":996259,"chainstates":[{"blocks":763703,"validated":true},{"blocks":996259,"snapshot_blockhash":"0000000000000000000000000000000000000000000000000000000000000000","validated":false}]}'
-pre_activation_snapshot="{\"headers\":996259,\"chainstates\":[{\"blocks\":763703,\"validated\":true},{\"blocks\":$((ECASH_ACTIVATION_HEIGHT - 1)),\"snapshot_blockhash\":\"${ECASH_ACTIVATION_BLOCK_HASH}\",\"validated\":false}]}"
-unvalidated_chainstate="{\"headers\":996259,\"chainstates\":[{\"blocks\":996259,\"snapshot_blockhash\":\"${ECASH_ACTIVATION_BLOCK_HASH}\",\"validated\":false}]}"
+pre_activation_snapshot="{\"headers\":996259,\"chainstates\":[{\"blocks\":763703,\"validated\":true},{\"blocks\":$((ECASH_SNAPSHOT_HEIGHT - 1)),\"snapshot_blockhash\":\"${ECASH_SNAPSHOT_BLOCK_HASH}\",\"validated\":false}]}"
+unvalidated_chainstate="{\"headers\":996259,\"chainstates\":[{\"blocks\":996259,\"snapshot_blockhash\":\"${ECASH_SNAPSHOT_BLOCK_HASH}\",\"validated\":false}]}"
 empty_chainstates='{"headers":996259,"chainstates":[]}'
 
 node_history_is_fully_validated "${ready_chainstates}" ||
@@ -122,6 +128,41 @@ grep -Fq "node_history_is_fully_validated \"\${chainstates}\"" \
     die "status.sh does not report strict historical validation separately"
 grep -Fq 'SNAPSHOT_RPC_WAIT_SECONDS' "${DEPLOYMENT_ROOT}/scripts/snapshot.sh" ||
     die "snapshot.sh does not wait through node RPC warmup"
+grep -Fq 'SNAPSHOT_ACTIVATION_WAIT_SECONDS' "${DEPLOYMENT_ROOT}/scripts/lib.sh" ||
+    die "snapshot activation block recovery is not bounded by the configured wait"
+
+# The only permitted Betanet snapshot conversion rewrites the four-byte
+# network magic in a version-2 snapshot header and preserves every other byte.
+snapshot_source_fixture="${snapshot_fixture_root}/source.dat"
+snapshot_target_fixture="${snapshot_fixture_root}/target.dat"
+printf '\x75\x74\x78\x6f\xff\x02\x00\xf9\xbe\xb4\xd9fixture-body' \
+    >"${snapshot_source_fixture}"
+source_fixture_sha="$(sha256sum "${snapshot_source_fixture}" | awk '{print $1}')"
+rewrite_snapshot_network_magic_v2 \
+    "${snapshot_source_fixture}" \
+    "${snapshot_target_fixture}" \
+    f9beb4d9 \
+    eca5b104
+[[ "$(snapshot_v2_header_hex "${snapshot_source_fixture}")" == 7574786fff0200f9beb4d9 ]] ||
+    die "snapshot conversion modified its source"
+[[ "$(snapshot_v2_header_hex "${snapshot_target_fixture}")" == 7574786fff0200eca5b104 ]] ||
+    die "snapshot conversion did not write the locked Betanet magic"
+[[ "$(stat --format='%s' "${snapshot_source_fixture}")" == "$(stat --format='%s' "${snapshot_target_fixture}")" ]] ||
+    die "snapshot conversion changed the artifact size"
+[[ "$(sha256sum "${snapshot_source_fixture}" | awk '{print $1}')" == "${source_fixture_sha}" ]] ||
+    die "snapshot conversion changed its source bytes"
+cmp --ignore-initial=11 \
+    "${snapshot_source_fixture}" "${snapshot_target_fixture}" ||
+    die "snapshot conversion changed bytes after the network magic"
+if (
+    rewrite_snapshot_network_magic_v2 \
+        "${snapshot_source_fixture}" \
+        "${snapshot_fixture_root}/wrong-source.dat" \
+        deadbeef \
+        eca5b104
+) >/dev/null 2>&1; then
+    die "snapshot conversion accepted the wrong source network magic"
+fi
 
 # The enforcer reads a cookie the node image creates, so the check has to accept
 # owner, group, and world readability and reject the root:root 0600 case.
@@ -187,6 +228,14 @@ grep -Fq 'record_block_history_is_complete' "${DEPLOYMENT_ROOT}/scripts/verify.s
     die "verify.sh does not assert complete block history"
 grep -Fq 'record_bip300_history_is_complete' "${DEPLOYMENT_ROOT}/scripts/verify.sh" ||
     die "verify.sh does not assert complete global BIP300 history"
+grep -Fq 'record_current_run_has_bmm_observation' "${DEPLOYMENT_ROOT}/scripts/verify.sh" ||
+    die "verify.sh does not assert a successful BMM request poll"
+grep -Fq 'event_contract_version' "${DEPLOYMENT_ROOT}/scripts/accept.sh" ||
+    die "accept.sh does not record the normalized event contract"
+grep -Fq 'history_fully_validated' "${DEPLOYMENT_ROOT}/scripts/accept.sh" ||
+    die "accept.sh does not distinguish snapshot readiness from full historical validation"
+grep -Fq 'snapshot_transform' "${DEPLOYMENT_ROOT}/scripts/accept.sh" ||
+    die "accept.sh does not record snapshot provenance"
 grep -Fq 'event.dataset_id = coverage.dataset_id' "${DEPLOYMENT_ROOT}/scripts/lib.sh" ||
     die "history verification can alias facts from another dataset"
 grep -Fq 'event.event_contract_version = coverage.event_contract_version' \
@@ -472,6 +521,7 @@ jq -e '.services["event-logger"].environment.BIP300_MONITOR_NATS_URL == "nats://
     <<<"${config_json}" >/dev/null
 jq -e '.services["enforcer-extractor"].environment.BIP300_MONITOR_NATS_URL == "nats://nats:4222"
     and .services["enforcer-extractor"].environment.BIP300_MONITOR_ENFORCER_ENDPOINT == "http://enforcer:50051"
+    and .services["enforcer-extractor"].environment.BIP300_MONITOR_BMM_REQUEST_POLL_INTERVAL_SECONDS == "5"
     and (.services["enforcer-extractor"].environment | has("BIP300_MONITOR_SIDECHAINS") | not)' \
     <<<"${config_json}" >/dev/null
 # The full history is mandatory; only one page is bounded in memory.
@@ -535,6 +585,10 @@ grep -Fxq "# network_id=${NETWORK_ID} magic=${ECASH_NETWORK_MAGIC}" \
     "${rendered_node_config}"
 grep -Fxq 'listen=0' "${rendered_node_config}"
 grep -Fxq 'prune=0' "${rendered_node_config}"
+grep -Fxq 'txindex=0' "${rendered_node_config}"
+if grep -Fxq 'txindex=1' "${rendered_node_config}"; then
+    die "observer-only deployment unexpectedly enables txindex"
+fi
 grep -Fxq "port=${ECASH_NODE_P2P_PORT}" "${rendered_node_config}"
 grep -Fxq "rpcport=${ECASH_NODE_RPC_PORT}" "${rendered_node_config}"
 grep -Fxq 'rpcallowip=172.30.0.0/24' "${rendered_node_config}"
@@ -550,7 +604,8 @@ actual_peer_count="$(grep -c '^addnode=' "${rendered_node_config}")"
 [[ "${actual_peer_count}" == "${expected_peer_count}" ]] ||
     die "rendered node configuration contains an unexpected peer"
 
-[[ "${LOCK_FORMAT}" == 2 ]]
+[[ "${LOCK_FORMAT}" == 4 ]]
+[[ "${ECASH_SNAPSHOT_TRANSFORM}" == none ]]
 [[ "${ECASH_NETWORK_MAGIC}" =~ ^[[:xdigit:]]{8}$ ]]
 [[ "${ECASH_ACTIVATION_BLOCK_HASH}" =~ ^[[:xdigit:]]{64}$ ]]
 [[ "${ECASH_SNAPSHOT_SHA256}" =~ ^[[:xdigit:]]{64}$ ]]
@@ -578,6 +633,7 @@ fi
 # Promoting ENFORCER_IMAGE without re-vendoring proto/upstream would pair a new
 # enforcer with stale client stubs. This is the offline half of that gate; CI
 # also re-downloads the upstream files.
-"${repository_root}/.github/scripts/check-proto-vendor.sh" --offline
+BIP300_MONITOR_PROTO_VERSIONS_FILE="${DEPLOYMENT_ROOT}/VERSIONS.betanet.lock.example" \
+    "${repository_root}/.github/scripts/check-proto-vendor.sh" --offline
 
 info "${NETWORK_ID} eCash deployment checks passed"

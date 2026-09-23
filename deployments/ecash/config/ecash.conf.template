@@ -6,7 +6,10 @@ discover=0
 dnsseed=1
 
 rest=1
-txindex=1
+# The private observer runs neither the enforcer wallet nor mining services.
+# Avoid rebuilding a full-history transaction index that none of its services
+# query, especially while AssumeUTXO validates history in the background.
+txindex=0
 disablewallet=1
 
 rpcbind=0.0.0.0

@@ -1,6 +1,6 @@
 # shellcheck shell=bash
 # Reproducible eCash network, image, tool, and snapshot lock.
-LOCK_FORMAT=2
+LOCK_FORMAT=4
 LOCKED_AT=2026-09-15
 
 NETWORK_ID=alphanet
@@ -63,5 +63,13 @@ ECASH_ACTIVATION_BLOCK_HASH=0000000000b360c17636b7a6c366e3effbe91a847eb5d61b7a7b
 ECASH_SNAPSHOT_URL=https://data.drivechain.dev/alphanet/utxo-963648.dat
 ECASH_SNAPSHOT_CHECKSUMS_URL=https://data.drivechain.dev/alphanet/SHA256SUMS
 ECASH_SNAPSHOT_FILE=utxo-963648.dat
+ECASH_SNAPSHOT_HEIGHT=963648
+ECASH_SNAPSHOT_BLOCK_HASH=0000000000b360c17636b7a6c366e3effbe91a847eb5d61b7a7b29476439e924
+ECASH_SNAPSHOT_TRANSFORM=none
+# Commitment compiled into the pinned node. These two values are provenance
+# inputs for reviewing a future network-specific node build; loadtxoutset is
+# the runtime authority that recomputes and enforces them.
+ECASH_SNAPSHOT_UTXO_HASH=9dcc897da984d93eda56e5c4d0c4d6b54e75df7d03f5c8ae1459f511fadf7210
+ECASH_SNAPSHOT_CHAIN_TX_COUNT=1423154850
 ECASH_SNAPSHOT_SIZE=9468026932
 ECASH_SNAPSHOT_SHA256=ca4ea635bfd26fbfeb2fa38cc38298ce916b61a9411e4926fe248292d0b1fd31

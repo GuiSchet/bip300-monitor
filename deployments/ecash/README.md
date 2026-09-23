@@ -8,6 +8,11 @@ the node configuration is generated from those values plus
 `config/ecash.conf.template`. The scripts and Compose topology are shared so a
 future Beta or Mainnet transition does not require another deployment copy.
 
+The reviewed, fail-closed HOSTKEY transition procedure is in
+[`docs/betanet-migration.md`](../../docs/betanet-migration.md). The active lock
+is not promoted until the transformed Betanet snapshot hash and all image
+digests are available.
+
 Alphanet is experimental. Use a dedicated data directory and no real funds.
 
 The lock pins the reviewed observer fork that adds `GetBip300BlockDelta`, while
@@ -45,8 +50,8 @@ just status
 ```
 
 The AssumeUTXO bootstrap is explicit because it downloads about 9.5 GB,
-verifies its pinned size and SHA-256, and waits for the exact activation header
-before loading it:
+verifies its pinned size and SHA-256, and waits for the exact snapshot-base
+header before loading it:
 
 ```bash
 just snapshot
@@ -69,9 +74,17 @@ therefore report `Connected ... pre-activation block(s) from stored headers`
 before the validator processes blocks at and above the locked activation
 height.
 
-The generated node configuration sets `prune=0` explicitly. Runtime readiness
+For Betanet, the official commitment is at height 935000. The downloader
+verifies either pinned source mirror, then deterministically rewrites only the
+four version-2 header bytes containing Bitcoin's network magic. The transformed
+artifact has its own locked SHA-256; `loadtxoutset` still validates the base
+block and UTXO commitment compiled into the official node.
+
+The generated observer-only node configuration sets `prune=0` and `txindex=0`
+explicitly. Runtime readiness
 rejects `getblockchaininfo.pruned = true`, because the observer RPC needs raw
-historical blocks to preserve exact scripts and transactions.
+historical blocks to preserve exact scripts and transactions. The enforcer has
+wallet and mining disabled and does not need Core's transaction index.
 
 The default `.env.example` deliberately sets
 `TRUST_ASSUMEUTXO_SNAPSHOT=true`. With that policy, `just enforcer-up` accepts
@@ -108,6 +121,12 @@ slot. It also requires complete per-instance `block` coverage and global
 `bip300_delta` coverage even when there are zero active slots. Repeated captures
 belong in `event_observation`, not as duplicate facts.
 
+Contract v4 additionally requires a successful live BMM-request poll from the
+current extractor run. An empty request list is recorded as an observed fact;
+an RPC failure is never treated as an empty auction. Distinct auction states at
+the same parent block are separate facts, while a repeated state adds only a
+new observation occurrence.
+
 Rows outlive a container, and the block is what scopes them — a previous run's
 rows are anchored at a previous block. Scoping by time instead would be wrong in
 the other direction: republishing is idempotent, so a restart at an unchanged tip
@@ -125,12 +144,16 @@ just verify-live
 After reviewing the verification output, `just accept` repeats the fast and
 live checks and atomically writes `${ECASH_DATA_ROOT}/.deployment-accepted`.
 The marker records the network, repository SHA, image/source pins, discovered
-slots, block-history status, mutable-state-history status, and verified live
-block. Acceptance refuses to run from a dirty Git checkout.
+slots, event contract and extractor-run capabilities, snapshot provenance, BMM poll
+status, background Core-validation status, block-history status,
+mutable-state-history status, and verified live block. Acceptance refuses to
+run from a dirty Git checkout.
 
 Timeouts can be adjusted in `.env`. `SNAPSHOT_RPC_WAIT_SECONDS` lets the
 snapshot command remain parked while a recovering node keeps RPC in warmup,
-instead of exiting and re-hashing the 9.5 GB file on every service retry. All
+instead of exiting and re-hashing the 9.5 GB file on every service retry.
+`SNAPSHOT_ACTIVATION_WAIT_SECONDS` bounds recovery of the raw activation block
+from a synced outbound peer. All
 values in `VERSIONS.lock` are repository-owned pins and cannot be overridden
 there. `just down` stops the stack without deleting `${ECASH_DATA_ROOT}`.
 

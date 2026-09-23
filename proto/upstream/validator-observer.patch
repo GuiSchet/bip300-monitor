@@ -1,5 +1,5 @@
 diff --git a/proto/cusf/mainchain/v1/validator.proto b/proto/cusf/mainchain/v1/validator.proto
-index 695c4e0..f4fd222 100644
+index f7eada7..1836f97 100644
 --- a/proto/cusf/mainchain/v1/validator.proto
 +++ b/proto/cusf/mainchain/v1/validator.proto
 @@ -84,6 +84,11 @@ service ValidatorService {
@@ -14,7 +14,7 @@ index 695c4e0..f4fd222 100644
    // Fetches BMM h* commitment for a specific mainchain block,
    // and optionally, it's ancestors
    rpc GetBmmHStarCommitment(GetBmmHStarCommitmentRequest) returns (GetBmmHStarCommitmentResponse) {
-@@ -165,6 +170,133 @@ message GetBlockInfoResponse {
+@@ -169,6 +174,133 @@ message GetBlockInfoResponse {
    repeated Info infos = 1;
  }
  
