@@ -2,7 +2,7 @@
 # Reviewed Betanet lock retained as a promotion/audit reference. The active
 # VERSIONS.lock must match these immutable network and artifact values.
 LOCK_FORMAT=5
-LOCKED_AT=2026-09-23
+LOCKED_AT=2026-09-24
 
 NETWORK_ID=betanet
 ECASH_NODE_CHAIN=main
@@ -39,12 +39,12 @@ POSTGRES_IMAGE=docker.io/library/postgres:18.2-alpine@sha256:035b9ab53cfa147d720
 POSTGRES_DB=bip300_monitor
 POSTGRES_USER=bip300_monitor
 
-# Last published monitor release. Keep contract, commit, and both immutable
-# image digests together; promote all four to v6 only after CI publishes it.
-MONITOR_EVENT_CONTRACT_VERSION=5
-MONITOR_IMAGE_COMMIT=86e83787b7c1dd32e404ded6ef26404f63f49359
-ENFORCER_EXTRACTOR_IMAGE=docker.io/guischet/bip300-enforcer-extractor:sha-86e83787b7c1@sha256:0053bfe3d2685bd7caf59f400cce5453a95f5082d52788b3bdc24fb4fb049f79
-EVENT_LOGGER_IMAGE=docker.io/guischet/bip300-event-logger:sha-86e83787b7c1@sha256:9f7458215a95f60311f727824688739574a335a20a35194e606cf736cd8c5aa2
+# Published monitor release. Keep contract, commit, and both immutable image
+# digests together.
+MONITOR_EVENT_CONTRACT_VERSION=6
+MONITOR_IMAGE_COMMIT=88da099049bb469aeee3dec3cc5d86a056970382
+ENFORCER_EXTRACTOR_IMAGE=docker.io/guischet/bip300-enforcer-extractor:sha-88da099049bb@sha256:48e8caa4b77f76bceec3ec50cfaa7581df58e135c96a5013fa807b5d125178a7
+EVENT_LOGGER_IMAGE=docker.io/guischet/bip300-event-logger:sha-88da099049bb@sha256:5d27d9dc223d50abe8eeefa3452c533241ab0c23fff6317c696125a3235b534a
 
 JUST_VERSION=1.57.0
 JUST_TARGET=x86_64-unknown-linux-musl
