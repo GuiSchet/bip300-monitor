@@ -37,6 +37,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../schema/0004_observation_provenance.sql"),
     include_str!("../schema/0005_event_fact_identity.sql"),
     include_str!("../schema/0006_worker_health_and_observation_order.sql"),
+    include_str!("../schema/0007_single_active_run.sql"),
 ];
 
 /// Advisory-lock key that serializes the migration of one record.
@@ -393,8 +394,15 @@ fn sidechain_instance_identity(
             sidechain.sidechain_number
         )
     })?;
-    let first_hash = Sha256::digest(&sidechain.raw_description);
-    let description_sha256d = Sha256::digest(first_hash).to_vec();
+    let description_sha256d = crate::bip300::sidechain_description_hash(&sidechain.raw_description)
+        .context("calculating the active sidechain BIP300 description hash")?;
+    if sidechain.description_hash != description_sha256d {
+        bail!(
+            "active sidechain slot {slot} reports description hash {}, calculated {}",
+            hex::encode(&sidechain.description_hash),
+            hex::encode(&description_sha256d)
+        );
+    }
     Ok((
         SidechainInstanceRef {
             sidechain: slot,
@@ -506,6 +514,40 @@ impl Store {
             .await
             .context("resolving the record dataset identity")?
             .get(0);
+        if manifest.event_contract_version >= 6 {
+            let incompatible: bool = transaction
+                .query_one(
+                    "SELECT initial_event_contract_version < 6
+                            AND EXISTS (
+                                SELECT 1 FROM sidechain_instance
+                                 WHERE dataset_id = $1::text::uuid
+                            )
+                       FROM dataset_manifest
+                      WHERE dataset_id = $1::text::uuid",
+                    &[&dataset_id],
+                )
+                .await
+                .context("checking the v6 dataset compatibility boundary")?
+                .get(0);
+            if incompatible {
+                bail!(
+                    "event contract v6 cannot extend a pre-v6 dataset; create a recoverable record backup and start an empty dataset"
+                );
+            }
+        }
+        transaction
+            .execute(
+                "UPDATE extractor_run
+                    SET status = 'failed',
+                        finished_at = now(),
+                        finish_reason = 'superseded by extractor startup after unclean termination'
+                  WHERE dataset_id = $1::text::uuid
+                    AND source = $2
+                    AND status = 'running'",
+                &[&dataset_id, &self.source],
+            )
+            .await
+            .context("closing an orphaned extractor run")?;
         let run_id: String = transaction
             .query_one(
                 "INSERT INTO extractor_run

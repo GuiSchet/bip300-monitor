@@ -35,6 +35,7 @@ use crate::{EnforcerClient, convert};
 type EventStream = Streaming<mainchain::SubscribeEventsResponse>;
 type SourceFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>>;
 type DeferredBackfill = Pin<Box<dyn Future<Output = BackfillRequest> + Send>>;
+type DeferredSidechainActivation = Pin<Box<dyn Future<Output = String> + Send>>;
 const NATS_CLIENT_NAME: &str = "bip300-monitor-enforcer-extractor";
 const SNAPSHOT_MAX_ATTEMPTS: u32 = 3;
 /// Names the writer of every row this extractor records.
@@ -79,9 +80,51 @@ impl StartupSource for EnforcerClient {
     }
 }
 
+/// Source used when a sidechain becomes active after startup.
+trait SidechainActivationSource: Send {
+    type Stream: Send;
+
+    fn open_sidechain_stream(&mut self, sidechain: u8) -> SourceFuture<'_, Self::Stream>;
+    fn read_activation_tip(&mut self) -> SourceFuture<'_, ObservedBlock>;
+}
+
+impl SidechainActivationSource for EnforcerClient {
+    type Stream = EventStream;
+
+    fn open_sidechain_stream(&mut self, sidechain: u8) -> SourceFuture<'_, Self::Stream> {
+        Box::pin(EnforcerClient::subscribe_events(self, sidechain))
+    }
+
+    fn read_activation_tip(&mut self) -> SourceFuture<'_, ObservedBlock> {
+        Box::pin(snapshot::current_tip(self))
+    }
+}
+
 /// Source of the mainchain tip, polled independently of any slot.
 trait TipSource: Send {
     fn read_tip(&mut self) -> SourceFuture<'_, ObservedBlock>;
+}
+
+/// Source used to bracket one BMM auction response with exact tip reads.
+trait BmmSource: Send {
+    fn current_tip(&mut self) -> SourceFuture<'_, ObservedBlock>;
+    fn bmm_requests(
+        &mut self,
+        parent: Vec<u8>,
+    ) -> SourceFuture<'_, mainchain::GetSeenBmmRequestsResponse>;
+}
+
+impl BmmSource for EnforcerClient {
+    fn current_tip(&mut self) -> SourceFuture<'_, ObservedBlock> {
+        Box::pin(snapshot::current_tip(self))
+    }
+
+    fn bmm_requests(
+        &mut self,
+        parent: Vec<u8>,
+    ) -> SourceFuture<'_, mainchain::GetSeenBmmRequestsResponse> {
+        Box::pin(async move { self.get_seen_bmm_requests(hex::encode(parent), None).await })
+    }
 }
 
 impl TipSource for EnforcerClient {
@@ -136,6 +179,7 @@ struct BackfillRequest {
 pub async fn run(args: Args, mut shutdown_rx: watch::Receiver<bool>) -> Result<()> {
     args.validate()
         .context("validating extractor configuration")?;
+    let activation_block_hash = args.activation_block_hash_bytes()?;
 
     let startup = prepare_startup(&args);
     tokio::pin!(startup);
@@ -232,6 +276,7 @@ pub async fn run(args: Args, mut shutdown_rx: watch::Receiver<bool>) -> Result<(
             args.sidechains.is_empty(),
             sidechain_state_rx,
             tip_rx.clone(),
+            args.tip_poll_interval(),
             args.stream_stall_timeout(),
             shutdown_rx.clone(),
         ));
@@ -247,7 +292,6 @@ pub async fn run(args: Args, mut shutdown_rx: watch::Receiver<bool>) -> Result<(
         workers.spawn(monitor_bmm_requests(
             client.clone(),
             recorder.clone(),
-            snapshot.anchor.clone(),
             args.bmm_request_poll_interval(),
             tip_rx.clone(),
             shutdown_rx.clone(),
@@ -267,6 +311,7 @@ pub async fn run(args: Args, mut shutdown_rx: watch::Receiver<bool>) -> Result<(
             client.clone(),
             recorder.clone(),
             args.activation_height,
+            activation_block_hash,
             snapshot.anchor.clone(),
             backfill::Settings {
                 page_blocks: args.backfill_page_blocks,
@@ -325,6 +370,7 @@ async fn backfill_bip300_history(
     mut client: EnforcerClient,
     recorder: Recorder,
     activation_height: u32,
+    activation_block_hash: Option<Vec<u8>>,
     mut target: ObservedBlock,
     settings: backfill::Settings,
     retry_interval: Duration,
@@ -338,6 +384,7 @@ async fn backfill_bip300_history(
             &mut client,
             &recorder,
             activation_height,
+            activation_block_hash.as_deref(),
             &target,
             settings,
             shutdown_rx.clone(),
@@ -374,9 +421,26 @@ async fn backfill_bip300_history(
                     );
                 }
                 target = reached_target;
-                let current_tip = snapshot::current_tip(&mut client)
-                    .await
-                    .context("reconciling global BIP300 history with the tip")?;
+                let current_tip = match snapshot::current_tip(&mut client).await {
+                    Ok(current_tip) => current_tip,
+                    Err(error) if backfill::retryable_rpc_error(&error) => {
+                        tracing::warn!(
+                            retry_seconds = retry_interval.as_secs(),
+                            error = %format!("{error:#}"),
+                            "could not reconcile global BIP300 history with the tip; retrying"
+                        );
+                        tokio::select! {
+                            biased;
+                            () = wait_for_shutdown(&mut shutdown_rx) => return Ok(()),
+                            () = tokio::time::sleep(retry_interval) => {}
+                        }
+                        continue;
+                    }
+                    Err(error) => {
+                        return Err(error)
+                            .context("reconciling global BIP300 history with the tip");
+                    }
+                };
                 if current_tip.hash != target.hash {
                     target = current_tip;
                     continue;
@@ -579,9 +643,32 @@ async fn backfill_sidechains(
                 break;
             }
 
-            let current_tip = snapshot::current_tip(&mut client).await.with_context(|| {
-                format!("reconciling sidechain {sidechain} history with the tip")
-            })?;
+            let current_tip = match snapshot::current_tip(&mut client).await {
+                Ok(current_tip) => current_tip,
+                Err(error) if backfill::retryable_rpc_error(&error) => {
+                    tracing::warn!(
+                        sidechain,
+                        retry_seconds = retry_interval.as_secs(),
+                        error = %format!("{error:#}"),
+                        "could not reconcile sidechain history with the tip; retrying"
+                    );
+                    schedule_backfill_retry(
+                        &mut retries,
+                        &mut deferred,
+                        BackfillRequest {
+                            instance: instance.clone(),
+                            target: target.clone(),
+                        },
+                        retry_interval,
+                    );
+                    break;
+                }
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!("reconciling sidechain {sidechain} history with the tip")
+                    });
+                }
+            };
             if current_tip.hash == target.hash {
                 break;
             }
@@ -709,6 +796,7 @@ async fn prepare_startup(args: &Args) -> Result<PreparedStartup> {
         snapshot,
         snapshot_metadata,
     } = observation;
+    validate_chain_identity(args, &snapshot).context("validating the enforcer chain identity")?;
     // Opening the recorder creates an extractor_run. Do it only after every
     // fallible, read-only startup probe has succeeded so a failed connection or
     // subscription cannot leave a misleading forever-running run behind.
@@ -735,6 +823,40 @@ async fn prepare_startup(args: &Args) -> Result<PreparedStartup> {
         snapshot,
         snapshot_metadata,
     })
+}
+
+fn validate_chain_identity(args: &Args, snapshot: &InitialSnapshot) -> Result<()> {
+    let chain_info = snapshot
+        .constants
+        .iter()
+        .find_map(|payload| match payload.event.as_ref() {
+            Some(events::enforcer_event::Event::ChainInfo(chain_info)) => Some(chain_info),
+            _ => None,
+        })
+        .context("initial snapshot has no chain-info payload")?;
+    let constants = chain_info
+        .bip300_constants
+        .as_ref()
+        .context("chain info has no BIP300 constants")?;
+    if constants.activation_height != args.activation_height {
+        bail!(
+            "enforcer BIP300 activation height is {}, expected {}",
+            constants.activation_height,
+            args.activation_height
+        );
+    }
+    if let Some(expected_name) = args.expected_enforcer_network.as_deref() {
+        let expected = mainchain::Network::from_str_name(expected_name)
+            .with_context(|| format!("unknown expected enforcer network `{expected_name}`"))?;
+        if chain_info.raw_network != expected as i32 {
+            let actual = mainchain::Network::try_from(chain_info.raw_network).map_or_else(
+                |_| chain_info.raw_network.to_string(),
+                |value| value.as_str_name().to_owned(),
+            );
+            bail!("enforcer network is {actual}, expected {expected_name}");
+        }
+    }
+    Ok(())
 }
 
 async fn prepare_observation<C>(
@@ -831,6 +953,7 @@ async fn monitor_sidechains(
     discover_new_slots: bool,
     mut sidechain_state_rx: watch::Receiver<u64>,
     tip_rx: watch::Receiver<ObservedBlock>,
+    activation_retry_interval: Duration,
     stream_stall_timeout: Duration,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> Result<()> {
@@ -846,6 +969,8 @@ async fn monitor_sidechains(
         .collect::<BTreeMap<_, _>>();
     let mut managed = BTreeMap::<u8, ManagedWorker>::new();
     let mut workers = JoinSet::new();
+    let mut deferred_activations = BTreeSet::<String>::new();
+    let mut activation_retries = FuturesUnordered::<DeferredSidechainActivation>::new();
     for (sidechain, stream) in streams {
         let instance = initial_instances
             .get(&sidechain)
@@ -937,6 +1062,15 @@ async fn monitor_sidechains(
                 }
                 sidechain_state_rx.borrow_and_update();
             }
+            instance_id = activation_retries.next(), if !activation_retries.is_empty() => {
+                let instance_id = instance_id
+                    .expect("a non-empty sidechain activation retry set yields an instance");
+                deferred_activations.remove(&instance_id);
+                tracing::debug!(
+                    instance = %instance_id,
+                    "retrying observation setup for a newly active sidechain"
+                );
+            }
         }
 
         let active_instances = recorder
@@ -968,19 +1102,36 @@ async fn monitor_sidechains(
 
         let additions = active
             .into_values()
-            .filter(|instance| !managed.contains_key(&instance.sidechain))
+            .filter(|instance| {
+                !managed.contains_key(&instance.sidechain)
+                    && !deferred_activations.contains(&instance.sidechain_instance_id)
+            })
             .collect::<Vec<_>>();
         for instance in additions {
             let sidechain = instance.sidechain;
             // Subscribe before fixing the backfill target. Any later block is
             // either delivered live or included by the final reconciliation.
-            let stream = client
-                .subscribe_events(sidechain)
-                .await
-                .with_context(|| format!("subscribing to newly active sidechain {sidechain}"))?;
-            let target = snapshot::current_tip(&mut client)
-                .await
-                .with_context(|| format!("anchoring newly active sidechain {sidechain}"))?;
+            let (stream, target) = match prepare_sidechain_activation(&mut client, sidechain).await
+            {
+                Ok(prepared) => prepared,
+                Err(error) if backfill::retryable_rpc_error(&error) => {
+                    schedule_sidechain_activation_retry(
+                        &mut activation_retries,
+                        &mut deferred_activations,
+                        &instance,
+                        activation_retry_interval,
+                    );
+                    tracing::warn!(
+                        sidechain,
+                        instance = %instance.sidechain_instance_id,
+                        retry_seconds = activation_retry_interval.as_secs(),
+                        error = %format!("{error:#}"),
+                        "could not prepare observation for a newly active sidechain; retrying"
+                    );
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
             let (stop_tx, stop_rx) = watch::channel(false);
             let worker_instance = instance.clone();
             let worker_recorder = recorder.clone();
@@ -1022,6 +1173,36 @@ async fn monitor_sidechains(
                 "started observation and queued full history for a newly active sidechain"
             );
         }
+    }
+}
+
+async fn prepare_sidechain_activation<S: SidechainActivationSource>(
+    source: &mut S,
+    sidechain: u8,
+) -> Result<(S::Stream, ObservedBlock)> {
+    let stream = source
+        .open_sidechain_stream(sidechain)
+        .await
+        .with_context(|| format!("subscribing to newly active sidechain {sidechain}"))?;
+    let target = source
+        .read_activation_tip()
+        .await
+        .with_context(|| format!("anchoring newly active sidechain {sidechain}"))?;
+    Ok((stream, target))
+}
+
+fn schedule_sidechain_activation_retry(
+    retries: &mut FuturesUnordered<DeferredSidechainActivation>,
+    deferred: &mut BTreeSet<String>,
+    instance: &SidechainInstanceRef,
+    retry_interval: Duration,
+) {
+    if deferred.insert(instance.sidechain_instance_id.clone()) {
+        let instance_id = instance.sidechain_instance_id.clone();
+        retries.push(Box::pin(async move {
+            tokio::time::sleep(retry_interval).await;
+            instance_id
+        }));
     }
 }
 
@@ -1202,7 +1383,6 @@ async fn monitor_tip(
 async fn monitor_bmm_requests(
     mut client: EnforcerClient,
     recorder: Recorder,
-    mut parent: ObservedBlock,
     interval: Duration,
     mut tip_rx: watch::Receiver<ObservedBlock>,
     mut shutdown_rx: watch::Receiver<bool>,
@@ -1215,14 +1395,11 @@ async fn monitor_bmm_requests(
     );
     let mut consecutive_failures = 0_u32;
     loop {
-        let parent_hex = hex::encode(&parent.hash);
-        match client.get_seen_bmm_requests(parent_hex, None).await {
-            Ok(response) => {
-                let payload = convert::bmm_requests(parent.hash.clone(), response)
-                    .context("converting live BMM requests")?;
-                let event = envelope(payload, parent.clone())?;
+        match collect_bmm_sample(&mut client, SNAPSHOT_MAX_ATTEMPTS).await {
+            Ok((payload, metadata)) => {
+                let event = envelope(payload, metadata.tip_before.clone())?;
                 recorder
-                    .record_batch_with_method(vec![event], CaptureMethod::Poll)
+                    .record_snapshot_batch(vec![event], CaptureMethod::Poll, &metadata)
                     .await
                     .context("recording a live BMM request snapshot")?;
                 if let Err(error) = recorder
@@ -1237,6 +1414,10 @@ async fn monitor_bmm_requests(
                 consecutive_failures = 0;
             }
             Err(error) => {
+                // RPC and conversion failures are isolated to this worker. No
+                // empty auction is fabricated; durable worker health makes a
+                // persistent malformed response fail verification after the
+                // degradation threshold without discarding unrelated history.
                 consecutive_failures = consecutive_failures.saturating_add(1);
                 let message = format!("live BMM request poll failed: {error:#}");
                 if let Err(status_error) = recorder
@@ -1270,11 +1451,54 @@ async fn monitor_bmm_requests(
                 if changed.is_err() {
                     bail!("mainchain tip observer stopped while BMM polling was running");
                 }
-                parent = tip_rx.borrow_and_update().clone();
+                tip_rx.borrow_and_update();
             }
             () = tokio::time::sleep(interval) => {}
         }
     }
+}
+
+async fn collect_bmm_sample<S: BmmSource>(
+    source: &mut S,
+    max_attempts: u32,
+) -> Result<(events::EnforcerEvent, SnapshotMetadata)> {
+    let started_at = SystemTime::now();
+    for attempts in 1..=max_attempts {
+        let tip_before = source
+            .current_tip()
+            .await
+            .context("reading the mainchain tip before sampling BMM requests")?;
+        let response = source
+            .bmm_requests(tip_before.hash.clone())
+            .await
+            .context("sampling live BMM requests")?;
+        let tip_after = source
+            .current_tip()
+            .await
+            .context("reading the mainchain tip after sampling BMM requests")?;
+        if tip_before.hash == tip_after.hash {
+            let payload = convert::bmm_requests(tip_before.hash.clone(), response)
+                .context("converting live BMM requests")?;
+            return Ok((
+                payload,
+                SnapshotMetadata {
+                    started_at,
+                    finished_at: SystemTime::now(),
+                    tip_before,
+                    tip_after,
+                    consistency: SnapshotConsistency::Stable,
+                    attempts,
+                },
+            ));
+        }
+        tracing::debug!(
+            attempts,
+            tip_before = %hex::encode(&tip_before.hash),
+            tip_after = %hex::encode(&tip_after.hash),
+            "mainchain tip moved while sampling BMM requests; discarding the response"
+        );
+    }
+    bail!("mainchain tip changed during every BMM snapshot attempt")
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1697,6 +1921,7 @@ mod tests {
     use std::time::{Duration, SystemTime};
 
     use anyhow::{Context as _, anyhow};
+    use clap::Parser as _;
     use futures_util::{StreamExt, stream};
     use shared::protobuf::enforcer_extractor as events;
     use shared::protobuf::event::event::MonitorEvent;
@@ -1705,11 +1930,12 @@ mod tests {
     use tokio::time::timeout;
 
     use super::{
-        BackfillRequest, Heartbeat, SourceFuture, StartupSource, StateSource, TipSource,
-        active_instances_for_slots, announce_tip_changes, current_tip_receiver, forward_stream,
-        prepare_observation, prepare_stable_observation, queue_tip_reconciliations,
-        refresh_on_new_blocks, schedule_backfill_retry, snapshot_tips_are_consistent,
-        supervise_workers,
+        BackfillRequest, BmmSource, Heartbeat, SidechainActivationSource, SourceFuture,
+        StartupSource, StateSource, TipSource, active_instances_for_slots, announce_tip_changes,
+        collect_bmm_sample, current_tip_receiver, forward_stream, prepare_observation,
+        prepare_sidechain_activation, prepare_stable_observation, queue_tip_reconciliations,
+        refresh_on_new_blocks, schedule_backfill_retry, schedule_sidechain_activation_retry,
+        snapshot_tips_are_consistent, supervise_workers, validate_chain_identity,
     };
     use crate::proto::{common, mainchain};
     use crate::snapshot::InitialSnapshot;
@@ -1732,6 +1958,305 @@ mod tests {
         ObservedBlock::at_height(vec![byte; 32], 996_259)
     }
 
+    fn chain_identity_snapshot(
+        network: mainchain::Network,
+        activation_height: u32,
+    ) -> InitialSnapshot {
+        InitialSnapshot {
+            constants: vec![events::EnforcerEvent {
+                event: Some(events::enforcer_event::Event::ChainInfo(
+                    events::ChainInfo {
+                        network: events::Network::Mainnet as i32,
+                        bip300_constants: Some(events::Bip300Constants {
+                            activation_height,
+                            ..Default::default()
+                        }),
+                        raw_network: network as i32,
+                    },
+                )),
+            }],
+            state: Vec::new(),
+            anchor: observed_tip(0x11),
+        }
+    }
+
+    #[test]
+    fn startup_chain_identity_must_match_the_locked_network_and_activation() {
+        let mut args = crate::config::Args::try_parse_from(["enforcer-extractor"]).unwrap();
+        args.activation_height = 967_680;
+        args.expected_enforcer_network = Some("NETWORK_MAINNET".to_owned());
+        validate_chain_identity(
+            &args,
+            &chain_identity_snapshot(mainchain::Network::Mainnet, 967_680),
+        )
+        .expect("matching chain identity");
+
+        let wrong_height = validate_chain_identity(
+            &args,
+            &chain_identity_snapshot(mainchain::Network::Mainnet, 967_681),
+        )
+        .expect_err("activation mismatch");
+        assert!(wrong_height.to_string().contains("activation height"));
+
+        let wrong_network = validate_chain_identity(
+            &args,
+            &chain_identity_snapshot(mainchain::Network::Regtest, 967_680),
+        )
+        .expect_err("network mismatch");
+        assert!(wrong_network.to_string().contains("NETWORK_REGTEST"));
+    }
+
+    #[test]
+    fn development_identity_still_requires_the_reported_activation_height() {
+        let args = crate::config::Args::try_parse_from(["enforcer-extractor"]).unwrap();
+        validate_chain_identity(
+            &args,
+            &chain_identity_snapshot(mainchain::Network::Regtest, 0),
+        )
+        .expect("the unpinned regtest default activates from genesis");
+
+        let error = validate_chain_identity(
+            &args,
+            &chain_identity_snapshot(mainchain::Network::Regtest, 10),
+        )
+        .expect_err("development must not silently use the wrong history floor");
+        assert!(error.to_string().contains("activation height"));
+    }
+
+    struct FakeSidechainActivationSource {
+        calls: Arc<Mutex<Vec<String>>>,
+        subscriptions: Arc<Mutex<VecDeque<std::result::Result<(), tonic::Status>>>>,
+        tips: Arc<Mutex<VecDeque<std::result::Result<ObservedBlock, tonic::Status>>>>,
+    }
+
+    impl SidechainActivationSource for FakeSidechainActivationSource {
+        type Stream = ();
+
+        fn open_sidechain_stream(&mut self, sidechain: u8) -> SourceFuture<'_, Self::Stream> {
+            let calls = Arc::clone(&self.calls);
+            let subscriptions = Arc::clone(&self.subscriptions);
+            Box::pin(async move {
+                calls
+                    .lock()
+                    .expect("activation call lock")
+                    .push(format!("subscribe:{sidechain}"));
+                subscriptions
+                    .lock()
+                    .expect("activation subscription lock")
+                    .pop_front()
+                    .context("configured activation subscription")?
+                    .map_err(anyhow::Error::new)
+            })
+        }
+
+        fn read_activation_tip(&mut self) -> SourceFuture<'_, ObservedBlock> {
+            let calls = Arc::clone(&self.calls);
+            let tips = Arc::clone(&self.tips);
+            Box::pin(async move {
+                calls
+                    .lock()
+                    .expect("activation call lock")
+                    .push("tip".to_owned());
+                tips.lock()
+                    .expect("activation tip lock")
+                    .pop_front()
+                    .context("configured activation tip")?
+                    .map_err(anyhow::Error::new)
+            })
+        }
+    }
+
+    fn fake_activation_source(
+        subscription: std::result::Result<(), tonic::Status>,
+        tip: Option<std::result::Result<ObservedBlock, tonic::Status>>,
+    ) -> FakeSidechainActivationSource {
+        FakeSidechainActivationSource {
+            calls: Arc::new(Mutex::new(Vec::new())),
+            subscriptions: Arc::new(Mutex::new(VecDeque::from([subscription]))),
+            tips: Arc::new(Mutex::new(tip.into_iter().collect())),
+        }
+    }
+
+    #[tokio::test]
+    async fn dynamic_sidechain_setup_classifies_transient_rpc_failures_for_retry() {
+        let mut subscribe_failure =
+            fake_activation_source(Err(tonic::Status::unavailable("enforcer restarting")), None);
+        let error = prepare_sidechain_activation(&mut subscribe_failure, 9)
+            .await
+            .expect_err("transient subscription failure");
+        assert!(crate::backfill::retryable_rpc_error(&error));
+        assert_eq!(
+            *subscribe_failure.calls.lock().unwrap(),
+            vec!["subscribe:9"]
+        );
+
+        let mut tip_failure = fake_activation_source(
+            Ok(()),
+            Some(Err(tonic::Status::deadline_exceeded("tip busy"))),
+        );
+        let error = prepare_sidechain_activation(&mut tip_failure, 98)
+            .await
+            .expect_err("transient tip failure");
+        assert!(crate::backfill::retryable_rpc_error(&error));
+        assert_eq!(
+            *tip_failure.calls.lock().unwrap(),
+            vec!["subscribe:98", "tip"]
+        );
+
+        let mut permanent = fake_activation_source(
+            Err(tonic::Status::unimplemented("subscription unsupported")),
+            None,
+        );
+        let error = prepare_sidechain_activation(&mut permanent, 130)
+            .await
+            .expect_err("permanent subscription failure");
+        assert!(!crate::backfill::retryable_rpc_error(&error));
+    }
+
+    #[tokio::test]
+    async fn dynamic_sidechain_retries_are_deduplicated_by_instance() {
+        let mut retries = futures_util::stream::FuturesUnordered::new();
+        let mut deferred = BTreeSet::new();
+        let sidechain = instance(9, 987_402);
+
+        schedule_sidechain_activation_retry(
+            &mut retries,
+            &mut deferred,
+            &sidechain,
+            Duration::ZERO,
+        );
+        schedule_sidechain_activation_retry(
+            &mut retries,
+            &mut deferred,
+            &sidechain,
+            Duration::ZERO,
+        );
+
+        assert_eq!(retries.len(), 1);
+        assert_eq!(
+            deferred,
+            BTreeSet::from([sidechain.sidechain_instance_id.clone()])
+        );
+        assert_eq!(
+            retries.next().await.unwrap(),
+            sidechain.sidechain_instance_id
+        );
+    }
+
+    struct FakeBmmSource {
+        tips: Arc<Mutex<VecDeque<ObservedBlock>>>,
+        parents: Arc<Mutex<Vec<Vec<u8>>>>,
+        responses: Arc<Mutex<VecDeque<mainchain::GetSeenBmmRequestsResponse>>>,
+    }
+
+    impl BmmSource for FakeBmmSource {
+        fn current_tip(&mut self) -> SourceFuture<'_, ObservedBlock> {
+            let tips = Arc::clone(&self.tips);
+            Box::pin(async move {
+                tips.lock()
+                    .expect("BMM tip lock")
+                    .pop_front()
+                    .context("configured BMM tip")
+            })
+        }
+
+        fn bmm_requests(
+            &mut self,
+            parent: Vec<u8>,
+        ) -> SourceFuture<'_, mainchain::GetSeenBmmRequestsResponse> {
+            let parents = Arc::clone(&self.parents);
+            let responses = Arc::clone(&self.responses);
+            Box::pin(async move {
+                parents.lock().expect("BMM parent lock").push(parent);
+                responses
+                    .lock()
+                    .expect("BMM response lock")
+                    .pop_front()
+                    .context("configured BMM response")
+            })
+        }
+    }
+
+    fn fake_bmm_source(tips: &[u8], response_count: usize) -> FakeBmmSource {
+        FakeBmmSource {
+            tips: Arc::new(Mutex::new(tips.iter().copied().map(observed_tip).collect())),
+            parents: Arc::new(Mutex::new(Vec::new())),
+            responses: Arc::new(Mutex::new(
+                std::iter::repeat_with(mainchain::GetSeenBmmRequestsResponse::default)
+                    .take(response_count)
+                    .collect(),
+            )),
+        }
+    }
+
+    #[tokio::test]
+    async fn bmm_samples_are_persistable_only_for_one_stable_parent() {
+        let mut source = fake_bmm_source(&[0x11, 0x11], 1);
+        let (payload, metadata) = collect_bmm_sample(&mut source, 3)
+            .await
+            .expect("stable BMM sample");
+        assert_eq!(metadata.consistency, SnapshotConsistency::Stable);
+        assert_eq!(metadata.attempts, 1);
+        assert_eq!(metadata.tip_before.hash, vec![0x11; 32]);
+        let events::enforcer_event::Event::BmmRequests(snapshot) =
+            payload.event.expect("BMM payload")
+        else {
+            panic!("expected BMM snapshot")
+        };
+        assert_eq!(snapshot.previous_mainchain_block_hash, vec![0x11; 32]);
+    }
+
+    #[tokio::test]
+    async fn bmm_samples_discard_a_response_when_the_parent_moves() {
+        let mut source = fake_bmm_source(&[0x11, 0x22, 0x22, 0x22], 2);
+        let parents = Arc::clone(&source.parents);
+        let (payload, metadata) = collect_bmm_sample(&mut source, 3)
+            .await
+            .expect("second BMM parent is stable");
+        assert_eq!(metadata.attempts, 2);
+        assert_eq!(metadata.tip_before.hash, vec![0x22; 32]);
+        assert_eq!(
+            *parents.lock().expect("BMM parent lock"),
+            vec![vec![0x11; 32], vec![0x22; 32]]
+        );
+        let events::enforcer_event::Event::BmmRequests(snapshot) =
+            payload.event.expect("BMM payload")
+        else {
+            panic!("expected BMM snapshot")
+        };
+        assert_eq!(snapshot.previous_mainchain_block_hash, vec![0x22; 32]);
+    }
+
+    #[tokio::test]
+    async fn bmm_samples_never_publish_an_unstable_parent() {
+        let mut source = fake_bmm_source(&[0x11, 0x12, 0x13, 0x14, 0x15, 0x16], 3);
+        let error = collect_bmm_sample(&mut source, 3)
+            .await
+            .expect_err("every parent moved");
+        assert!(error.to_string().contains("every BMM snapshot attempt"));
+    }
+
+    #[tokio::test]
+    async fn an_invalid_bmm_response_is_a_worker_failure_not_an_empty_snapshot() {
+        let mut source = fake_bmm_source(&[0x11, 0x11], 0);
+        source
+            .responses
+            .lock()
+            .unwrap()
+            .push_back(mainchain::GetSeenBmmRequestsResponse {
+                requests: vec![mainchain::get_seen_bmm_requests_response::BmmRequest {
+                    sidechain_number: 256,
+                    ..Default::default()
+                }],
+            });
+
+        let error = collect_bmm_sample(&mut source, 3)
+            .await
+            .expect_err("an invalid response must not become an observed empty auction");
+        assert!(error.to_string().contains("converting live BMM requests"));
+        assert_eq!(source.parents.lock().unwrap().len(), 1);
+    }
+
     fn instance(sidechain: u8, activation_height: u32) -> SidechainInstanceRef {
         SidechainInstanceRef {
             sidechain,
@@ -1746,12 +2271,20 @@ mod tests {
                 events::ActiveSidechainsSnapshot {
                     sidechains: slots
                         .iter()
-                        .map(|&(sidechain, activation_height)| events::ActiveSidechain {
-                            sidechain_number: u32::from(sidechain),
-                            raw_description: vec![sidechain; 32],
-                            proposal_height: 1,
-                            activation_height,
-                            ..Default::default()
+                        .map(|&(sidechain, activation_height)| {
+                            let mut raw_description = vec![32];
+                            raw_description.extend_from_slice(&[sidechain; 32]);
+                            let description_hash =
+                                shared::bip300::sidechain_description_hash(&raw_description)
+                                    .unwrap();
+                            events::ActiveSidechain {
+                                sidechain_number: u32::from(sidechain),
+                                raw_description,
+                                proposal_height: 1,
+                                activation_height,
+                                description_hash,
+                                ..Default::default()
+                            }
                         })
                         .collect(),
                 },

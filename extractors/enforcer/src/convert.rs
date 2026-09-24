@@ -168,13 +168,16 @@ fn bip300_coinbase_message(
 ) -> Result<events::Bip300CoinbaseMessage> {
     let normalized = match required(message.message, "bip300_coinbase_message.message")? {
         mainchain::bip300_coinbase_message::Message::M1(m1) => {
+            let description = consensus_hex(m1.description, "bip300_m1.description")?;
+            let description_hash = hash_from_reverse(
+                m1.description_sha256d_hash,
+                "bip300_m1.description_sha256d_hash",
+            )?;
+            validate_description_hash(&description, &description_hash, "bip300_m1")?;
             events::bip300_coinbase_message::Message::M1(events::M1Delta {
                 sidechain_number: m1.sidechain_number,
-                description: consensus_hex(m1.description, "bip300_m1.description")?,
-                description_hash: hash_from_reverse(
-                    m1.description_sha256d_hash,
-                    "bip300_m1.description_sha256d_hash",
-                )?,
+                description,
+                description_hash,
             })
         }
         mainchain::bip300_coinbase_message::Message::M2(m2) => {
@@ -440,16 +443,19 @@ fn block_header(header: mainchain::BlockHeaderInfo) -> Result<events::BlockHeade
 fn sidechain_proposal(
     proposal: mainchain::get_sidechain_proposals_response::SidechainProposal,
 ) -> Result<events::SidechainProposal> {
+    let raw_description = consensus_hex(proposal.description, "sidechain_proposal.description")?;
+    let description_hash = hash_from_reverse(
+        proposal.description_sha256d_hash,
+        "sidechain_proposal.description_sha256d_hash",
+    )?;
+    validate_description_hash(&raw_description, &description_hash, "sidechain_proposal")?;
     Ok(events::SidechainProposal {
         sidechain_number: required(
             proposal.sidechain_number,
             "sidechain_proposal.sidechain_number",
         )?,
-        raw_description: consensus_hex(proposal.description, "sidechain_proposal.description")?,
-        description_hash: hash_from_reverse(
-            proposal.description_sha256d_hash,
-            "sidechain_proposal.description_sha256d_hash",
-        )?,
+        raw_description,
+        description_hash,
         vote_count: required(proposal.vote_count, "sidechain_proposal.vote_count")?,
         proposal_height: required(
             proposal.proposal_height,
@@ -466,12 +472,15 @@ fn sidechain_proposal(
 fn active_sidechain(
     sidechain: mainchain::get_sidechains_response::SidechainInfo,
 ) -> Result<events::ActiveSidechain> {
+    let raw_description = consensus_hex(sidechain.description, "active_sidechain.description")?;
+    let description_hash = shared::bip300::sidechain_description_hash(&raw_description)
+        .context("calculating active_sidechain.description_hash")?;
     Ok(events::ActiveSidechain {
         sidechain_number: required(
             sidechain.sidechain_number,
             "active_sidechain.sidechain_number",
         )?,
-        raw_description: consensus_hex(sidechain.description, "active_sidechain.description")?,
+        raw_description,
         vote_count: required(sidechain.vote_count, "active_sidechain.vote_count")?,
         proposal_height: required(
             sidechain.proposal_height,
@@ -485,7 +494,25 @@ fn active_sidechain(
             .declaration
             .map(sidechain_declaration)
             .transpose()?,
+        description_hash,
     })
+}
+
+fn validate_description_hash(
+    encoded_description: &[u8],
+    reported_hash: &[u8],
+    field: &str,
+) -> Result<()> {
+    let calculated = shared::bip300::sidechain_description_hash(encoded_description)
+        .with_context(|| format!("calculating {field}.description_hash"))?;
+    if calculated != reported_hash {
+        bail!(
+            "`{field}.description_hash` is {}, calculated {}",
+            hex::encode(reported_hash),
+            hex::encode(calculated)
+        );
+    }
+    Ok(())
 }
 
 fn sidechain_declaration(

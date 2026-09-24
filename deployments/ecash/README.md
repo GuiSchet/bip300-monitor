@@ -121,13 +121,19 @@ slot. It also requires complete per-instance `block` coverage and global
 `bip300_delta` coverage even when there are zero active slots. Repeated captures
 belong in `event_observation`, not as duplicate facts.
 
-Contract v5 additionally requires the enforcer's validator mempool task and a
-successful live BMM-request poll from the current extractor run. An empty
-request list is recorded as an observed fact; an RPC failure is never treated
-as an empty auction. Distinct auction states at the same parent block are
-separate facts, while a repeated state adds only a new observation occurrence.
-The latest auction must therefore be selected through its occurrence, not the
-fact's first-seen timestamp:
+Contract v5 introduced the enforcer's validator mempool requirement and live
+BMM-request polling. Contract v6 additionally accepts a poll only when tip
+reads before and after the RPC prove that its parent stayed unchanged, verifies
+the configured network and activation height inside the extractor, and stores
+the corrected BIP300 description hash. An empty request list is an observed
+fact; an RPC error or a moving parent is never treated as an empty auction.
+Likewise, a response that cannot be normalized is not persisted: it counts as
+a BMM-worker failure, degrades that worker after three consecutive failures and
+blocks verification and acceptance without stopping unrelated history work.
+Distinct auction states at the same parent block are separate facts, while a
+repeated state adds only a new observation occurrence. The latest auction must
+therefore be selected through its occurrence, not the fact's first-seen
+timestamp:
 
 ```sql
 SELECT observation.observed_at, fact.payload
@@ -237,6 +243,11 @@ Two different gaps follow from that, and only one of them is about transport:
   extractor walks the whole gap in bounded pages, stores each page and its
   cursor atomically, and resumes after interruption. Historical pages bypass
   NATS. A quiet tip never arms the stream watchdog.
+- **A newly activated slot cannot open its stream or read its anchor tip.**
+  Transient gRPC failures defer only that instance and retry on the 30-second
+  tip cadence; existing slots keep running. The instance is re-read from the
+  durable active set before retry, and its backfill closes the pre-subscription
+  gap. A permanent API or data error remains fatal.
 - **A live consumer missed a message.** Cosmetic, because the record already
   has it.
 
@@ -251,6 +262,29 @@ and creates an empty Postgres directory. It never removes the node or enforcer
 directories. Run `just monitor-up` afterwards to migrate and start the full
 import.
 
+The first contract-v6 deployment must use that recoverable rebuild. Contract
+v5 calculated `sidechain_instance.description_sha256d` over a different byte
+sequence, so mixing old and corrected instance identities would make joins
+ambiguous. The v6 extractor refuses to extend a pre-v6 dataset once it contains
+sidechain instances. Keep the dump and moved cluster until v6 history and live
+verification pass; this reset does not touch node, AssumeUTXO, or enforcer data.
+
+### Rolling the monitor back from v6 to v5
+
+Never start a v5 extractor against a record created or migrated by v6. The old
+binary does not know the corrected description identity and cannot reconcile a
+run left active by an unclean v6 stop; it can either mix incompatible hashes or
+fail on the single-active-run index.
+
+If rollback is required after `just reset-record betanet`, stop the bootstrap
+and the complete Compose stack first. Preserve the current v6 Postgres directory
+as a separate recoverable failure artifact, then restore the exact `cluster/`
+and `deployment-accepted.before-reset` saved under the selected
+`${ECASH_DATA_ROOT}/backups/postgres-<timestamp>/`. Only after that restore may
+the reviewed v5 commit and lock be selected and started. A pin-only rollback is
+invalid. Keep the pre-v6 backup for as long as v5 rollback remains supported,
+not merely until the first successful v6 acceptance.
+
 ## Deploying a new monitor build
 
 The Compose file and `VERSIONS.lock` describe one system and move together: an
@@ -258,8 +292,11 @@ image older than the Compose file that runs it ignores the Postgres settings
 entirely and never refreshes its liveness file, so the containers come up and
 stay unhealthy with nothing naming the real cause.
 
-Merge to `main`, let CI publish the `sha-<commit>` images, promote their digests
-and `MONITOR_IMAGE_COMMIT` in `VERSIONS.lock`, and deploy after that.
+Merge to `main`, let CI publish the `sha-<commit>` images, promote their digests,
+`MONITOR_IMAGE_COMMIT`, and `MONITOR_EVENT_CONTRACT_VERSION` in both locks, and
+deploy after that. The checked-in lock intentionally remains on the last
+published contract until those immutable v6 images exist; source code alone is
+not a deployable promotion.
 `just preflight` refuses to start when the monitor sources have moved since the
 pinned commit, so the order is checked rather than remembered. Details in
 [`docs/container-images.md`](../../docs/container-images.md).

@@ -67,11 +67,13 @@ load_versions() {
     : "${ECASH_SNAPSHOT_SHA256:?ECASH_SNAPSHOT_SHA256 must be locked}"
     : "${ENFORCER_NETWORK_PRESET:?ENFORCER_NETWORK_PRESET must be locked}"
     : "${ENFORCER_API_NETWORK:?ENFORCER_API_NETWORK must be locked}"
+    : "${ENFORCER_UPSTREAM_REVIEWED_COMMIT:?ENFORCER_UPSTREAM_REVIEWED_COMMIT must be locked}"
+    : "${MONITOR_EVENT_CONTRACT_VERSION:?MONITOR_EVENT_CONTRACT_VERSION must be locked}"
     : "${POSTGRES_IMAGE:?POSTGRES_IMAGE must be locked}"
     : "${POSTGRES_DB:?POSTGRES_DB must be locked}"
     : "${POSTGRES_USER:?POSTGRES_USER must be locked}"
 
-    [[ "${LOCK_FORMAT}" == 4 ]] || die "unsupported LOCK_FORMAT=${LOCK_FORMAT}"
+    [[ "${LOCK_FORMAT}" == 5 ]] || die "unsupported LOCK_FORMAT=${LOCK_FORMAT}"
     [[ "${NETWORK_ID}" =~ ^[a-z0-9][a-z0-9-]*$ ]] ||
         die "NETWORK_ID has an invalid format"
     # Both end up unquoted inside psql invocations and the healthcheck.
@@ -87,6 +89,8 @@ load_versions() {
         die "ECASH_SNAPSHOT_UTXO_HASH must contain 64 hexadecimal characters"
     [[ "${ECASH_SNAPSHOT_SHA256}" =~ ^[[:xdigit:]]{64}$ ]] ||
         die "ECASH_SNAPSHOT_SHA256 must contain 64 hexadecimal characters"
+    [[ "${ENFORCER_UPSTREAM_REVIEWED_COMMIT}" =~ ^[[:xdigit:]]{40}$ ]] ||
+        die "ENFORCER_UPSTREAM_REVIEWED_COMMIT must contain 40 hexadecimal characters"
     case "${ECASH_SNAPSHOT_TRANSFORM}" in
     none)
         : "${ECASH_SNAPSHOT_CHECKSUMS_URL:?ECASH_SNAPSHOT_CHECKSUMS_URL must be locked for a direct snapshot}"
@@ -121,6 +125,7 @@ load_versions() {
     require_positive_integer ECASH_SNAPSHOT_HEIGHT "${ECASH_SNAPSHOT_HEIGHT}"
     require_positive_integer ECASH_SNAPSHOT_CHAIN_TX_COUNT "${ECASH_SNAPSHOT_CHAIN_TX_COUNT}"
     require_positive_integer ECASH_SNAPSHOT_SIZE "${ECASH_SNAPSHOT_SIZE}"
+    require_positive_integer MONITOR_EVENT_CONTRACT_VERSION "${MONITOR_EVENT_CONTRACT_VERSION}"
     ((ECASH_MIN_FREE_PERCENT < 100)) ||
         die "ECASH_MIN_FREE_PERCENT must be less than 100"
     ((ECASH_SNAPSHOT_HEIGHT <= ECASH_ACTIVATION_HEIGHT)) ||
@@ -684,6 +689,80 @@ record_current_run_has_bmm_observation() {
              )"
     )" || return 1
     [[ "${result}" == t ]]
+}
+
+# Contract v6 brackets every BMM response with two identical tip reads and
+# stores that proof in snapshot_group. The event anchor and payload parent must
+# name that same block.
+record_current_run_has_stable_bmm_observation() {
+    local result
+
+    result="$(
+        postgres_query \
+            "WITH current_run AS (
+                 SELECT run_id, dataset_id, event_contract_version
+                   FROM extractor_run
+                  WHERE source = 'enforcer' AND status = 'running'
+                  ORDER BY started_at DESC, run_id DESC
+                  LIMIT 1
+             )
+             SELECT EXISTS (
+                 SELECT 1
+                   FROM current_run
+                   JOIN event_observation observation
+                     ON observation.run_id = current_run.run_id
+                    AND observation.dataset_id = current_run.dataset_id
+                   JOIN snapshot_group snapshot
+                     ON snapshot.snapshot_group_id = observation.snapshot_group_id
+                    AND snapshot.run_id = current_run.run_id
+                   JOIN event
+                     ON event.id = observation.event_id
+                    AND event.dataset_id = current_run.dataset_id
+                    AND event.event_contract_version = current_run.event_contract_version
+                  WHERE observation.capture_method = 'poll'
+                    AND event.source = 'enforcer'
+                    AND event.kind = 'bmm_requests'
+                    AND snapshot.consistency = 'stable'
+                    AND snapshot.tip_before_hash = snapshot.tip_after_hash
+                    AND snapshot.tip_before_hash = event.block_hash
+                    AND decode(
+                        event.payload #>> '{monitor_event,Enforcer,event,BmmRequests,previous_mainchain_block_hash}',
+                        'hex'
+                    ) = event.block_hash
+             )"
+    )" || return 1
+    [[ "${result}" == t ]]
+}
+
+record_has_single_running_enforcer() {
+    local result
+
+    result="$(
+        postgres_query \
+            "WITH current_dataset AS (
+                 SELECT dataset_id
+                   FROM extractor_run
+                  WHERE source = 'enforcer'
+                  ORDER BY started_at DESC, run_id DESC
+                  LIMIT 1
+             )
+             SELECT count(*) = 1
+               FROM extractor_run
+              WHERE source = 'enforcer'
+                AND dataset_id = (SELECT dataset_id FROM current_dataset)
+                AND status = 'running'"
+    )" || return 1
+    [[ "${result}" == t ]]
+}
+
+record_current_dataset_created_at() {
+    postgres_query \
+        "SELECT manifest.created_at
+           FROM extractor_run run
+           JOIN dataset_manifest manifest USING (dataset_id)
+          WHERE run.source = 'enforcer' AND run.status = 'running'
+          ORDER BY run.started_at DESC, run.run_id DESC
+          LIMIT 1"
 }
 
 record_current_event_contract_version() {

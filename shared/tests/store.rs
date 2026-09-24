@@ -18,8 +18,9 @@ use shared::protobuf::event::{Event, ObservedBlock, event::MonitorEvent};
 use shared::recorder::Recorder;
 use shared::store::{
     CaptureMethod, DatasetManifest, ExtractorWorker, HistoryPage, HistoryStatus, PostgresArgs,
-    SidechainInstanceRef, Store, sidechain_instance_ref,
+    SidechainInstanceRef, SnapshotConsistency, SnapshotMetadata, Store, sidechain_instance_ref,
 };
+use std::time::{Duration, SystemTime};
 
 /// Each test owns a database of its own so they can run concurrently.
 async fn store_for(test: &str, source: &'static str) -> Store {
@@ -161,13 +162,37 @@ fn sidechain_proposals() -> events::enforcer_event::Event {
 }
 
 fn active_sidechain(sidechain_number: u32) -> events::ActiveSidechain {
+    let mut raw_description = vec![32];
+    raw_description.extend_from_slice(&[sidechain_number as u8; 32]);
+    let description_hash = shared::bip300::sidechain_description_hash(&raw_description).unwrap();
     events::ActiveSidechain {
         sidechain_number,
-        raw_description: vec![sidechain_number as u8; 32],
+        raw_description,
         vote_count: 4,
         proposal_height: 1,
         activation_height: 2,
         declaration: None,
+        description_hash,
+    }
+}
+
+fn replacement_sidechain(
+    sidechain_number: u32,
+    description: Vec<u8>,
+    proposal_height: u32,
+    activation_height: u32,
+) -> events::ActiveSidechain {
+    assert!(description.len() < 0xfd);
+    let mut raw_description = vec![description.len() as u8];
+    raw_description.extend_from_slice(&description);
+    let description_hash = shared::bip300::sidechain_description_hash(&raw_description).unwrap();
+    events::ActiveSidechain {
+        sidechain_number,
+        raw_description,
+        proposal_height,
+        activation_height,
+        description_hash,
+        ..Default::default()
     }
 }
 
@@ -207,13 +232,7 @@ async fn instance_scoped_writes_survive_replacement_without_cross_tagging_slots(
     let old_instance = instance(9);
     let replacement =
         events::enforcer_event::Event::ActiveSidechains(events::ActiveSidechainsSnapshot {
-            sidechains: vec![events::ActiveSidechain {
-                sidechain_number: 9,
-                raw_description: vec![0xbb; 32],
-                proposal_height: 3,
-                activation_height: 4,
-                ..Default::default()
-            }],
+            sidechains: vec![replacement_sidechain(9, vec![0xbb; 32], 3, 4)],
         });
     store
         .record(&[envelope(
@@ -316,6 +335,86 @@ async fn invalid_publisher_configuration_does_not_create_an_extractor_run() {
         .expect("count runs after failed startup")
         .get(0);
     assert_eq!(after, before, "publisher failure must precede run creation");
+}
+
+#[tokio::test]
+async fn a_new_start_closes_an_orphaned_run_before_claiming_the_dataset() {
+    let test = "orphaned_run_reconciliation";
+    let _first = store_for(test, "enforcer").await;
+    let admin_url = std::env::var("BIP300_MONITOR_TEST_POSTGRES_URL").unwrap();
+    let _replacement = Store::connect(
+        &args_for(&admin_url, &format!("bip300_test_{test}")),
+        "enforcer",
+    )
+    .await
+    .expect("replace the orphaned run");
+
+    let client = query_client(test).await;
+    let counts = client
+        .query_one(
+            "SELECT count(*) FILTER (WHERE status = 'running'),
+                    count(*) FILTER (
+                        WHERE status = 'failed'
+                          AND finish_reason = 'superseded by extractor startup after unclean termination'
+                    )
+               FROM extractor_run
+              WHERE source = 'enforcer'",
+            &[],
+        )
+        .await
+        .expect("query reconciled runs");
+    assert_eq!(counts.get::<_, i64>(0), 1);
+    assert_eq!(counts.get::<_, i64>(1), 1);
+}
+
+#[tokio::test]
+async fn v6_refuses_to_mix_corrected_sidechain_identities_into_a_legacy_dataset() {
+    let test = "v6_identity_boundary";
+    let admin_url = std::env::var("BIP300_MONITOR_TEST_POSTGRES_URL").unwrap();
+    let (admin, connection) = tokio_postgres::connect(&admin_url, tokio_postgres::NoTls)
+        .await
+        .expect("connect to the test Postgres");
+    tokio::spawn(connection);
+    let database = format!("bip300_test_{test}");
+    admin
+        .batch_execute(&format!("DROP DATABASE IF EXISTS {database}"))
+        .await
+        .expect("drop any previous legacy test database");
+    admin
+        .batch_execute(&format!("CREATE DATABASE {database}"))
+        .await
+        .expect("create the legacy test database");
+
+    let legacy_manifest = DatasetManifest {
+        event_contract_version: 5,
+        ..DatasetManifest::default()
+    };
+    let legacy = Store::connect_with_manifest(
+        &args_for(&admin_url, &database),
+        "enforcer",
+        legacy_manifest,
+    )
+    .await
+    .expect("start a legacy-contract run");
+    legacy
+        .record(&[envelope(
+            active_sidechains(),
+            Some(ObservedBlock::at_height(vec![0x01; 32], 2)),
+            1_700_000_000_000,
+        )])
+        .await
+        .expect("seed legacy sidechain identities");
+
+    let error = match Store::connect(&args_for(&admin_url, &database), "enforcer").await {
+        Ok(_) => panic!("v6 must require a fresh dataset after legacy identities exist"),
+        Err(error) => error,
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("event contract v6 cannot extend a pre-v6 dataset"),
+        "unexpected error: {error:#}"
+    );
 }
 
 #[tokio::test]
@@ -1135,16 +1234,14 @@ async fn revisiting_a_tip_preserves_the_full_a_b_a_occurrence_order() {
 #[tokio::test]
 async fn sidechain_replacement_and_reactivation_keep_distinct_instances() {
     let store = store_for("instance_replacement", "enforcer").await;
-    let replacement = |raw_description: Vec<u8>, proposal_height, activation_height| {
+    let replacement = |description: Vec<u8>, proposal_height, activation_height| {
         events::enforcer_event::Event::ActiveSidechains(events::ActiveSidechainsSnapshot {
-            sidechains: vec![events::ActiveSidechain {
-                sidechain_number: 9,
-                raw_description,
-                vote_count: 4,
+            sidechains: vec![replacement_sidechain(
+                9,
+                description,
                 proposal_height,
                 activation_height,
-                declaration: None,
-            }],
+            )],
         })
     };
     store
@@ -1186,7 +1283,9 @@ async fn sidechain_replacement_and_reactivation_keep_distinct_instances() {
         .await
         .expect("query current instance")
         .get(0);
-    assert_eq!(current, vec![9; 32]);
+    let mut expected = vec![32];
+    expected.extend_from_slice(&[9; 32]);
+    assert_eq!(current, expected);
 }
 
 #[tokio::test]
@@ -1329,4 +1428,65 @@ async fn live_bmm_changes_share_a_parent_without_aliasing_facts() {
         .expect("query latest BMM observation");
     let latest: (i64, i64) = (latest_row.get(0), latest_row.get(1));
     assert_eq!(latest, (10, 1_700_000_010_000));
+}
+
+#[tokio::test]
+async fn a_stable_bmm_observation_proves_one_parent_in_payload_anchor_and_snapshot() {
+    let test = "stable_bmm_parent";
+    let store = store_for(test, "enforcer").await;
+    let parent = ObservedBlock::at_height(vec![0xdd; 32], 967_700);
+    let metadata = SnapshotMetadata {
+        started_at: SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000),
+        finished_at: SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_001),
+        tip_before: parent.clone(),
+        tip_after: parent.clone(),
+        consistency: SnapshotConsistency::Stable,
+        attempts: 1,
+    };
+    store
+        .record_snapshot(
+            &[envelope(
+                bmm_requests(0xdd, 10),
+                Some(parent),
+                1_700_000_000_500,
+            )],
+            CaptureMethod::Poll,
+            &metadata,
+        )
+        .await
+        .expect("record stable BMM snapshot");
+
+    let client = query_client(test).await;
+    let verified: bool = client
+        .query_one(
+            "SELECT EXISTS (
+                 SELECT 1
+                   FROM extractor_run run
+                   JOIN event_observation observation
+                     ON observation.run_id = run.run_id
+                    AND observation.dataset_id = run.dataset_id
+                   JOIN snapshot_group snapshot
+                     ON snapshot.snapshot_group_id = observation.snapshot_group_id
+                    AND snapshot.run_id = run.run_id
+                   JOIN event fact
+                     ON fact.id = observation.event_id
+                    AND fact.dataset_id = run.dataset_id
+                    AND fact.event_contract_version = run.event_contract_version
+                  WHERE run.source = 'enforcer' AND run.status = 'running'
+                    AND observation.capture_method = 'poll'
+                    AND fact.kind = 'bmm_requests'
+                    AND snapshot.consistency = 'stable'
+                    AND snapshot.tip_before_hash = snapshot.tip_after_hash
+                    AND snapshot.tip_before_hash = fact.block_hash
+                    AND decode(
+                        fact.payload #>> '{monitor_event,Enforcer,event,BmmRequests,previous_mainchain_block_hash}',
+                        'hex'
+                    ) = fact.block_hash
+             )",
+            &[],
+        )
+        .await
+        .expect("verify stable BMM parent proof")
+        .get(0);
+    assert!(verified);
 }

@@ -212,6 +212,11 @@ fn validate_bip300_delta(delta: &events::Bip300BlockDelta) -> Result<()> {
         {
             events::bip300_coinbase_message::Message::M1(m1) => {
                 require_32_bytes(&m1.description_hash, "bip300_m1.description_hash")?;
+                let calculated = shared::bip300::sidechain_description_hash(&m1.description)
+                    .context("calculating bip300_m1.description_hash")?;
+                if calculated != m1.description_hash {
+                    bail!("BIP300 M1 description hash does not match its description");
+                }
             }
             events::bip300_coinbase_message::Message::M2(m2) => {
                 require_32_bytes(&m2.description_hash, "bip300_m2.description_hash")?;
@@ -290,10 +295,24 @@ fn validate_proposal(proposal: &events::SidechainProposal) -> Result<()> {
         &proposal.description_hash,
         "sidechain_proposal.description_hash",
     )?;
+    let calculated = shared::bip300::sidechain_description_hash(&proposal.raw_description)
+        .context("calculating sidechain_proposal.description_hash")?;
+    if calculated != proposal.description_hash {
+        bail!("sidechain proposal description hash does not match its description");
+    }
     validate_declaration(proposal.declaration.as_ref())
 }
 
 fn validate_active_sidechain(sidechain: &events::ActiveSidechain) -> Result<()> {
+    require_32_bytes(
+        &sidechain.description_hash,
+        "active_sidechain.description_hash",
+    )?;
+    let calculated = shared::bip300::sidechain_description_hash(&sidechain.raw_description)
+        .context("calculating active_sidechain.description_hash")?;
+    if calculated != sidechain.description_hash {
+        bail!("active sidechain description hash does not match its description");
+    }
     validate_declaration(sidechain.declaration.as_ref())
 }
 
@@ -512,8 +531,9 @@ mod tests {
             events::SidechainProposalsSnapshot {
                 proposals: vec![events::SidechainProposal {
                     sidechain_number: 9,
-                    raw_description: vec![0x01, 0x02],
-                    description_hash: vec![0x03; 32],
+                    raw_description: vec![2, 0x01, 0x02],
+                    description_hash: shared::bip300::sidechain_description_hash(&[2, 0x01, 0x02])
+                        .unwrap(),
                     vote_count: 4,
                     proposal_height: 5,
                     proposal_age: 6,
@@ -534,8 +554,7 @@ mod tests {
             .expect("valid proposal snapshot")
             .full_json
             .expect("full form requested");
-        assert!(proposal.contains("\"raw_description\":\"0102\""));
-        assert!(proposal.contains(&"03".repeat(32)));
+        assert!(proposal.contains("\"raw_description\":\"020102\""));
         assert!(proposal.contains("\"hash_id_1\":\"07\""));
         assert!(proposal.contains("\"hash_id_2\":\"08\""));
 
@@ -631,6 +650,32 @@ mod tests {
                 .expect_err("missing sidechain event")
                 .to_string()
                 .contains("concrete event")
+        );
+
+        let bad_m1 = envelope(events::enforcer_event::Event::Bip300BlockDelta(
+            events::Bip300BlockDelta {
+                header: Some(header(6)),
+                coinbase_txid: vec![0x06; 32],
+                coinbase_messages: vec![events::Bip300CoinbaseMessage {
+                    vout: 1,
+                    raw_script_pubkey: vec![0x51],
+                    accepted: true,
+                    message: Some(events::bip300_coinbase_message::Message::M1(
+                        events::M1Delta {
+                            sidechain_number: 9,
+                            description: vec![1, 0x42],
+                            description_hash: vec![0x07; 32],
+                        },
+                    )),
+                }],
+                ..Default::default()
+            },
+        ));
+        assert!(
+            render(&bad_m1, false)
+                .expect_err("mismatched M1 description hash")
+                .to_string()
+                .contains("does not match")
         );
     }
 }

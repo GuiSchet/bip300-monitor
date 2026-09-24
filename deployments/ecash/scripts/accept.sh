@@ -40,13 +40,27 @@ enforcer_mempool_tracking_is_enabled ||
 record_current_workers_are_healthy ||
     die "the current extractor run has an unhealthy or uninitialized worker"
 event_contract_version="$(record_current_event_contract_version)"
-[[ "${event_contract_version}" == 5 ]] ||
-    die "the current extractor uses event contract v${event_contract_version:-unknown}; Betanet requires v5"
+[[ "${event_contract_version}" == "${MONITOR_EVENT_CONTRACT_VERSION}" ]] ||
+    die "the current extractor uses event contract v${event_contract_version:-unknown}; Betanet requires v${MONITOR_EVENT_CONTRACT_VERSION}"
 run_capabilities="$(record_current_run_capabilities)"
 jq -e 'index("live_bmm_bid_snapshots") != null' <<<"${run_capabilities}" >/dev/null ||
     die "the active extractor run does not declare live_bmm_bid_snapshots"
 jq -e 'index("mempool_backed_bmm_bid_snapshots") != null' <<<"${run_capabilities}" >/dev/null ||
     die "the active extractor run does not declare mempool_backed_bmm_bid_snapshots"
+if ((MONITOR_EVENT_CONTRACT_VERSION >= 6)); then
+    jq -e '
+        index("bip300_description_hash_identity") != null
+        and index("stable_parent_bmm_snapshots") != null
+        and index("validated_chain_identity") != null
+        and index("orphan_run_reconciliation") != null
+    ' <<<"${run_capabilities}" >/dev/null ||
+        die "the active extractor run does not declare the contract-v6 correctness capabilities"
+    record_current_run_has_stable_bmm_observation ||
+        die "the current extractor run has no stable-parent BMM observation"
+fi
+record_has_single_running_enforcer ||
+    die "the current dataset does not have exactly one running enforcer extractor"
+dataset_created_at="$(record_current_dataset_created_at)"
 chainstates="$(node_cli getchainstates)" || die "could not read node chainstates"
 history_fully_validated=false
 if node_history_is_fully_validated "${chainstates}"; then
@@ -58,13 +72,21 @@ fi
     printf 'repository_commit=%s\n' "${repository_commit}"
     printf 'node_commit=%s\n' "${ECASH_NODE_COMMIT}"
     printf 'node_image=%s\n' "${ECASH_NODE_IMAGE}"
+    printf 'enforcer_base_commit=%s\n' "${ENFORCER_BASE_COMMIT}"
+    printf 'enforcer_upstream_reviewed_commit=%s\n' "${ENFORCER_UPSTREAM_REVIEWED_COMMIT}"
+    printf 'enforcer_observer_commit=%s\n' "${ENFORCER_OBSERVER_COMMIT}"
     printf 'enforcer_commit=%s\n' "${ENFORCER_COMMIT}"
     printf 'enforcer_image=%s\n' "${ENFORCER_IMAGE}"
     printf 'monitor_image_commit=%s\n' "${MONITOR_IMAGE_COMMIT}"
     printf 'event_contract_version=%s\n' "${event_contract_version}"
+    printf 'dataset_created_at=%s\n' "${dataset_created_at}"
     printf 'extractor_run_capabilities=%s\n' "$(jq -c . <<<"${run_capabilities}")"
     printf 'bmm_request_polling_verified=true\n'
     printf 'bmm_mempool_tracking_enabled=true\n'
+    if ((MONITOR_EVENT_CONTRACT_VERSION >= 6)); then
+        printf 'bmm_stable_parent_verified=true\n'
+    fi
+    printf 'confirmed_bmm_fee_available=false\n'
     printf 'snapshot_trust_enabled=%s\n' "${TRUST_ASSUMEUTXO_SNAPSHOT}"
     printf 'snapshot_transform=%s\n' "${ECASH_SNAPSHOT_TRANSFORM}"
     printf 'snapshot_height=%s\n' "${ECASH_SNAPSHOT_HEIGHT}"

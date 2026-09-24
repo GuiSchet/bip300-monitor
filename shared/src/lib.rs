@@ -2,6 +2,9 @@
 
 //! Shared infrastructure for bip300-monitor extractors and tools.
 
+/// BIP300-specific consensus encoding and hash helpers.
+pub mod bip300;
+
 /// Process-wide structured diagnostics.
 pub mod logging;
 

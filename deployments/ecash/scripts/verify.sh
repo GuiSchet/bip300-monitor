@@ -163,8 +163,8 @@ until record_current_run_has_bmm_observation; do
     sleep 1
 done
 event_contract_version="$(record_current_event_contract_version)"
-[[ "${event_contract_version}" == 5 ]] ||
-    die "the current extractor uses event contract v${event_contract_version:-unknown}; Betanet requires v5"
+[[ "${event_contract_version}" == "${MONITOR_EVENT_CONTRACT_VERSION}" ]] ||
+    die "the current extractor uses event contract v${event_contract_version:-unknown}; Betanet requires v${MONITOR_EVENT_CONTRACT_VERSION}"
 run_capabilities="$(record_current_run_capabilities)"
 jq -e '
     index("live_bmm_bid_snapshots") != null
@@ -172,6 +172,19 @@ jq -e '
     and index("per_worker_health") != null
 ' <<<"${run_capabilities}" >/dev/null ||
     die "the current extractor run does not declare mempool-backed BMM and per-worker health"
+if ((MONITOR_EVENT_CONTRACT_VERSION >= 6)); then
+    jq -e '
+        index("bip300_description_hash_identity") != null
+        and index("stable_parent_bmm_snapshots") != null
+        and index("validated_chain_identity") != null
+        and index("orphan_run_reconciliation") != null
+    ' <<<"${run_capabilities}" >/dev/null ||
+        die "the current extractor run does not declare the contract-v6 correctness capabilities"
+    record_current_run_has_stable_bmm_observation ||
+        die "the current extractor run has no stable-parent BMM observation"
+fi
+record_has_single_running_enforcer ||
+    die "the current dataset does not have exactly one running enforcer extractor"
 worker_wait_seconds="${WORKER_HEALTH_WAIT_SECONDS:-60}"
 worker_deadline="$((SECONDS + worker_wait_seconds))"
 until record_current_workers_are_healthy; do

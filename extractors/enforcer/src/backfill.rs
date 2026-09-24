@@ -61,6 +61,7 @@ pub(crate) struct HistoryScope<'a> {
     pub(crate) sidechain: Option<u8>,
     pub(crate) sidechain_instance_id: Option<&'a str>,
     pub(crate) activation_height: u32,
+    pub(crate) expected_start_hash: Option<&'a [u8]>,
 }
 
 type FetchFuture<'a> =
@@ -84,7 +85,7 @@ pub(crate) trait HistoryStream {
     }
 
     fn inconclusive_probe_error(&self, error: &Error) -> bool {
-        retryable_page_error(error)
+        retryable_rpc_error(error)
     }
 }
 
@@ -99,6 +100,7 @@ impl HistoryStream for BlockHistory<'_> {
             sidechain: Some(self.instance.sidechain),
             sidechain_instance_id: Some(&self.instance.sidechain_instance_id),
             activation_height: self.instance.activation_height,
+            expected_start_hash: None,
         }
     }
 
@@ -211,7 +213,7 @@ pub(crate) async fn run_history<S: HistoryStream>(
             )),
             Ok(payloads) => Page::Found(payloads),
             Err(error) if stream.unavailable_error(&error) => Page::Unavailable(error),
-            Err(error) if retryable_page_error(&error) && progress.effective_page_blocks > 1 => {
+            Err(error) if page_too_large(&error) && progress.effective_page_blocks > 1 => {
                 let previous_page_blocks = progress.effective_page_blocks;
                 let reduced = (previous_page_blocks / 2).max(1);
                 let message = format!("{error:#}");
@@ -248,6 +250,18 @@ pub(crate) async fn run_history<S: HistoryStream>(
                 );
                 continue;
             }
+            Err(error) if retryable_rpc_error(&error) => {
+                return settle_failure(
+                    recorder,
+                    &scope,
+                    error.context("the history page request failed transiently"),
+                    &progress.target_tip,
+                    blocks,
+                    pages,
+                    FailureMode::Deferred,
+                )
+                .await;
+            }
             Err(error) => {
                 return settle_failure(
                     recorder,
@@ -265,9 +279,37 @@ pub(crate) async fn run_history<S: HistoryStream>(
         let payloads = match page {
             Page::Found(payloads) => payloads,
             Page::Unavailable(error) => {
-                let current_tip = snapshot::current_tip(client)
-                    .await
-                    .context("reading the current tip after an unavailable history cursor")?;
+                let current_tip = match snapshot::current_tip(client).await {
+                    Ok(current_tip) => current_tip,
+                    Err(tip_error) if retryable_rpc_error(&tip_error) => {
+                        return settle_failure(
+                            recorder,
+                            &scope,
+                            tip_error.context(format!(
+                                "reading the current tip after unavailable history cursor: {error:#}"
+                            )),
+                            &progress.target_tip,
+                            blocks,
+                            pages,
+                            FailureMode::Deferred,
+                        )
+                        .await;
+                    }
+                    Err(tip_error) => {
+                        return settle_failure(
+                            recorder,
+                            &scope,
+                            tip_error.context(
+                                "reading the current tip after an unavailable history cursor",
+                            ),
+                            &progress.target_tip,
+                            blocks,
+                            pages,
+                            FailureMode::Fatal,
+                        )
+                        .await;
+                    }
+                };
                 let target_availability = if current_tip.hash == progress.target_tip.hash {
                     Some(true)
                 } else {
@@ -348,6 +390,24 @@ pub(crate) async fn run_history<S: HistoryStream>(
         )?;
         let returned = u32::try_from(payloads.len()).expect("a page length fits in a u32");
         let completes_cycle = u64::from(returned) == remaining;
+
+        if let Err(error) = validate_expected_start_hash(
+            &scope,
+            progress.floor_hash.as_deref(),
+            completes_cycle,
+            &oldest.hash,
+        ) {
+            return settle_failure(
+                recorder,
+                &scope,
+                error,
+                &progress.target_tip,
+                blocks,
+                pages,
+                FailureMode::Fatal,
+            )
+            .await;
+        }
 
         if completes_cycle
             && let Some(floor_hash) = progress.floor_hash.as_deref()
@@ -668,6 +728,27 @@ fn blocks_through_floor(cursor_height: u32, floor_height: Option<u32>) -> Result
     }
 }
 
+fn validate_expected_start_hash(
+    scope: &HistoryScope<'_>,
+    floor_hash: Option<&[u8]>,
+    completes_cycle: bool,
+    actual_oldest_hash: &[u8],
+) -> Result<()> {
+    if completes_cycle
+        && floor_hash.is_none()
+        && let Some(expected_start_hash) = scope.expected_start_hash
+        && actual_oldest_hash != expected_start_hash
+    {
+        bail!(
+            "history stream {} reached activation block {}, expected {}",
+            scope.stream,
+            hex::encode(actual_oldest_hash),
+            hex::encode(expected_start_hash)
+        );
+    }
+    Ok(())
+}
+
 pub(crate) fn verify_page_with<S: HistoryStream>(
     stream: &S,
     payloads: &[events::EnforcerEvent],
@@ -723,8 +804,21 @@ pub(crate) fn verify_page_with<S: HistoryStream>(
     Ok(())
 }
 
-pub(crate) fn retryable_page_error(error: &Error) -> bool {
-    error_has_code(error, Code::DeadlineExceeded) || error_has_code(error, Code::ResourceExhausted)
+pub(crate) fn retryable_rpc_error(error: &Error) -> bool {
+    [
+        Code::Cancelled,
+        Code::DeadlineExceeded,
+        Code::ResourceExhausted,
+        Code::Unavailable,
+    ]
+    .into_iter()
+    .any(|code| error_has_code(error, code))
+}
+
+fn page_too_large(error: &Error) -> bool {
+    [Code::DeadlineExceeded, Code::ResourceExhausted]
+        .into_iter()
+        .any(|code| error_has_code(error, code))
 }
 
 pub(crate) fn error_has_code(error: &Error, code: Code) -> bool {
@@ -812,8 +906,8 @@ mod tests {
     use tonic::Code;
 
     use super::{
-        BlockHistory, blocks_through_floor, error_has_code, replacement_target,
-        retryable_page_error, verify_page_with,
+        BlockHistory, HistoryScope, blocks_through_floor, error_has_code, page_too_large,
+        replacement_target, retryable_rpc_error, validate_expected_start_hash, verify_page_with,
     };
 
     fn recovered(hash: u8, previous_hash: u8, height: u32) -> events::EnforcerEvent {
@@ -876,12 +970,69 @@ mod tests {
     }
 
     #[test]
+    fn activation_hash_is_checked_only_when_a_full_cycle_reaches_its_start() {
+        let expected = vec![0x11; 32];
+        let wrong = vec![0x22; 32];
+        let floor = vec![0x33; 32];
+        let scope = HistoryScope {
+            stream: "bip300_delta",
+            sidechain: None,
+            sidechain_instance_id: None,
+            activation_height: 101,
+            expected_start_hash: Some(&expected),
+        };
+
+        validate_expected_start_hash(&scope, None, true, &expected)
+            .expect("full cycle reached the configured activation block");
+        assert!(validate_expected_start_hash(&scope, None, true, &wrong).is_err());
+        validate_expected_start_hash(&scope, Some(&floor), true, &wrong)
+            .expect("an extension ends above activation and checks its exclusive floor instead");
+        validate_expected_start_hash(&scope, None, false, &wrong)
+            .expect("an intermediate page has not reached activation yet");
+    }
+
+    #[test]
     fn grpc_retry_classification_walks_anyhow_context() {
-        let deadline =
-            anyhow::Error::new(tonic::Status::deadline_exceeded("slow")).context("requesting page");
-        assert!(retryable_page_error(&deadline));
-        assert!(error_has_code(&deadline, Code::DeadlineExceeded));
-        assert!(!error_has_code(&deadline, Code::NotFound));
+        for (code, status) in [
+            (Code::Cancelled, tonic::Status::cancelled("cancelled")),
+            (
+                Code::DeadlineExceeded,
+                tonic::Status::deadline_exceeded("slow"),
+            ),
+            (
+                Code::ResourceExhausted,
+                tonic::Status::resource_exhausted("busy"),
+            ),
+            (Code::Unavailable, tonic::Status::unavailable("offline")),
+        ] {
+            let error = anyhow::Error::new(status).context("requesting page");
+            assert!(retryable_rpc_error(&error));
+            assert!(error_has_code(&error, code));
+            assert!(!error_has_code(&error, Code::NotFound));
+        }
+        let invalid = anyhow::Error::new(tonic::Status::invalid_argument("bad request"));
+        assert!(!retryable_rpc_error(&invalid));
+    }
+
+    #[test]
+    fn only_page_pressure_errors_reduce_the_persisted_page_size() {
+        for status in [
+            tonic::Status::deadline_exceeded("page timed out"),
+            tonic::Status::resource_exhausted("page is too large"),
+        ] {
+            let error = anyhow::Error::new(status).context("requesting history page");
+            assert!(page_too_large(&error));
+            assert!(retryable_rpc_error(&error));
+        }
+
+        for status in [
+            tonic::Status::unavailable("enforcer restarting"),
+            tonic::Status::cancelled("connection cancelled"),
+        ] {
+            let error = anyhow::Error::new(status).context("requesting history page");
+            assert!(!page_too_large(&error));
+            assert!(retryable_rpc_error(&error));
+        }
     }
 
     #[test]
