@@ -55,8 +55,9 @@ promotion.
 1. Merge to `main`. Pull requests structurally cannot publish, because the Docker
    Hub secret is unavailable to them.
 2. CI builds and publishes `sha-<commit>` for both monitor images.
-3. Resolve the digests and promote them in `VERSIONS.lock`, together with
-   `MONITOR_IMAGE_COMMIT`, as its own commit.
+3. Resolve the digests and promote them in both deployment locks, together with
+   `MONITOR_IMAGE_COMMIT` and the matching
+   `MONITOR_EVENT_CONTRACT_VERSION`, as its own commit.
 4. Deploy.
 
 `preflight.sh` enforces the order rather than trusting anyone to remember it: it

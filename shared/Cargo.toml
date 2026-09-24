@@ -9,6 +9,7 @@ repository.workspace = true
 [dependencies]
 anyhow = { workspace = true }
 async-nats = { workspace = true }
+bitcoin = { workspace = true }
 clap = { workspace = true }
 futures-util = { workspace = true }
 hex = { workspace = true }

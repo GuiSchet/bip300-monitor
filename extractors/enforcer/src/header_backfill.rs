@@ -11,7 +11,7 @@ use tonic::Code;
 
 use crate::EnforcerClient;
 use crate::backfill::{
-    HistoryScope, HistoryStream, Settings, error_has_code, retryable_page_error, run_history,
+    HistoryScope, HistoryStream, Settings, error_has_code, retryable_rpc_error, run_history,
 };
 use crate::convert;
 
@@ -21,6 +21,7 @@ const HISTORY_STREAM: &str = "bip300_delta";
 
 struct Bip300History {
     activation_height: u32,
+    activation_block_hash: Option<Vec<u8>>,
 }
 
 impl HistoryStream for Bip300History {
@@ -30,6 +31,7 @@ impl HistoryStream for Bip300History {
             sidechain: None,
             sidechain_instance_id: None,
             activation_height: self.activation_height,
+            expected_start_hash: self.activation_block_hash.as_deref(),
         }
     }
 
@@ -64,7 +66,7 @@ impl HistoryStream for Bip300History {
     }
 
     fn inconclusive_probe_error(&self, error: &Error) -> bool {
-        error_has_code(error, Code::Unimplemented) || retryable_page_error(error)
+        error_has_code(error, Code::Unimplemented) || retryable_rpc_error(error)
     }
 }
 
@@ -73,6 +75,7 @@ pub(crate) async fn run(
     client: &mut EnforcerClient,
     recorder: &Recorder,
     activation_height: u32,
+    activation_block_hash: Option<&[u8]>,
     tip: &ObservedBlock,
     settings: Settings,
     shutdown_rx: watch::Receiver<bool>,
@@ -80,7 +83,10 @@ pub(crate) async fn run(
     run_history(
         client,
         recorder,
-        &Bip300History { activation_height },
+        &Bip300History {
+            activation_height,
+            activation_block_hash: activation_block_hash.map(<[u8]>::to_vec),
+        },
         tip,
         settings,
         shutdown_rx,
@@ -94,7 +100,7 @@ mod tests {
     use shared::protobuf::event::ObservedBlock;
 
     use super::Bip300History;
-    use crate::backfill::verify_page_with;
+    use crate::backfill::{HistoryStream, verify_page_with};
 
     fn recovered(hash: u8, previous_hash: u8, height: u32) -> events::EnforcerEvent {
         events::EnforcerEvent {
@@ -120,6 +126,7 @@ mod tests {
     fn global_bip300_pages_use_the_shared_contiguity_rules() {
         let stream = Bip300History {
             activation_height: 101,
+            activation_block_hash: Some(vec![0x11; 32]),
         };
         let payloads = vec![
             recovered(0x14, 0x13, 104),
@@ -133,5 +140,20 @@ mod tests {
             3,
         )
         .expect("valid global BIP300 page");
+    }
+
+    #[test]
+    fn development_history_has_no_expected_activation_hash() {
+        let development = Bip300History {
+            activation_height: 0,
+            activation_block_hash: None,
+        };
+        assert_eq!(development.scope().expected_start_hash, None);
+
+        let pinned = Bip300History {
+            activation_height: 967_680,
+            activation_block_hash: Some(vec![0x11; 32]),
+        };
+        assert_eq!(pinned.scope().expected_start_hash, Some(&[0x11; 32][..]));
     }
 }

@@ -5,6 +5,8 @@ These protobuf files are copied from the reviewed observer fork:
 - Official repository: <https://github.com/LayerTwo-Labs/bip300301_enforcer>
 - Observer fork: <https://github.com/GuiSchet/bip300301_enforcer>
 - Base commit: `0e27251ef351a522c72ab9ef079f75e06075390f`
+- Latest upstream commit reviewed for compatibility (not deployed):
+  `6e5f79f7668b0f82eab788531adb2ea21664d972`
 - Observer commit: `0740a39380b39885fe8655f79f78150001d8a15b`
 - Local branch: `feature/betanet-monitor-observer` in the sibling enforcer checkout
 - Published branch: `feature/betanet-monitor-observer` in the observer fork
@@ -13,9 +15,13 @@ These protobuf files are copied from the reviewed observer fork:
 Only the read-only `ValidatorService` contract and its direct CUSF message
 dependencies are vendored. The monitor does not link to the enforcer
 implementation. The observer commit is based directly on the latest reviewed
-upstream commit, retains upstream `GetSeenBmmRequests`, and adds only
-`GetBip300BlockDelta`. The active Betanet lock pins that exact runtime commit
-and its immutable OCI image.
+upstream base required by the observer fork, retains upstream
+`GetSeenBmmRequests`, and adds only `GetBip300BlockDelta`. The later upstream
+revision recorded above was reviewed on 2026-09-24: it does not change these
+protobufs or the validator observer paths, and its behavior fix is wallet-only.
+The runtime therefore remains on the tested observer commit instead of taking
+an unrelated upgrade. `ENFORCER_UPSTREAM_REVIEWED_COMMIT` preserves that audit
+boundary separately from the deployed base and observer pins.
 
 `validator-observer.patch` is the reproducible delta from the official
 `validator.proto` to the vendored observer contract. This lets CI reconstruct

@@ -249,12 +249,24 @@ grep -Fq 'record_bip300_history_is_complete' "${DEPLOYMENT_ROOT}/scripts/verify.
     die "verify.sh does not assert complete global BIP300 history"
 grep -Fq 'record_current_run_has_bmm_observation' "${DEPLOYMENT_ROOT}/scripts/verify.sh" ||
     die "verify.sh does not assert a successful BMM request poll"
+grep -Fq 'record_current_run_has_stable_bmm_observation' "${DEPLOYMENT_ROOT}/scripts/verify.sh" ||
+    die "verify.sh does not assert a stable-parent BMM request poll"
+grep -Fq 'record_has_single_running_enforcer' "${DEPLOYMENT_ROOT}/scripts/verify.sh" ||
+    die "verify.sh does not assert a single active extractor run"
 grep -Fq 'record_current_workers_are_healthy' "${DEPLOYMENT_ROOT}/scripts/verify.sh" ||
     die "verify.sh does not assert per-worker extractor health"
 grep -Fq 'mempool_backed_bmm_bid_snapshots' "${DEPLOYMENT_ROOT}/scripts/accept.sh" ||
     die "accept.sh does not require mempool-backed BMM capability"
 grep -Fq 'bmm_mempool_tracking_enabled=true' "${DEPLOYMENT_ROOT}/scripts/accept.sh" ||
     die "accept.sh does not record the verified BMM mempool mode"
+grep -Fq 'bmm_stable_parent_verified=true' "${DEPLOYMENT_ROOT}/scripts/accept.sh" ||
+    die "accept.sh does not record stable-parent BMM verification"
+grep -Fq 'confirmed_bmm_fee_available=false' "${DEPLOYMENT_ROOT}/scripts/accept.sh" ||
+    die "accept.sh does not record the confirmed M8 fee limitation"
+grep -Fq 'enforcer_upstream_reviewed_commit=' "${DEPLOYMENT_ROOT}/scripts/accept.sh" ||
+    die "accept.sh does not preserve the reviewed upstream enforcer provenance"
+grep -Fq 'dataset_created_at=' "${DEPLOYMENT_ROOT}/scripts/accept.sh" ||
+    die "accept.sh does not identify the accepted dataset generation"
 grep -Fq 'event_contract_version' "${DEPLOYMENT_ROOT}/scripts/accept.sh" ||
     die "accept.sh does not record the normalized event contract"
 grep -Fq 'history_fully_validated' "${DEPLOYMENT_ROOT}/scripts/accept.sh" ||
@@ -553,6 +565,7 @@ jq -e '.services["event-logger"].environment.BIP300_MONITOR_NATS_URL == "nats://
     <<<"${config_json}" >/dev/null
 jq -e '.services["enforcer-extractor"].environment.BIP300_MONITOR_NATS_URL == "nats://nats:4222"
     and .services["enforcer-extractor"].environment.BIP300_MONITOR_ENFORCER_ENDPOINT == "http://enforcer:50051"
+    and .services["enforcer-extractor"].environment.BIP300_MONITOR_EXPECTED_ENFORCER_NETWORK == "NETWORK_MAINNET"
     and .services["enforcer-extractor"].environment.BIP300_MONITOR_BMM_REQUEST_POLL_INTERVAL_SECONDS == "5"
     and (.services["enforcer-extractor"].environment | has("BIP300_MONITOR_SIDECHAINS") | not)' \
     <<<"${config_json}" >/dev/null
@@ -636,7 +649,7 @@ actual_peer_count="$(grep -c '^addnode=' "${rendered_node_config}")"
 [[ "${actual_peer_count}" == "${expected_peer_count}" ]] ||
     die "rendered node configuration contains an unexpected peer"
 
-[[ "${LOCK_FORMAT}" == 4 ]]
+[[ "${LOCK_FORMAT}" == 5 ]]
 [[ "${NETWORK_ID}" == betanet ]]
 [[ "${ECASH_SNAPSHOT_TRANSFORM}" == network_magic_v2 ]]
 [[ "${ECASH_SNAPSHOT_SOURCE_SHA256}" =~ ^[[:xdigit:]]{64}$ ]]
@@ -646,7 +659,9 @@ actual_peer_count="$(grep -c '^addnode=' "${rendered_node_config}")"
 [[ "${ECASH_SNAPSHOT_SHA256}" =~ ^[[:xdigit:]]{64}$ ]]
 [[ "${ECASH_NODE_COMMIT}" =~ ^[[:xdigit:]]{40}$ ]]
 [[ "${ENFORCER_COMMIT}" =~ ^[[:xdigit:]]{40}$ ]]
+[[ "${ENFORCER_UPSTREAM_REVIEWED_COMMIT}" =~ ^[[:xdigit:]]{40}$ ]]
 [[ "${ENFORCER_COMMIT}" == "${ENFORCER_OBSERVER_COMMIT}" ]]
+[[ "${MONITOR_EVENT_CONTRACT_VERSION}" =~ ^[0-9]+$ ]]
 [[ "${MONITOR_IMAGE_COMMIT}" =~ ^[[:xdigit:]]{40}$ ]]
 [[ "${ECASH_NODE_IMAGE}" == *":${ECASH_NODE_BRANCH}@sha256:"* ]]
 [[ "${ENFORCER_IMAGE}" == *":sha-${ENFORCER_COMMIT:0:12}@sha256:"* ]]

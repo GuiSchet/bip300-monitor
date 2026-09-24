@@ -3,11 +3,13 @@
 use std::collections::HashSet;
 use std::time::Duration;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use clap::Parser;
 use shared::logging::LogLevel;
 use shared::nats::NatsArgs;
 use shared::store::{DatasetManifest, PostgresArgs};
+
+use crate::proto::mainchain;
 
 /// Runtime configuration for the enforcer extractor.
 #[derive(Clone, Parser)]
@@ -36,6 +38,10 @@ pub struct Args {
         default_value = "unknown"
     )]
     pub activation_block_hash: String,
+
+    /// Exact protobuf network name expected from `GetChainInfo`.
+    #[arg(long, env = "BIP300_MONITOR_EXPECTED_ENFORCER_NETWORK")]
+    pub expected_enforcer_network: Option<String>,
 
     /// Exact node source commit used by this deployment.
     #[arg(long, env = "BIP300_MONITOR_NODE_COMMIT", default_value = "unknown")]
@@ -123,8 +129,8 @@ pub struct Args {
     )]
     pub tip_poll_interval_seconds: u64,
 
-    /// How often the live BMM auction is sampled while the parent block is
-    /// unchanged. A tip change triggers an immediate additional sample.
+    /// How often the live BMM auction is sampled. Each sample reads its own
+    /// parent; a change detected by the independent tip poll can wake it early.
     #[arg(
         long,
         env = "BIP300_MONITOR_BMM_REQUEST_POLL_INTERVAL_SECONDS",
@@ -208,6 +214,20 @@ impl Args {
         Ok(())
     }
 
+    /// Return the exact activation hash when the dataset has a pinned identity.
+    /// Development datasets deliberately use no expected activation hash.
+    pub fn activation_block_hash_bytes(&self) -> Result<Option<Vec<u8>>> {
+        if self.activation_block_hash == "unknown" {
+            return Ok(None);
+        }
+        let hash = hex::decode(&self.activation_block_hash)
+            .context("decoding the configured activation block hash")?;
+        if hash.len() != 32 {
+            bail!("activation block hash must decode to exactly 32 bytes");
+        }
+        Ok(Some(hash))
+    }
+
     /// Return the configured request timeout.
     pub const fn request_timeout(&self) -> Duration {
         Duration::from_secs(self.request_timeout_seconds)
@@ -261,7 +281,11 @@ impl Args {
                 "resolved_m1_m8_deltas",
                 "treasury_transitions",
                 "live_bmm_bid_snapshots",
-                "mempool_backed_bmm_bid_snapshots"
+                "mempool_backed_bmm_bid_snapshots",
+                "bip300_description_hash_identity",
+                "stable_parent_bmm_snapshots",
+                "validated_chain_identity",
+                "orphan_run_reconciliation"
             ]),
             creation_reason: "pre-Drivechain Pulse L1 observation dataset".to_owned(),
         }
@@ -288,6 +312,20 @@ fn validate_identity(args: &Args) -> Result<()> {
         validate_hex(&args.node_commit, 40, "node commit")?;
         validate_hex(&args.enforcer_commit, 40, "enforcer commit")?;
         validate_hex(&args.monitor_commit, 40, "monitor commit")?;
+        let expected_network = args.expected_enforcer_network.as_deref().ok_or_else(|| {
+            anyhow::anyhow!("expected enforcer network must be configured for a production dataset")
+        })?;
+        let network = mainchain::Network::from_str_name(expected_network)
+            .ok_or_else(|| anyhow::anyhow!("unknown enforcer network `{expected_network}`"))?;
+        if matches!(
+            network,
+            mainchain::Network::Unspecified | mainchain::Network::Unknown
+        ) {
+            bail!("expected enforcer network must be a concrete network");
+        }
+    } else if let Some(expected_network) = args.expected_enforcer_network.as_deref() {
+        mainchain::Network::from_str_name(expected_network)
+            .ok_or_else(|| anyhow::anyhow!("unknown enforcer network `{expected_network}`"))?;
     }
     Ok(())
 }
@@ -329,6 +367,7 @@ mod tests {
         assert_eq!(args.nats.nats_flush_timeout_seconds, 10);
         assert_eq!(args.shutdown_timeout_seconds, 15);
         args.validate().expect("unique sidechains");
+        assert_eq!(args.activation_block_hash_bytes().unwrap(), None);
     }
 
     #[test]
@@ -416,6 +455,55 @@ mod tests {
                 .expect("syntactically valid arguments");
         let error = args.validate().expect_err("duplicate sidechains must fail");
         assert!(error.to_string().contains("configured more than once"));
+    }
+
+    #[test]
+    fn production_identity_requires_a_concrete_enforcer_network() {
+        let production = [
+            "enforcer-extractor",
+            "--network-id",
+            "betanet",
+            "--activation-height",
+            "967680",
+            "--activation-block-hash",
+            "00000000000000030101ba5cfea54b22becc79f95dc6040beb76e01dd9d04042",
+            "--node-commit",
+            "ca64033c137457a3c8ca394186759819a2ab0694",
+            "--enforcer-commit",
+            "0740a39380b39885fe8655f79f78150001d8a15b",
+            "--monitor-commit",
+            "5d2c347b5f009d758ac2002fb57030a57f7ff5ad",
+        ];
+        let missing = Args::try_parse_from(production).unwrap();
+        assert!(
+            missing
+                .validate()
+                .expect_err("production network is required")
+                .to_string()
+                .contains("expected enforcer network")
+        );
+
+        let mut configured = production.to_vec();
+        configured.extend(["--expected-enforcer-network", "NETWORK_MAINNET"]);
+        let configured = Args::try_parse_from(configured).unwrap();
+        configured.validate().expect("concrete production network");
+        assert_eq!(
+            configured.activation_block_hash_bytes().unwrap(),
+            Some(
+                hex::decode("00000000000000030101ba5cfea54b22becc79f95dc6040beb76e01dd9d04042")
+                    .unwrap()
+            )
+        );
+    }
+
+    #[test]
+    fn rejects_a_malformed_pinned_activation_hash() {
+        let mut args = Args::try_parse_from(["enforcer-extractor"]).unwrap();
+        args.activation_block_hash = "not-a-32-byte-hash".to_owned();
+        let error = args
+            .validate()
+            .expect_err("a pinned activation hash must be exact hexadecimal");
+        assert!(error.to_string().contains("activation block hash"));
     }
 
     #[test]

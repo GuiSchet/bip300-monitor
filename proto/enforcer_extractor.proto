@@ -256,6 +256,8 @@ message ActiveSidechain {
   uint32 activation_height = 5;
   // Absent when the proposal version is unknown to the enforcer.
   SidechainDeclaration declaration = 6;
+  // 32-byte BIP300 SHA256d description hash in conventional display order.
+  bytes description_hash = 7;
 }
 
 message ActiveSidechainsSnapshot {

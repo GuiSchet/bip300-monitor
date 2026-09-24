@@ -221,6 +221,22 @@ mod tests {
 
     use super::{Tracker, active_instances, block_anchor, tip_anchor};
 
+    fn active_sidechain(sidechain_number: u32, activation_height: u32) -> events::ActiveSidechain {
+        let description = [sidechain_number as u8; 32];
+        let mut raw_description = vec![description.len() as u8];
+        raw_description.extend_from_slice(&description);
+        let description_hash =
+            shared::bip300::sidechain_description_hash(&raw_description).unwrap();
+        events::ActiveSidechain {
+            sidechain_number,
+            raw_description,
+            proposal_height: 1,
+            activation_height,
+            description_hash,
+            ..Default::default()
+        }
+    }
+
     fn ctip(sidechain_number: u32, value_sats: u64) -> events::EnforcerEvent {
         events::EnforcerEvent {
             event: Some(events::enforcer_event::Event::Ctip(events::CtipSnapshot {
@@ -349,18 +365,7 @@ mod tests {
         let snapshot = events::EnforcerEvent {
             event: Some(events::enforcer_event::Event::ActiveSidechains(
                 events::ActiveSidechainsSnapshot {
-                    sidechains: vec![
-                        events::ActiveSidechain {
-                            sidechain_number: 9,
-                            activation_height: 987_402,
-                            ..Default::default()
-                        },
-                        events::ActiveSidechain {
-                            sidechain_number: 98,
-                            activation_height: 987_402,
-                            ..Default::default()
-                        },
-                    ],
+                    sidechains: vec![active_sidechain(9, 987_402), active_sidechain(98, 987_402)],
                 },
             )),
         };

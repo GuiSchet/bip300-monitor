@@ -32,6 +32,12 @@ variant in the first pilot.
   values and stored as 32 bytes in conventional display order.
 - Fields documented as consensus-encoded preserve the byte order and any
   length prefix supplied by the enforcer's `ConsensusHex` value.
+- A sidechain description is stored with that consensus `CompactSize` length
+  prefix, but its BIP300 identity is SHA256d of the decoded description bytes
+  only. `description_hash` is stored in conventional display order and is
+  verified against every M1 and proposal response that already carries the
+  upstream hash. Active-sidechain responses do not carry it, so the monitor
+  calculates and includes it in contract v6.
 - `Bip300BlockDelta` is global, one fact per mainchain block. It preserves each
   exact matching coinbase `scriptPubKey`, its `vout`, parsed fields and whether
   the enforcer accepted it. Resolved effects and treasury transitions come
@@ -59,6 +65,14 @@ variant in the first pilot.
   `tip_before`, `tip_after`, the read interval, attempt count and either
   `stable` or `changed`. Three bounded attempts are made; a moving chain is
   persisted explicitly as `changed`, never mislabeled stable.
+- A live BMM auction has a stricter rule: the extractor reads the tip, asks
+  `GetSeenBmmRequests` for exactly that parent, and reads the tip again. It
+  discards and retries a response when the parent moved and persists only a
+  `stable` group whose two tips, event anchor, and payload parent are equal.
+  The BMM worker reads the current tip on its own five-second sampling cycle.
+  The independent 30-second tip poll can also wake it early after that poll
+  detects a move, but this notification is not immediate and correctness does
+  not depend on it.
 - Reorgs are recorded, not repaired. `BlockDisconnected` says a block left the
   chain; the preceding `BlockConnected` fact remains because this is an
   observation log, not a mutable current-chain view. The fact is idempotent,
@@ -86,6 +100,11 @@ variant in the first pilot.
 Conversions reject missing required input fields, malformed hex, and hashes
 that are not exactly 32 bytes. This prevents incomplete upstream responses from
 being published as valid-looking zero values.
+
+`ConfirmedBmmRequest.fee_sats` is absent in the reviewed enforcer response and
+the monitor does not infer it. Confirmed M8 history therefore contains the
+request identity and effects exposed by the enforcer; live mempool samples are
+the source of `bid_sats`.
 
 Core NATS transport is at-most-once and non-durable. A successful bounded client
 flush confirms that its transport write buffer was emptied; it does not confirm

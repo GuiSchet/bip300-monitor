@@ -1,6 +1,6 @@
 # shellcheck shell=bash
 # Reproducible eCash Betanet network, image, tool, and snapshot lock.
-LOCK_FORMAT=4
+LOCK_FORMAT=5
 LOCKED_AT=2026-09-23
 
 NETWORK_ID=betanet
@@ -26,6 +26,7 @@ ECASH_NODE_EXPECTED_VERSION=31
 ENFORCER_REPO=https://github.com/GuiSchet/bip300301_enforcer.git
 ENFORCER_BRANCH=feature/betanet-monitor-observer
 ENFORCER_BASE_COMMIT=0e27251ef351a522c72ab9ef079f75e06075390f
+ENFORCER_UPSTREAM_REVIEWED_COMMIT=6e5f79f7668b0f82eab788531adb2ea21664d972
 ENFORCER_OBSERVER_COMMIT=0740a39380b39885fe8655f79f78150001d8a15b
 ENFORCER_COMMIT=0740a39380b39885fe8655f79f78150001d8a15b
 ENFORCER_IMAGE=ghcr.io/guischet/bip300301_enforcer:sha-0740a39380b3@sha256:6dcbc506f7c110d26018bac5be93924b5b9788b9948d53e2d1fbb2bd70d3990d
@@ -37,7 +38,9 @@ POSTGRES_IMAGE=docker.io/library/postgres:18.2-alpine@sha256:035b9ab53cfa147d720
 POSTGRES_DB=bip300_monitor
 POSTGRES_USER=bip300_monitor
 
-# Source commit from which the v5 extractor/logger images were built.
+# Last published monitor release. Keep contract, commit, and both immutable
+# image digests together; promote all four to v6 only after CI publishes it.
+MONITOR_EVENT_CONTRACT_VERSION=5
 MONITOR_IMAGE_COMMIT=86e83787b7c1dd32e404ded6ef26404f63f49359
 ENFORCER_EXTRACTOR_IMAGE=docker.io/guischet/bip300-enforcer-extractor:sha-86e83787b7c1@sha256:0053bfe3d2685bd7caf59f400cce5453a95f5082d52788b3bdc24fb4fb049f79
 EVENT_LOGGER_IMAGE=docker.io/guischet/bip300-event-logger:sha-86e83787b7c1@sha256:9f7458215a95f60311f727824688739574a335a20a35194e606cf736cd8c5aa2

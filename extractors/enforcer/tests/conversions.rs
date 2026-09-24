@@ -16,6 +16,26 @@ fn consensus_hex(bytes: &[u8]) -> Option<common::ConsensusHex> {
     })
 }
 
+fn consensus_vec_hex(bytes: &[u8]) -> Option<common::ConsensusHex> {
+    assert!(
+        bytes.len() < 0xfd,
+        "the test helper only encodes short vectors"
+    );
+    let mut encoded = vec![bytes.len() as u8];
+    encoded.extend_from_slice(bytes);
+    consensus_hex(&encoded)
+}
+
+fn description_hash(bytes: &[u8]) -> Option<common::ReverseHex> {
+    let encoded = consensus_vec_hex(bytes).expect("encoded description");
+    let encoded = hex::decode(encoded.hex.expect("description hex")).unwrap();
+    Some(common::ReverseHex {
+        hex: Some(hex::encode(
+            shared::bip300::sidechain_description_hash(&encoded).unwrap(),
+        )),
+    })
+}
+
 fn raw_hex(bytes: &[u8]) -> Option<common::Hex> {
     Some(common::Hex {
         hex: Some(hex::encode(bytes)),
@@ -147,9 +167,9 @@ fn converts_sidechain_snapshots() {
         sidechain_proposals: vec![
             mainchain::get_sidechain_proposals_response::SidechainProposal {
                 sidechain_number: Some(7),
-                description: consensus_hex(&[0x01, 0x02]),
+                description: consensus_vec_hex(&[0x01, 0x02]),
                 declaration: None,
-                description_sha256d_hash: reverse_hex(0x33),
+                description_sha256d_hash: description_hash(&[0x01, 0x02]),
                 vote_count: Some(4),
                 proposal_height: Some(100),
                 proposal_age: Some(6),
@@ -162,14 +182,17 @@ fn converts_sidechain_snapshots() {
     };
     let proposal = &snapshot.proposals[0];
     assert_eq!(proposal.sidechain_number, 7);
-    assert_eq!(proposal.raw_description, vec![0x01, 0x02]);
-    assert_eq!(proposal.description_hash, vec![0x33; 32]);
+    assert_eq!(proposal.raw_description, vec![2, 0x01, 0x02]);
+    assert_eq!(
+        proposal.description_hash,
+        shared::bip300::sidechain_description_hash(&proposal.raw_description).unwrap()
+    );
     assert!(proposal.declaration.is_none());
 
     let active = convert::active_sidechains(mainchain::GetSidechainsResponse {
         sidechains: vec![mainchain::get_sidechains_response::SidechainInfo {
             sidechain_number: Some(7),
-            description: consensus_hex(&[0x03, 0x04]),
+            description: consensus_vec_hex(&[0x03, 0x04]),
             vote_count: Some(9),
             proposal_height: Some(100),
             activation_height: Some(200),
@@ -182,6 +205,11 @@ fn converts_sidechain_snapshots() {
     };
     let active = &snapshot.sidechains[0];
     assert_eq!(active.activation_height, 200);
+    assert_eq!(active.raw_description, vec![2, 0x03, 0x04]);
+    assert_eq!(
+        active.description_hash,
+        shared::bip300::sidechain_description_hash(&active.raw_description).unwrap()
+    );
     let declaration = active
         .declaration
         .as_ref()
@@ -485,4 +513,34 @@ fn rejects_missing_and_malformed_required_fields() {
         format!("{missing_vote_count:#}")
             .contains("missing required field `withdrawal_bundle_proposal.vote_count`")
     );
+
+    let mismatched_description =
+        convert::sidechain_proposals(mainchain::GetSidechainProposalsResponse {
+            sidechain_proposals: vec![
+                mainchain::get_sidechain_proposals_response::SidechainProposal {
+                    sidechain_number: Some(9),
+                    description: consensus_vec_hex(&[1, 2]),
+                    description_sha256d_hash: reverse_hex(0x33),
+                    vote_count: Some(1),
+                    proposal_height: Some(2),
+                    proposal_age: Some(3),
+                    declaration: None,
+                },
+            ],
+        })
+        .expect_err("a description/hash mismatch must fail");
+    assert!(format!("{mismatched_description:#}").contains("description_hash` is"));
+
+    let malformed_description = convert::active_sidechains(mainchain::GetSidechainsResponse {
+        sidechains: vec![mainchain::get_sidechains_response::SidechainInfo {
+            sidechain_number: Some(9),
+            description: consensus_hex(&[2, 1]),
+            vote_count: Some(1),
+            proposal_height: Some(2),
+            activation_height: Some(3),
+            declaration: None,
+        }],
+    })
+    .expect_err("a truncated consensus description must fail");
+    assert!(format!("{malformed_description:#}").contains("consensus-encoded"));
 }
