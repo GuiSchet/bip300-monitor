@@ -1,0 +1,47 @@
+name: Publish verified v7 OCI archives
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: publish-verified-v7
+  cancel-in-progress: false
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Install OCI copy tool
+        run: sudo apt-get update && sudo apt-get install --yes --no-install-recommends skopeo
+      - name: Verify and publish the approved bytes
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REGISTRY_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir artifacts
+          export REGISTRY_AUTH_FILE="${RUNNER_TEMP}/v7-registry-auth.json"
+          trap 'rm -f "$REGISTRY_AUTH_FILE"' EXIT
+          printf '%s' "$REGISTRY_TOKEN" | skopeo login --username guischet --password-stdin docker.io
+          publish() {
+            local archive="$1" destination="$2" expected="$3" actual
+            if skopeo inspect --raw "docker://$destination" > existing.json 2>/dev/null; then
+              actual="sha256:$(sha256sum existing.json | cut -d ' ' -f1)"
+              [[ "$actual" == "$expected" ]] || { echo 'immutable image tag already has a different digest'; exit 1; }
+            else
+              skopeo copy --preserve-digests "oci-archive:$archive" "docker://$destination"
+            fi
+            actual="sha256:$(skopeo inspect --raw "docker://$destination@$expected" | sha256sum | cut -d ' ' -f1)"
+            [[ "$actual" == "$expected" ]]
+            printf 'Verified %s@%s\n' "$destination" "$expected"
+          }
+          gh release download observer-v7-20261004 --repo GuiSchet/bip300-monitor --pattern enforcer-extractor.oci.tar --dir artifacts
+          printf '%s\n' '5d9445f979f73835284820ec67ea01119bce0cdd2e22aaca58e7709917fe14be  artifacts/enforcer-extractor.oci.tar' | sha256sum --check
+          publish 'artifacts/enforcer-extractor.oci.tar' 'docker.io/guischet/bip300-enforcer-extractor:sha-ecf5b8290e6b' 'sha256:e5e1b9fbcaa7a3493cbc25b9efddb9e5f70a52ecddd29b01919760757b9c3bf8'
+          gh release download observer-v7-20261004 --repo GuiSchet/bip300-monitor --pattern event-logger.oci.tar --dir artifacts
+          printf '%s\n' 'ba65a569bd36dee60a974d10ad4953ea4bc6c8d2254fdb13cd47002a2367a711  artifacts/event-logger.oci.tar' | sha256sum --check
+          publish 'artifacts/event-logger.oci.tar' 'docker.io/guischet/bip300-event-logger:sha-ecf5b8290e6b' 'sha256:e6328fb87385d8b6210999c2d32aed85104520acdd1f60dfc3db338157dca328'
+          gh release download observer-v7-20261004 --repo GuiSchet/bip300-monitor --pattern observatory.oci.tar --dir artifacts
+          printf '%s\n' '3f3eaaaad0c90a2c441c7f350ee5f3f6382659bd2133c23c9a9d650d601bc697  artifacts/observatory.oci.tar' | sha256sum --check
+          publish 'artifacts/observatory.oci.tar' 'docker.io/guischet/drivechain-observatory:sha-d349c23e20d5' 'sha256:d925d1d2244d122c911b0c3aa3d27c95b649a107eee82b38a765d01ee1a34e59'
