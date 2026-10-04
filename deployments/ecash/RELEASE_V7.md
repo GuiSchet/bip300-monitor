@@ -9,7 +9,11 @@ Sources:
 
 - Enforcer: `9b2a15621469a88ea5d3b8f1dcd5ee1bb21e0ac4`.
 - Monitor image source: `ecf5b8290e6b5501508a4a3913bd93c83728cca1`.
-- Observatory: `1d3426e16b4f1cc1fd8a3efa201509ec250aa647`.
+- Observatory image source: `d349c23e20d52f287289a313c4d8d884846261c8`.
+- Observatory deployment: `6a78a1adfaede62fce706ece5dd2159be6500e4d`.
+- Observatory API/sync OCI: `docker.io/guischet/drivechain-observatory:sha-d349c23e20d5@sha256:d925d1d2244d122c911b0c3aa3d27c95b649a107eee82b38a765d01ee1a34e59`.
+  Set `PULSE_IMAGE` to this reference for the separate Observatory deployment
+  after publication. Its web source is in the same reviewed checkout.
 
 The later monitor deployment commit only pairs these image digests with the
 release and strengthens backup control scripts/tests; it does not change the
@@ -33,14 +37,18 @@ fresh database configured with that dataset UUID.
   exact JSON copy, charts, provenance, SSE/outage recovery. Reorg A→B→A, missing
   history, conflicting facts, readiness, stable revision brackets and exact
   `u64::MAX` confirmed fees were exercised. Final source pins passed another
-  complete source/sync/API integration run. Clippy and TypeScript passed.
+  complete source/sync/API integration run. Clippy, TypeScript and the web's
+  optimized production build passed. A PostgreSQL18 container replacement also
+  preserved an inserted table; `PGDATA` is explicit within its named volume.
+  Existing destinations must be backed up and restored to the new v7 volume,
+  not silently reused under the changed data-directory setting.
 - Scale: 1,000,000 synthetic events / 10,000 headers; seed 24.037 s, resumed
   rebuild 76.578 s, list p95 21.088 ms, one-block incremental extension 81 ms.
   These numbers describe the local test environment, not HOSTKEY capacity.
 - A real schema8 custom-format dump restored in an isolated PostgreSQL18
   container. Corrupted bytes were rejected; 49-hour backup age and malformed
   receipts failed health checks. Production v6 restore remains a cutover gate.
-- All three OCI images passed executable smoke tests with networking disabled.
+- All four OCI images passed executable smoke tests with networking disabled.
   Loaded Docker configs matched the corresponding OCI config digests.
 
 ## Review disposition
