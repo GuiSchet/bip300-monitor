@@ -3,7 +3,7 @@
 set -euo pipefail
 source "$(dirname -- "${BASH_SOURCE[0]}")/lib.sh"
 container="${BIP300_TEST_CONTAINER:-observer-v7-tests}"
-[[ "$container" == observer-v7-tests ]] || die 'dedicated test container required'
+[[ "$container" =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]*$ ]] || die 'invalid test container identifier'
 database="bip300_test_verifier_$$"
 docker exec "$container" createdb -U postgres "$database"
 trap 'docker exec "$container" dropdb -U postgres "$database" >/dev/null' EXIT

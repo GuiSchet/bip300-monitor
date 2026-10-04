@@ -165,6 +165,11 @@ jobs:
             host=127.0.0.1 port=55432 user=postgres password=test dbname=postgres
         run: cargo test --workspace --all-features --jobs 2 --locked
 
+      - name: Test canonical history operator queries
+        env:
+          BIP300_TEST_CONTAINER: ${{ job.services.postgres.id }}
+        run: bash deployments/ecash/scripts/test-history-sql.sh
+
   # Build both final images and smoke-test their contents. Pull requests never
   # publish; a merge to main publishes only when an actual image input changed.
   images:

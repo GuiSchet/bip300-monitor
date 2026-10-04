@@ -33,7 +33,8 @@ Cutover sequence, after release approval:
    --archive cutover-TIMESTAMP`. Inspect the off-host restore receipt.
 3. On the VPS, run `bash scripts/reset-record.sh betanet --finalize
    cutover-TIMESTAMP`. It refuses without the matching receipt, refuses a
-   restarted extractor, and moves the old cluster into the permanent archive.
+   restarted or replaced extractor (container identity and full precision
+   startup timestamp), and moves the old cluster into the permanent archive.
 4. Apply the approved v7 enforcer+monitor images. The new monitor creates a
    fresh dataset; it refuses an existing v6 identity before applying migrations.
 5. Grant the Observatory reader SELECT on `observation_failure`, configure the
@@ -48,3 +49,9 @@ Rollback stops the new extractor and Postgres, archives the new cluster, and
 restores the old cluster **with the old images from its archived lock**. Never
 start an older monitor against schema8. Run verification again and keep both
 cutover archives. Do not reset node chainstate or enforcer LMDB.
+
+Local regression checks: `python3 scripts/test-backup-cutover.py` simulates
+Docker only to verify freeze-before-dump, missing receipts, corruption, rapid
+restarts, permanent archives and directory preservation. It also runs in the
+deployment static check. Separately, `offhost-backup.py --restore-only
+--local-root ARCHIVE` validates the real dump in isolated PostgreSQL.

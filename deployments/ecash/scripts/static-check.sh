@@ -9,7 +9,7 @@ load_versions
 export COMPOSE_ENV_FILE="${DEPLOYMENT_ROOT}/.env.example"
 load_deployment_env
 
-for command_name in cmp cp dd diff docker git jq just mktemp od rm shellcheck shfmt stat tr yamllint; do
+for command_name in cmp cp dd diff docker git jq just mktemp od python3 rm shellcheck shfmt stat tr yamllint; do
     require_command "${command_name}"
 done
 
@@ -300,6 +300,8 @@ if grep -nE 'rm .*(node|enforcer|postgres)' \
     "${DEPLOYMENT_ROOT}/scripts/reset-record.sh"; then
     die "reset-record.sh must move recoverable data rather than delete it"
 fi
+
+python3 "${DEPLOYMENT_ROOT}/scripts/test-backup-cutover.py"
 
 sidechain_fixture='{"sidechains":[]}'
 enforcer_rpc() {

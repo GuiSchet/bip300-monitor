@@ -1317,3 +1317,15 @@ require_node_monitoring_ready() {
     active_blocks="$(jq -r '.chainstates[-1].blocks // "unavailable"' <<<"${chainstates}")"
     die "ecash-node is not ready for monitoring (chainstates=${chainstate_count}, historical_blocks=${historical_blocks}, active_blocks=${active_blocks}); require one fully validated chainstate or set TRUST_ASSUMEUTXO_SNAPSHOT=true and load the pinned snapshot at ${ECASH_SNAPSHOT_BLOCK_HASH}"
 }
+
+# A cutover archive is valid only while this exact writer remains stopped.
+# Preserve Docker's full timestamp; second-resolution file mtimes can miss a
+# stop/start/stop within the same second.
+frozen_writer_identity() {
+    local container identity
+    container="$(compose ps -a -q enforcer-extractor)"
+    [[ "$container" =~ ^[a-f0-9]{12,64}$ ]] || die 'expected exactly one stopped extractor container'
+    identity="$(docker inspect --format '{{.Id}} {{.State.StartedAt}} {{.State.Running}}' "$container")"
+    [[ "$identity" == *' false' ]] || die 'extractor must be stopped before freezing its identity'
+    printf '%s\n' "$identity"
+}

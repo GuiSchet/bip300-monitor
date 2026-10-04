@@ -29,10 +29,8 @@ assert r['restored_at']>0 and r['restored_on'], 'missing off-host restore eviden
 PY
 # A restarted writer after preparation invalidates the frozen archive even if
 # it was stopped again before this command.
-last_start="$(compose ps -a -q enforcer-extractor | xargs -r docker inspect --format '{{.State.StartedAt}}')"
-if [[ -n "$last_start" ]]; then
-    [[ "$(date -d "$last_start" +%s)" -le "$(stat -c %Y "$backup/record.dump")" ]] || die 'extractor restarted after archive; prepare again'
-fi
+frozen_writer="$(jq -er '.cutover_writer | select(type == "string" and length > 0)' "$backup/manifest.json")"
+[[ "$(frozen_writer_identity)" == "$frozen_writer" ]] || die 'extractor restarted or was replaced after archive; prepare again'
 postgres_root="$root/postgres"
 [[ "$root" != / && -d "$postgres_root" && ! -L "$postgres_root" ]] || die 'unsafe Postgres directory'
 compose stop postgres
