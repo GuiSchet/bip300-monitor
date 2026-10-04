@@ -1,56 +1,47 @@
 #!/usr/bin/env bash
-
 set -euo pipefail
-
-# shellcheck source=lib.sh
+umask 077
 source "$(dirname -- "${BASH_SOURCE[0]}")/lib.sh"
-
 load_versions
 load_deployment_env
-for command_name in chmod chown date docker mkdir mv sha256sum; do
-    require_command "${command_name}"
-done
-
-confirmation="${1:-}"
-[[ "${confirmation}" == "${NETWORK_ID}" ]] ||
-    die "refusing to reset Postgres: pass the exact network id (${NETWORK_ID})"
-
-require_service_running postgres
-wait_for_postgres_health
-
-resolved_data_root="$(data_root)"
-postgres_root="${resolved_data_root}/postgres"
-[[ "${resolved_data_root}" != / && "${postgres_root}" == "${resolved_data_root}/postgres" ]] ||
-    die "unsafe Postgres reset target: ${postgres_root}"
-[[ -d "${postgres_root}" ]] || die "Postgres data directory does not exist: ${postgres_root}"
-
-timestamp="$(date --utc +%Y%m%dT%H%M%SZ)"
-backup_root="${resolved_data_root}/backups/postgres-${timestamp}"
-mkdir -p -- "${backup_root}"
-chmod 0700 "${backup_root}"
-dump_path="${backup_root}/record.dump"
-
-info "backing up the current Postgres record"
-compose exec -T postgres \
-    pg_dump --username="${POSTGRES_USER}" --dbname="${POSTGRES_DB}" --format=custom \
-    >"${dump_path}"
-chmod 0600 "${dump_path}"
-sha256sum "${dump_path}" >"${dump_path}.sha256"
-chmod 0600 "${dump_path}.sha256"
-
-info "stopping only the extractor and Postgres; node and enforcer data are preserved"
-compose stop enforcer-extractor postgres
-
-old_cluster="${backup_root}/cluster"
-mv -- "${postgres_root}" "${old_cluster}"
-mkdir -- "${postgres_root}"
-chown "${PUID}:${PGID}" "${postgres_root}"
-chmod 0700 "${postgres_root}"
-
-marker="${resolved_data_root}/.deployment-accepted"
-if [[ -f "${marker}" ]]; then
-    mv -- "${marker}" "${backup_root}/deployment-accepted.before-reset"
+[[ "${1:-}" == "$NETWORK_ID" ]] || die "pass the exact network id: $NETWORK_ID"
+mode="${2:---prepare}"
+if [[ "$mode" == --prepare ]]; then
+    exec bash "${DEPLOYMENT_ROOT}/scripts/backup-record.sh" cutover
 fi
-
-info "Postgres record reset is staged; run 'just monitor-up' to migrate and backfill"
-info "recoverable backup: ${backup_root}"
+[[ "$mode" == --finalize ]] || die 'expected --prepare or --finalize ARCHIVE_NAME'
+archive="${3:-}"
+[[ "$archive" =~ ^cutover-[0-9]{8}T[0-9]{6}Z$ ]] || die 'expected the exact prepared cutover archive name'
+root="$(data_root)"
+backup="$root/backups/$archive"
+[[ -f "$backup/COMPLETE" && -f "$backup/OFFHOST_RESTORE_OK" ]] || die 'verified off-host restore receipt is required'
+service_is_running enforcer-extractor && die 'extractor must remain stopped since the final dump; prepare a new archive'
+[[ ! -e "$backup/cluster" ]] || die 'this archive was already finalized'
+(cd "$backup" && sha256sum --check SHA256SUMS)
+python3 - "$backup" <<'PY'
+import hashlib,json,sys
+from pathlib import Path
+p=Path(sys.argv[1])
+with (p/'record.dump').open('rb') as f: digest=hashlib.file_digest(f,'sha256').hexdigest()
+r=json.loads((p/'OFFHOST_RESTORE_OK').read_text())
+assert r['dump_sha256']==digest and r['validation']['schema']>=7, 'invalid off-host restore receipt'
+assert r['restored_at']>0 and r['restored_on'], 'missing off-host restore evidence'
+PY
+# A restarted writer after preparation invalidates the frozen archive even if
+# it was stopped again before this command.
+last_start="$(compose ps -a -q enforcer-extractor | xargs -r docker inspect --format '{{.State.StartedAt}}')"
+if [[ -n "$last_start" ]]; then
+    [[ "$(date -d "$last_start" +%s)" -le "$(stat -c %Y "$backup/record.dump")" ]] || die 'extractor restarted after archive; prepare again'
+fi
+postgres_root="$root/postgres"
+[[ "$root" != / && -d "$postgres_root" && ! -L "$postgres_root" ]] || die 'unsafe Postgres directory'
+compose stop postgres
+mv -- "$postgres_root" "$backup/cluster"
+mkdir -- "$postgres_root"
+chown "$PUID:$PGID" "$postgres_root"
+chmod 0700 "$postgres_root"
+if [[ -f "$root/.deployment-accepted" ]]; then
+    mv "$root/.deployment-accepted" "$backup/deployment-accepted.before-reset"
+fi
+info "new Postgres record staged; archived cluster and paired VERSIONS.lock: $backup"
+info "start only the reviewed v7 release; rollback must restore the archived cluster AND its old binaries"

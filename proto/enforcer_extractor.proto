@@ -18,6 +18,8 @@ message EnforcerEvent {
     WithdrawalBundleProposalsSnapshot withdrawal_bundle_proposals = 8;
     Bip300BlockDelta bip300_block_delta = 10;
     BmmRequestsSnapshot bmm_requests = 11;
+    MainchainTransition mainchain_transition = 12;
+    ConfirmedBmmFees confirmed_bmm_fees = 13;
   }
 }
 
@@ -53,8 +55,13 @@ message BlockHeader {
   // 32-byte previous block hash in conventional display order.
   bytes previous_hash = 2;
   uint32 height = 3;
-  // Total chain work as a 32-byte little-endian unsigned integer.
-  bytes chain_work = 4;
+  // v6 field 4 incorrectly contained per-block work. Never reuse it.
+  reserved 4;
+  reserved "chain_work";
+  // Proof contributed by this block, uint256 little-endian.
+  bytes block_work = 6;
+  // Absolute accumulated proof from genesis, uint256 little-endian.
+  bytes cumulative_work = 7;
   // Block timestamp in seconds since the Unix epoch.
   uint64 timestamp = 5;
 }
@@ -201,6 +208,8 @@ message ConfirmedBmmRequest {
 // not a complete transaction history: requests may enter and leave between
 // polls. The envelope is anchored to the same parent block recorded here.
 message BmmRequestsSnapshot {
+  string observer_session = 3;
+  uint64 mempool_generation = 4;
   // 32-byte parent block hash in conventional display order.
   bytes previous_mainchain_block_hash = 1;
   repeated BmmRequest requests = 2;
@@ -350,4 +359,28 @@ message BlockDisconnected {
   // 32-byte disconnected block hash in conventional display order.
   bytes block_hash = 1;
   uint32 sidechain_number = 2;
+}
+
+// Session/sequence describe observation order, not block height. A subscription
+// boundary records the beginning of evidence and carries no block header.
+message MainchainTransition {
+  string observer_session = 1;
+  uint64 sequence = 2;
+  // 3 = subscription boundary, 1 = connected, 2 = disconnected.
+  int32 action = 3;
+  BlockHeader header = 4;
+}
+
+// Independent enrichment: never changes an existing Bip300BlockDelta fact.
+message ConfirmedBmmFees {
+  BlockHeader header = 1;
+  repeated ConfirmedBmmFee fees = 2;
+  string source = 3;
+}
+message ConfirmedBmmFee {
+  uint32 sidechain_number = 1;
+  bytes txid = 2;
+  optional uint64 fee_sats = 3;
+  // Empty when fee_sats is known; otherwise explains missing historical data.
+  string unavailable_reason = 4;
 }

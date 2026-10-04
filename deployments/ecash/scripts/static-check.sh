@@ -273,12 +273,12 @@ grep -Fq 'history_fully_validated' "${DEPLOYMENT_ROOT}/scripts/accept.sh" ||
     die "accept.sh does not distinguish snapshot readiness from full historical validation"
 grep -Fq 'snapshot_transform' "${DEPLOYMENT_ROOT}/scripts/accept.sh" ||
     die "accept.sh does not record snapshot provenance"
-grep -Fq 'event.dataset_id = coverage.dataset_id' "${DEPLOYMENT_ROOT}/scripts/lib.sh" ||
+grep -Fq '(e.dataset_id,e.event_contract_version,e.source)=(c.dataset_id,c.event_contract_version,c.source)' "${DEPLOYMENT_ROOT}/scripts/lib.sh" ||
     die "history verification can alias facts from another dataset"
-grep -Fq 'event.event_contract_version = coverage.event_contract_version' \
+grep -Fq 'r.event_contract_version=:' \
     "${DEPLOYMENT_ROOT}/scripts/lib.sh" ||
     die "history verification can alias facts from another event contract"
-grep -Fq 'current_sidechain_instance current_instance' \
+grep -Fq 'current_sidechain_instance i' \
     "${DEPLOYMENT_ROOT}/scripts/lib.sh" ||
     die "slot-history verification is not scoped to the active instance"
 grep -Fq 'record_has_global_block bip300_block_delta' \
@@ -293,8 +293,8 @@ for invalid_kind in '' 3bip300_delta BIP300_delta bip300-delta 'bip300 delta'; d
         die "event kind validation accepted invalid value: ${invalid_kind}"
     fi
 done
-grep -Fq 'compose stop enforcer-extractor postgres' \
-    "${DEPLOYMENT_ROOT}/scripts/reset-record.sh" ||
+grep -Fq 'compose stop enforcer-extractor' \
+    "${DEPLOYMENT_ROOT}/scripts/backup-record.sh" ||
     die "reset-record.sh no longer preserves the node and enforcer services"
 if grep -nE 'rm .*(node|enforcer|postgres)' \
     "${DEPLOYMENT_ROOT}/scripts/reset-record.sh"; then

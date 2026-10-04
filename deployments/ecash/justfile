@@ -25,9 +25,12 @@ enforcer-up:
 monitor-up:
     ./scripts/monitor-up.sh
 
-# Back up and replace only the Postgres record; pass the exact network id.
-reset-record confirmation="":
-    ./scripts/reset-record.sh "{{ confirmation }}"
+# Freeze and archive the record; finalize only after a verified off-host restore.
+reset-record confirmation="" mode="--prepare" archive="":
+    ./scripts/reset-record.sh "{{ confirmation }}" "{{ mode }}" "{{ archive }}"
+
+backup-record:
+    bash ./scripts/backup-record.sh daily
 
 # Download, verify, and load the pinned AssumeUTXO snapshot.
 snapshot:

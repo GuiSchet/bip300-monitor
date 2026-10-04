@@ -126,16 +126,15 @@ observer_repo="${ENFORCER_OBSERVER_REPO_PATH:-${DEFAULT_OBSERVER_REPO}}"
 if git -C "${observer_repo}" rev-parse --git-dir >/dev/null 2>&1; then
     git -C "${observer_repo}" cat-file -e "${observer_commit}^{commit}" 2>/dev/null ||
         die "observer commit ${observer_commit} is absent from ${observer_repo}"
-    observer_parent="$(git -C "${observer_repo}" rev-parse "${observer_commit}^")"
-    [[ "${observer_parent}" == "${base_commit}" ]] ||
-        die "observer ${observer_commit} has parent ${observer_parent}, expected official base ${base_commit}"
+    git -C "${observer_repo}" merge-base --is-ancestor "${base_commit}" "${observer_commit}" ||
+        die "observer ${observer_commit} does not descend from official base ${base_commit}"
     while read -r _ proto_path; do
         cmp -s \
             <(git -C "${observer_repo}" show "${observer_commit}:proto/${proto_path}") \
             "${PROTO_ROOT}/${proto_path}" ||
             die "vendored ${proto_path} differs from observer commit ${observer_commit}"
     done <<<"${recorded_checksums}"
-    info "local observer commit and direct parent verified in ${observer_repo}"
+    info "local observer commit and official-base ancestry verified in ${observer_repo}"
 else
     info "observer checkout not present; reproducibility verified from the checked-in patch"
 fi

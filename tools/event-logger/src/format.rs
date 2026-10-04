@@ -51,6 +51,28 @@ pub fn render(event: &Event, full_events: bool) -> Result<RenderedEvent> {
 
 fn summarize(payload: &events::enforcer_event::Event) -> Result<String> {
     match payload {
+        events::enforcer_event::Event::MainchainTransition(event) => {
+            if let Some(header) = &event.header {
+                validate_header(header)?;
+            }
+            Ok(format!(
+                "session={} sequence={} action={}",
+                event.observer_session, event.sequence, event.action
+            ))
+        }
+        events::enforcer_event::Event::ConfirmedBmmFees(event) => {
+            validate_header(
+                event
+                    .header
+                    .as_ref()
+                    .context("fee enrichment missing header")?,
+            )?;
+            Ok(format!(
+                "confirmed_bmm_fees={} source={}",
+                event.fees.len(),
+                event.source
+            ))
+        }
         events::enforcer_event::Event::ChainInfo(chain_info) => {
             let network = events::Network::try_from(chain_info.network)
                 .context("chain info contains an unknown network value")?;
@@ -287,7 +309,8 @@ fn validate_bmm_requests(snapshot: &events::BmmRequestsSnapshot) -> Result<()> {
 fn validate_header(header: &events::BlockHeader) -> Result<()> {
     require_32_bytes(&header.hash, "block_header.hash")?;
     require_32_bytes(&header.previous_hash, "block_header.previous_hash")?;
-    require_32_bytes(&header.chain_work, "block_header.chain_work")
+    require_32_bytes(&header.block_work, "block_header.block_work")?;
+    require_32_bytes(&header.cumulative_work, "block_header.cumulative_work")
 }
 
 fn validate_proposal(proposal: &events::SidechainProposal) -> Result<()> {
@@ -400,7 +423,8 @@ mod tests {
             hash: vec![byte; 32],
             previous_hash: vec![byte.wrapping_sub(1); 32],
             height: 42,
-            chain_work: vec![2; 32],
+            block_work: vec![1; 32],
+            cumulative_work: vec![2; 32],
             timestamp: 1_700_000_000,
         }
     }

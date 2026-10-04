@@ -38,6 +38,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../schema/0005_event_fact_identity.sql"),
     include_str!("../schema/0006_worker_health_and_observation_order.sql"),
     include_str!("../schema/0007_single_active_run.sql"),
+    include_str!("../schema/0008_observation_quality.sql"),
 ];
 
 /// Advisory-lock key that serializes the migration of one record.
@@ -279,6 +280,8 @@ pub enum CaptureMethod {
 pub enum ExtractorWorker {
     MainchainTip,
     BmmRequests,
+    MainchainEvents,
+    ConfirmedBmmFees,
 }
 
 impl ExtractorWorker {
@@ -286,6 +289,8 @@ impl ExtractorWorker {
         match self {
             Self::MainchainTip => "mainchain_tip",
             Self::BmmRequests => "bmm_requests",
+            Self::MainchainEvents => "mainchain_events",
+            Self::ConfirmedBmmFees => "confirmed_bmm_fees",
         }
     }
 }
@@ -309,6 +314,8 @@ impl SnapshotConsistency {
 /// Provenance shared by every event captured in one unary snapshot.
 #[derive(Clone, Debug)]
 pub struct SnapshotMetadata {
+    pub revision_before: Option<String>,
+    pub revision_after: Option<String>,
     pub started_at: SystemTime,
     pub finished_at: SystemTime,
     pub tip_before: ObservedBlock,
@@ -469,6 +476,25 @@ impl Store {
             run_id: String::new(),
             event_contract_version: 0,
         };
+        if manifest.event_contract_version >= 7 {
+            let client = store.client.lock().await;
+            let exists: bool = client
+                .query_one("SELECT to_regclass('dataset_manifest') IS NOT NULL", &[])
+                .await?
+                .get(0);
+            if exists {
+                let incompatible: bool = client.query_one(
+                    "SELECT EXISTS(SELECT 1 FROM dataset_manifest WHERE network_id=$1 AND activation_height=$2
+                        AND activation_block_hash=$3 AND initial_event_contract_version<>7)",
+                    &[&manifest.network_id,&height_to_i32(manifest.activation_height)?,&manifest.activation_block_hash],
+                ).await?.get(0);
+                if incompatible {
+                    bail!(
+                        "event contract v7 requires a fresh v7 dataset; no migrations were applied"
+                    );
+                }
+            }
+        }
         store.migrate().await?;
         let (dataset_id, run_id) = store.initialize_identity(&manifest).await?;
         Ok(Self {
@@ -514,24 +540,20 @@ impl Store {
             .await
             .context("resolving the record dataset identity")?
             .get(0);
-        if manifest.event_contract_version >= 6 {
+        if manifest.event_contract_version >= 7 {
             let incompatible: bool = transaction
                 .query_one(
-                    "SELECT initial_event_contract_version < 6
-                            AND EXISTS (
-                                SELECT 1 FROM sidechain_instance
-                                 WHERE dataset_id = $1::text::uuid
-                            )
+                    "SELECT initial_event_contract_version <> 7
                        FROM dataset_manifest
                       WHERE dataset_id = $1::text::uuid",
                     &[&dataset_id],
                 )
                 .await
-                .context("checking the v6 dataset compatibility boundary")?
+                .context("checking the v7 dataset compatibility boundary")?
                 .get(0);
             if incompatible {
                 bail!(
-                    "event contract v6 cannot extend a pre-v6 dataset; create a recoverable record backup and start an empty dataset"
+                    "event contract v7 requires a fresh v7 dataset; create a recoverable record backup and start an empty dataset"
                 );
             }
         }
@@ -568,6 +590,24 @@ impl Store {
             .await
             .context("starting an extractor run")?
             .get(0);
+        // A new subscription starts at the current tip: it cannot replay live
+        // transitions missed between processes, even after a clean shutdown.
+        if self.source == "enforcer" && manifest.event_contract_version >= 7 {
+            transaction
+                .execute(
+                    "INSERT INTO observation_failure(dataset_id, run_id, worker, error)
+                     SELECT $1::text::uuid, $2::text::uuid, 'mainchain_events',
+                            'subscription restarted after run ' || run_id::text ||
+                            '; offline transitions are unknown (no replay continuity)'
+                       FROM extractor_run
+                      WHERE dataset_id = $1::text::uuid AND source = $3
+                        AND run_id <> $2::text::uuid
+                      ORDER BY started_at DESC, run_id DESC LIMIT 1",
+                    &[&dataset_id, &run_id, &self.source],
+                )
+                .await
+                .context("recording the subscription restart gap")?;
+        }
         transaction
             .execute(
                 "INSERT INTO extractor_status (dataset_id, source, run_id)
@@ -684,7 +724,10 @@ impl Store {
             return Ok(0);
         }
 
+        let queued_at = std::time::Instant::now();
         let mut client = self.client.lock().await;
+        let writer_wait_ms = queued_at.elapsed().as_millis() as u64;
+        let transaction_started = std::time::Instant::now();
         let transaction = client
             .transaction()
             .await
@@ -726,6 +769,13 @@ impl Store {
             .await
             .context("committing a record transaction")?;
 
+        tracing::info!(
+            writer_wait_ms,
+            transaction_ms = transaction_started.elapsed().as_millis() as u64,
+            events = events.len(),
+            inserted,
+            "record transaction committed"
+        );
         Ok(inserted)
     }
 
@@ -741,6 +791,16 @@ impl Store {
         }
         require_hash(&metadata.tip_before.hash, "snapshot tip before")?;
         require_hash(&metadata.tip_after.hash, "snapshot tip after")?;
+        if metadata.consistency == SnapshotConsistency::Stable
+            && (metadata.tip_before != metadata.tip_after
+                || metadata
+                    .revision_before
+                    .as_ref()
+                    .is_none_or(String::is_empty)
+                || metadata.revision_before != metadata.revision_after)
+        {
+            bail!("stable snapshot requires one tip and one explicit chain revision");
+        }
         let tip_before_height = height_to_i32(required_height(
             &metadata.tip_before,
             "snapshot tip before",
@@ -762,8 +822,8 @@ impl Store {
                 "INSERT INTO snapshot_group
                     (dataset_id, run_id, capture_method, started_at, finished_at,
                      tip_before_hash, tip_before_height, tip_after_hash,
-                     tip_after_height, consistency, attempts)
-                 VALUES ($1::text::uuid, $2::text::uuid, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+                     tip_after_height, consistency, attempts, revision_before, revision_after)
+                 VALUES ($1::text::uuid, $2::text::uuid, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
                  RETURNING snapshot_group_id::text",
                 &[
                     &self.dataset_id,
@@ -777,6 +837,8 @@ impl Store {
                     &tip_after_height,
                     &metadata.consistency.as_str(),
                     &attempts,
+                    &metadata.revision_before,
+                    &metadata.revision_after,
                 ],
             )
             .await
@@ -935,6 +997,14 @@ impl Store {
             .await
             .with_context(|| format!("recording {} worker failure", worker.as_str()))?
             .with_context(|| format!("{} worker status was not initialized", worker.as_str()))?;
+        transaction
+            .execute(
+                "INSERT INTO observation_failure(dataset_id,run_id,worker,error)
+             VALUES($1::text::uuid,$2::text::uuid,$3,$4)",
+                &[&self.dataset_id, &self.run_id, &worker.as_str(), &error],
+            )
+            .await
+            .context("recording observation failure evidence")?;
         let failures: i32 = row.get(0);
         recompute_extractor_error(&transaction, &self.dataset_id, self.source, &self.run_id)
             .await?;
@@ -1101,6 +1171,160 @@ impl Store {
         row.map(history_coverage_from_row).transpose()
     }
 
+    /// New facts have priority over daily retries of unavailable historical fees.
+    pub async fn next_fee_block(&self) -> Result<Option<(i64, ObservedBlock)>> {
+        let client = self.client.lock().await;
+        let row = client.query_opt(
+            "WITH next AS (SELECT id,block_hash,height FROM event
+              WHERE dataset_id=$1::text::uuid AND event_contract_version=$2 AND source=$3 AND kind='bip300_block_delta'
+                AND id>COALESCE((SELECT max(source_event_id) FROM bmm_fee_job
+                    WHERE dataset_id=$1::text::uuid AND event_contract_version=$2 AND source=$3),0)
+              ORDER BY id LIMIT 1), retry AS (
+                SELECT e.id,e.block_hash,e.height FROM bmm_fee_job j JOIN event e ON e.id=j.source_event_id
+                 WHERE j.dataset_id=$1::text::uuid AND j.event_contract_version=$2 AND j.source=$3 AND j.next_retry_at<=now()
+                 ORDER BY j.next_retry_at LIMIT 1)
+             SELECT * FROM next UNION ALL SELECT * FROM retry WHERE NOT EXISTS(SELECT 1 FROM next)",
+            &[&self.dataset_id,&self.event_contract_version,&self.source],
+        ).await?;
+        row.map(|r| {
+            Ok((
+                r.get(0),
+                ObservedBlock::at_height(r.get(1), u32::try_from(r.get::<_, i32>(2))?),
+            ))
+        })
+        .transpose()
+    }
+
+    pub async fn record_fee_enrichment(&self, source_event_id: i64, event: &Event) -> Result<()> {
+        use crate::protobuf::enforcer_extractor::enforcer_event::Event as Payload;
+        let Some(MonitorEvent::Enforcer(payload)) = &event.monitor_event else {
+            bail!("missing fee payload");
+        };
+        let Some(Payload::ConfirmedBmmFees(fees)) = &payload.event else {
+            bail!("expected confirmed fees");
+        };
+        let header = fees.header.as_ref().context("fee header missing")?;
+        let unavailable = fees.fees.iter().any(|f| f.fee_sats.is_none());
+        let mut client = self.client.lock().await;
+        let tx = client.transaction().await?;
+        let source = tx.query_opt(
+            "SELECT envelope FROM event WHERE id=$1 AND dataset_id=$2::text::uuid AND event_contract_version=$3
+               AND source=$4 AND kind='bip300_block_delta' AND block_hash=$5 AND height=$6",
+            &[&source_event_id,&self.dataset_id,&self.event_contract_version,&self.source,&header.hash,&height_to_i32(header.height)?],
+        ).await?.context("fee enrichment does not match its source block")?;
+        let bytes: Vec<u8> = source.get(0);
+        let source = Event::decode(bytes.as_slice())?;
+        let Some(MonitorEvent::Enforcer(source)) = source.monitor_event else {
+            bail!("invalid source envelope");
+        };
+        let Some(Payload::Bip300BlockDelta(delta)) = source.event else {
+            bail!("invalid source delta");
+        };
+        let expected: std::collections::BTreeSet<_> = delta
+            .confirmed_bmm_requests
+            .iter()
+            .map(|r| (r.sidechain_number, &r.txid))
+            .collect();
+        let actual: std::collections::BTreeSet<_> = fees
+            .fees
+            .iter()
+            .map(|r| (r.sidechain_number, &r.txid))
+            .collect();
+        if delta.header.as_ref() != Some(header)
+            || expected != actual
+            || actual.len() != fees.fees.len()
+        {
+            bail!("fee enrichment changes its source header or confirmed request identities");
+        }
+        let sequence = reserve_capture_sequences(&tx, &self.run_id, 1).await?;
+        insert(
+            &tx,
+            self.source,
+            &self.dataset_id,
+            &self.run_id,
+            self.event_contract_version,
+            CaptureMethod::Backfill,
+            None,
+            None,
+            None,
+            sequence,
+            event,
+            &mut BTreeMap::new(),
+        )
+        .await?;
+        tx.execute("INSERT INTO bmm_fee_job(dataset_id,event_contract_version,source,source_event_id,next_retry_at)
+                    VALUES($1::text::uuid,$2,$3,$4,CASE WHEN $5 THEN now()+interval '24 hours' END)
+                    ON CONFLICT(dataset_id,event_contract_version,source,source_event_id) DO UPDATE
+                    SET last_observed_at=now(),next_retry_at=excluded.next_retry_at",
+            &[&self.dataset_id,&self.event_contract_version,&self.source,&source_event_id,&unavailable]).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Only certified prefixes can terminate a repair; a live fact cannot.
+    pub async fn certified_history_floor(
+        &self,
+        stream: &str,
+        sidechain: Option<u8>,
+        instance: Option<&str>,
+        hashes: &[Vec<u8>],
+    ) -> Result<Option<ObservedBlock>> {
+        let sidechain = sidechain.map(i16::from);
+        let client = self.client.lock().await;
+        let row = client
+            .query_opt(
+                "SELECT block_hash,height FROM history_certified_block
+             WHERE dataset_id=$1::text::uuid AND event_contract_version=$2 AND source=$3
+               AND stream=$4 AND sidechain IS NOT DISTINCT FROM $5
+               AND sidechain_instance_id IS NOT DISTINCT FROM $6
+               AND block_hash=ANY($7) ORDER BY height DESC LIMIT 1",
+                &[
+                    &self.dataset_id,
+                    &self.event_contract_version,
+                    &self.source,
+                    &stream,
+                    &sidechain,
+                    &instance,
+                    &hashes,
+                ],
+            )
+            .await
+            .context("finding a certified history prefix")?;
+        row.map(|r| {
+            Ok(ObservedBlock::at_height(
+                r.get(0),
+                u32::try_from(r.get::<_, i32>(1))?,
+            ))
+        })
+        .transpose()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn set_history_floor(
+        &self,
+        stream: &str,
+        sidechain: Option<u8>,
+        instance: Option<&str>,
+        cursor: &ObservedBlock,
+        floor_hash: Option<&[u8]>,
+        floor_height: Option<u32>,
+    ) -> Result<()> {
+        let sidechain = sidechain.map(i16::from);
+        let height = floor_height.map(height_to_i32).transpose()?;
+        let client = self.client.lock().await;
+        let rows = client.execute(
+            "UPDATE history_coverage SET floor_hash=$8,floor_height=$9,updated_at=now()
+              WHERE dataset_id=$1::text::uuid AND event_contract_version=$2 AND source=$3
+                AND stream=$4 AND sidechain IS NOT DISTINCT FROM $5
+                AND sidechain_instance_id IS NOT DISTINCT FROM $6 AND next_hash=$7 AND status='running'",
+            &[&self.dataset_id,&self.event_contract_version,&self.source,&stream,&sidechain,&instance,&cursor.hash,&floor_hash,&height],
+        ).await?;
+        if rows != 1 {
+            bail!("history cursor changed while setting the certified floor");
+        }
+        Ok(())
+    }
+
     /// Start a new backwards walk while preserving the cumulative inserted-row
     /// count from earlier completed walks.
     #[allow(clippy::too_many_arguments)]
@@ -1142,8 +1366,8 @@ impl Store {
                      $12, $13, $10, $11, 'running', $14, NULL, now(), now(), NULL)
                  ON CONFLICT ON CONSTRAINT history_coverage_identity DO UPDATE SET
                     coverage_start_height = EXCLUDED.coverage_start_height,
-                    covered_tip_hash = EXCLUDED.covered_tip_hash,
-                    covered_tip_height = EXCLUDED.covered_tip_height,
+                    covered_tip_hash = COALESCE(EXCLUDED.covered_tip_hash, history_coverage.covered_tip_hash),
+                    covered_tip_height = COALESCE(EXCLUDED.covered_tip_height, history_coverage.covered_tip_height),
                     target_tip_hash = EXCLUDED.target_tip_hash,
                     target_tip_height = EXCLUDED.target_tip_height,
                     floor_hash = EXCLUDED.floor_hash,
@@ -1202,9 +1426,12 @@ impl Store {
         let sidechain = page.sidechain.map(i16::from);
         let expected_height = required_height(page.expected_next, "history page cursor")?;
         let expected_height = height_to_i32(expected_height)?;
-        let (next_hash, next_height) = optional_block_parts(page.next)?;
+        let (mut next_hash, mut next_height) = optional_block_parts(page.next)?;
 
+        let queued_at = std::time::Instant::now();
         let mut client = self.client.lock().await;
+        let writer_wait_ms = queued_at.elapsed().as_millis() as u64;
+        let transaction_started = std::time::Instant::now();
         let transaction = client
             .transaction()
             .await
@@ -1237,17 +1464,27 @@ impl Store {
             .await?;
         }
         let inserted_i64 = i64::try_from(inserted).context("history page insert count overflow")?;
-        let complete = page.next.is_none();
+        let conflict: bool = transaction.query_one(
+            "SELECT EXISTS(SELECT 1 FROM event_conflict c JOIN event e ON e.id=c.first_event_id
+                WHERE e.dataset_id=$1::text::uuid AND e.event_contract_version=$2 AND e.source=$3
+                  AND e.kind=CASE $4::text WHEN 'block' THEN 'block_connected' ELSE 'bip300_block_delta' END
+                  AND e.sidechain IS NOT DISTINCT FROM $5 AND e.sidechain_instance_id IS NOT DISTINCT FROM $6)",
+            &[&self.dataset_id,&self.event_contract_version,&self.source,&page.stream,&sidechain,&page.sidechain_instance_id],
+        ).await?.get(0);
+        let complete = page.next.is_none() && !conflict;
+        if conflict {
+            (next_hash, next_height) = optional_block_parts(Some(page.expected_next))?;
+        }
         let updated = transaction
             .execute(
                 "UPDATE history_coverage
                     SET next_hash = $7,
                         next_height = $8,
-                        status = CASE WHEN $9 THEN 'complete' ELSE 'running' END,
+                        status = CASE WHEN $13 THEN 'error' WHEN $9 THEN 'complete' ELSE 'running' END,
                         covered_tip_hash = CASE WHEN $9 THEN target_tip_hash ELSE covered_tip_hash END,
                         covered_tip_height = CASE WHEN $9 THEN target_tip_height ELSE covered_tip_height END,
                         rows_recorded = rows_recorded + $10,
-                        last_error = NULL,
+                        last_error = CASE WHEN $13 THEN 'conflicting immutable block facts' ELSE NULL END,
                         updated_at = now(),
                         completed_at = CASE WHEN $9 THEN now() ELSE NULL END
                   WHERE dataset_id = $1::text::uuid AND source = $2 AND stream = $3
@@ -1269,6 +1506,7 @@ impl Store {
                     &inserted_i64,
                     &page.sidechain_instance_id,
                     &self.event_contract_version,
+                    &conflict,
                 ],
             )
             .await
@@ -1283,6 +1521,16 @@ impl Store {
             .commit()
             .await
             .context("committing a historical page transaction")?;
+        if conflict {
+            bail!("conflicting immutable block facts retained; history certification suspended");
+        }
+        tracing::info!(
+            writer_wait_ms,
+            transaction_ms = transaction_started.elapsed().as_millis() as u64,
+            events = events.len(),
+            inserted,
+            "record transaction committed"
+        );
         Ok(inserted)
     }
 
@@ -1469,56 +1717,11 @@ impl Store {
         Ok(())
     }
 
-    /// Newest recorded block of one kind for one sidechain slot.
-    ///
-    /// The hash is what a range backfill needs as its starting point; the
-    /// height only bounds how much it may ask for.
-    pub async fn last_recorded_block(
-        &self,
-        kind: &str,
-        sidechain: u8,
-        sidechain_instance_id: &str,
-    ) -> Result<Option<(Vec<u8>, u32)>> {
-        let sidechain = i16::from(sidechain);
-        let client = self.client.lock().await;
-        let row = client
-            .query_opt(
-                "SELECT block_hash, height FROM event
-                 WHERE dataset_id = $1::text::uuid AND source = $2 AND kind = $3 AND sidechain = $4
-                   AND sidechain_instance_id = $5
-                   AND event_contract_version = $6
-                   AND block_hash IS NOT NULL AND height IS NOT NULL
-                 ORDER BY height DESC
-                 LIMIT 1",
-                &[
-                    &self.dataset_id,
-                    &self.source,
-                    &kind,
-                    &sidechain,
-                    &sidechain_instance_id,
-                    &self.event_contract_version,
-                ],
-            )
-            .await
-            .with_context(|| {
-                format!("reading the last recorded {kind} block for sidechain {sidechain}")
-            })?;
-
-        let Some(row) = row else {
-            return Ok(None);
-        };
-        let hash: Vec<u8> = row.get(0);
-        let height: i32 = row.get(1);
-        let height = u32::try_from(height)
-            .with_context(|| format!("recorded height {height} is negative"))?;
-
-        Ok(Some((hash, height)))
-    }
-
     /// Height of the newest recorded event of one kind for one sidechain slot.
     ///
-    /// This is the backfill checkpoint: because the record is written before
-    /// anything is published, it cannot claim an event that was not stored.
+    /// Diagnostic maximum only. Live delivery may leave older holes; the
+    /// resumable backfill checkpoint is history_coverage.
+    #[cfg(feature = "postgres_integration_tests")]
     pub async fn last_recorded_height(
         &self,
         kind: &str,
@@ -1664,6 +1867,18 @@ async fn insert(
     instance_cache: &mut BTreeMap<i16, String>,
 ) -> Result<u64> {
     let facts = facts(event).context("describing an event for the record")?;
+    let previous_hash = match event.monitor_event.as_ref() {
+        Some(MonitorEvent::Enforcer(payload)) => match payload.event.as_ref() {
+            Some(crate::protobuf::enforcer_extractor::enforcer_event::Event::BlockConnected(b)) => {
+                b.header.as_ref().map(|h| &h.previous_hash)
+            }
+            Some(crate::protobuf::enforcer_extractor::enforcer_event::Event::Bip300BlockDelta(
+                b,
+            )) => b.header.as_ref().map(|h| &h.previous_hash),
+            _ => None,
+        },
+        _ => None,
+    };
     let payload = json::render(event).context("rendering an event payload as JSON")?;
     let envelope = event.encode_to_vec();
     let envelope_sha256 = Sha256::digest(&envelope).to_vec();
@@ -1672,7 +1887,22 @@ async fn insert(
         None => bail!("event envelope does not contain a monitor event"),
     };
     let observed_at = SystemTime::UNIX_EPOCH + Duration::from_millis(event.timestamp);
-    update_sidechain_instances(transaction, dataset_id, event, observed_at, instance_cache).await?;
+    let authoritative = match snapshot_group_id {
+        Some(group) => transaction.query_one(
+            "SELECT consistency = 'stable' FROM snapshot_group WHERE snapshot_group_id = $1::text::uuid",
+            &[&group],
+        ).await?.get::<_, bool>(0),
+        None => true,
+    };
+    update_sidechain_instances(
+        transaction,
+        dataset_id,
+        event,
+        observed_at,
+        instance_cache,
+        authoritative,
+    )
+    .await?;
     let sidechain_instance_id = match (
         facts.sidechain,
         explicit_sidechain,
@@ -1719,9 +1949,9 @@ async fn insert(
                  INSERT INTO event
                      (dataset_id, observed_at, source, kind, sidechain, block_hash,
                       height, envelope, payload, envelope_sha256,
-                      sidechain_instance_id, event_contract_version, fact_sha256)
+                      sidechain_instance_id, event_contract_version, fact_sha256, previous_hash)
                  VALUES ($1::text::uuid, $2, $3, $4, $5, $6, $7, $8, $9,
-                         $10, $11, $12, $17)
+                         $10, $11, $12, $17, $18)
                  ON CONFLICT ON CONSTRAINT event_identity DO NOTHING
                  RETURNING id
              ), resolved_fact AS MATERIALIZED (
@@ -1768,6 +1998,7 @@ async fn insert(
                 &method.as_str(),
                 &snapshot_group_id,
                 &fact_sha256,
+                &previous_hash,
             ],
         )
         .await
@@ -1781,6 +2012,7 @@ async fn update_sidechain_instances(
     event: &Event,
     observed_at: SystemTime,
     instance_cache: &mut BTreeMap<i16, String>,
+    authoritative: bool,
 ) -> Result<()> {
     let Some(MonitorEvent::Enforcer(payload)) = event.monitor_event.as_ref() else {
         return Ok(());
@@ -1792,13 +2024,15 @@ async fn update_sidechain_instances(
         return Ok(());
     };
 
-    transaction
-        .execute(
-            "DELETE FROM current_sidechain_instance WHERE dataset_id = $1::text::uuid",
-            &[&dataset_id],
-        )
-        .await
-        .context("resetting the current sidechain-instance map")?;
+    if authoritative {
+        transaction
+            .execute(
+                "DELETE FROM current_sidechain_instance WHERE dataset_id = $1::text::uuid",
+                &[&dataset_id],
+            )
+            .await
+            .context("resetting the current sidechain-instance map")?;
+    }
     instance_cache.clear();
     for sidechain in &snapshot.sidechains {
         let slot = i16::try_from(sidechain.sidechain_number).with_context(|| {
@@ -1835,20 +2069,22 @@ async fn update_sidechain_instances(
             )
             .await
             .context("recording a sidechain instance")?;
-        transaction
-            .execute(
-                "INSERT INTO current_sidechain_instance
+        if authoritative {
+            transaction
+                .execute(
+                    "INSERT INTO current_sidechain_instance
                     (dataset_id, sidechain, sidechain_instance_id, observed_at)
                  VALUES ($1::text::uuid, $2, $3, $4)",
-                &[
-                    &dataset_id,
-                    &slot,
-                    &instance.sidechain_instance_id,
-                    &observed_at,
-                ],
-            )
-            .await
-            .context("recording the current sidechain instance")?;
+                    &[
+                        &dataset_id,
+                        &slot,
+                        &instance.sidechain_instance_id,
+                        &observed_at,
+                    ],
+                )
+                .await
+                .context("recording the current sidechain instance")?;
+        }
         instance_cache.insert(slot, instance.sidechain_instance_id);
     }
     Ok(())

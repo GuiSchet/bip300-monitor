@@ -1,0 +1,6 @@
+[Unit]
+Description=Alert when verified off-host record backup is older than 48 hours
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /opt/bip300-monitor/deployments/ecash/scripts/backup-health.py /srv/bip300-monitor/betanet/backups

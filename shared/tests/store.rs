@@ -137,7 +137,8 @@ fn chain_tip(hash: u8, height: u32) -> events::enforcer_event::Event {
             hash: vec![hash; 32],
             previous_hash: vec![hash.wrapping_sub(1); 32],
             height,
-            chain_work: vec![0x44; 32],
+            block_work: vec![1; 32],
+            cumulative_work: vec![0x44; 32],
             timestamp: 1_750_000_000,
         }),
     })
@@ -145,6 +146,8 @@ fn chain_tip(hash: u8, height: u32) -> events::enforcer_event::Event {
 
 fn bmm_requests(parent: u8, bid_sats: u64) -> events::enforcer_event::Event {
     events::enforcer_event::Event::BmmRequests(events::BmmRequestsSnapshot {
+        observer_session: "test-session".into(),
+        mempool_generation: 1,
         previous_mainchain_block_hash: vec![parent; 32],
         requests: vec![events::BmmRequest {
             sidechain_number: 9,
@@ -217,7 +220,8 @@ fn connected(sidechain_number: u32, height: u32, hash: u8) -> events::enforcer_e
             hash: vec![hash; 32],
             previous_hash: vec![hash.wrapping_sub(1); 32],
             height,
-            chain_work: vec![0x44; 32],
+            block_work: vec![1; 32],
+            cumulative_work: vec![0x44; 32],
             timestamp: 1_750_000_000,
         }),
         sidechain_number,
@@ -365,10 +369,24 @@ async fn a_new_start_closes_an_orphaned_run_before_claiming_the_dataset() {
         .expect("query reconciled runs");
     assert_eq!(counts.get::<_, i64>(0), 1);
     assert_eq!(counts.get::<_, i64>(1), 1);
+    let gaps = client
+        .query_one(
+            "SELECT count(*) FROM observation_failure f JOIN extractor_run r USING (run_id)
+             WHERE f.worker = 'mainchain_events' AND r.status = 'running'
+               AND f.error LIKE '%offline transitions are unknown%'",
+            &[],
+        )
+        .await
+        .expect("query the restart discontinuity");
+    assert_eq!(
+        gaps.get::<_, i64>(0),
+        1,
+        "one gap, only on the replacement run"
+    );
 }
 
 #[tokio::test]
-async fn v6_refuses_to_mix_corrected_sidechain_identities_into_a_legacy_dataset() {
+async fn v7_refuses_to_reuse_an_older_contract_dataset() {
     let test = "v6_identity_boundary";
     let admin_url = std::env::var("BIP300_MONITOR_TEST_POSTGRES_URL").unwrap();
     let (admin, connection) = tokio_postgres::connect(&admin_url, tokio_postgres::NoTls)
@@ -406,13 +424,13 @@ async fn v6_refuses_to_mix_corrected_sidechain_identities_into_a_legacy_dataset(
         .expect("seed legacy sidechain identities");
 
     let error = match Store::connect(&args_for(&admin_url, &database), "enforcer").await {
-        Ok(_) => panic!("v6 must require a fresh dataset after legacy identities exist"),
+        Ok(_) => panic!("v7 must require a fresh dataset after legacy identities exist"),
         Err(error) => error,
     };
     assert!(
         error
             .to_string()
-            .contains("event contract v6 cannot extend a pre-v6 dataset"),
+            .contains("event contract v7 requires a fresh v7 dataset"),
         "unexpected error: {error:#}"
     );
 }
@@ -1436,6 +1454,8 @@ async fn a_stable_bmm_observation_proves_one_parent_in_payload_anchor_and_snapsh
     let store = store_for(test, "enforcer").await;
     let parent = ObservedBlock::at_height(vec![0xdd; 32], 967_700);
     let metadata = SnapshotMetadata {
+        revision_before: Some("test:1".into()),
+        revision_after: Some("test:1".into()),
         started_at: SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000),
         finished_at: SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_001),
         tip_before: parent.clone(),
@@ -1489,4 +1509,351 @@ async fn a_stable_bmm_observation_proves_one_parent_in_payload_anchor_and_snapsh
         .expect("verify stable BMM parent proof")
         .get(0);
     assert!(verified);
+}
+
+fn block_event(height: u32, hash: u8, parent: u8) -> Event {
+    let mut payload = connected(9, height, hash);
+    if let events::enforcer_event::Event::BlockConnected(block) = &mut payload {
+        block.header.as_mut().unwrap().previous_hash = vec![parent; 32];
+    }
+    envelope(
+        payload,
+        Some(ObservedBlock::at_height(vec![hash; 32], height)),
+        1_700_000_000_000 + u64::from(height),
+    )
+}
+
+#[tokio::test]
+async fn a_reorg_preserves_old_proof_and_joins_only_a_certified_prefix() {
+    let store = store_for("certified_reorg", "enforcer").await;
+    let id = instance_id(9);
+    let old_tip = ObservedBlock::at_height(vec![104; 32], 104);
+    store
+        .begin_history_cycle(
+            "block",
+            Some(9),
+            Some(&id),
+            101,
+            None,
+            &old_tip,
+            None,
+            Some(100),
+            128,
+        )
+        .await
+        .unwrap();
+    let events = (101..=104)
+        .map(|h| block_event(h, h as u8, h as u8 - 1))
+        .collect::<Vec<_>>();
+    store
+        .record_history_page(
+            &events,
+            HistoryPage {
+                stream: "block",
+                sidechain: Some(9),
+                sidechain_instance_id: Some(&id),
+                expected_next: &old_tip,
+                next: None,
+            },
+        )
+        .await
+        .unwrap();
+    // A live fact with no proven prefix must never serve as a repair floor.
+    store.record(&[block_event(200, 200, 199)]).await.unwrap();
+    let fork = ObservedBlock::at_height(vec![170; 32], 104);
+    let progress = store
+        .begin_history_cycle(
+            "block",
+            Some(9),
+            Some(&id),
+            101,
+            None,
+            &fork,
+            None,
+            Some(100),
+            128,
+        )
+        .await
+        .unwrap();
+    assert_eq!(progress.covered_tip, Some(old_tip));
+    assert_eq!(progress.status, HistoryStatus::Running);
+    let floor = store
+        .certified_history_floor(
+            "block",
+            Some(9),
+            Some(&id),
+            &[vec![200; 32], vec![170; 32], vec![103; 32]],
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(floor.height, Some(103));
+    store
+        .record_history_page(
+            &[block_event(104, 170, 103)],
+            HistoryPage {
+                stream: "block",
+                sidechain: Some(9),
+                sidechain_instance_id: Some(&id),
+                expected_next: &fork,
+                next: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .history_coverage("block", Some(9), Some(&id))
+            .await
+            .unwrap()
+            .unwrap()
+            .covered_tip,
+        Some(fork)
+    );
+    let client = query_client("certified_reorg").await;
+    assert_eq!(
+        client
+            .query_one("SELECT count(*) FROM history_certified_block", &[])
+            .await
+            .unwrap()
+            .get::<_, i64>(0),
+        5
+    );
+}
+
+#[tokio::test]
+async fn conflicting_block_payloads_survive_a_failed_history_certification() {
+    let store = store_for("durable_conflict", "enforcer").await;
+    let id = instance_id(9);
+    let target = ObservedBlock::at_height(vec![104; 32], 104);
+    let first = block_event(104, 104, 103);
+    store.record(std::slice::from_ref(&first)).await.unwrap();
+    let mut conflicting = first;
+    if let Some(MonitorEvent::Enforcer(payload)) = &mut conflicting.monitor_event
+        && let Some(events::enforcer_event::Event::BlockConnected(block)) = &mut payload.event
+    {
+        block.header.as_mut().unwrap().timestamp += 1;
+    }
+    store
+        .begin_history_cycle(
+            "block",
+            Some(9),
+            Some(&id),
+            104,
+            None,
+            &target,
+            None,
+            Some(103),
+            128,
+        )
+        .await
+        .unwrap();
+    let error = store
+        .record_history_page(
+            &[conflicting],
+            HistoryPage {
+                stream: "block",
+                sidechain: Some(9),
+                sidechain_instance_id: Some(&id),
+                expected_next: &target,
+                next: None,
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("conflicting immutable"));
+    let client = query_client("durable_conflict").await;
+    assert_eq!(
+        client
+            .query_one(
+                "SELECT count(*) FROM event WHERE kind='block_connected'",
+                &[]
+            )
+            .await
+            .unwrap()
+            .get::<_, i64>(0),
+        2
+    );
+    assert_eq!(
+        client
+            .query_one("SELECT count(*) FROM event_conflict", &[])
+            .await
+            .unwrap()
+            .get::<_, i64>(0),
+        1
+    );
+    assert_eq!(
+        store
+            .history_coverage("block", Some(9), Some(&id))
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        HistoryStatus::Error
+    );
+}
+
+#[tokio::test]
+async fn an_orphan_at_the_missing_height_does_not_certify_the_target_chain() {
+    let store = store_for("orphan_height", "enforcer").await;
+    let id = instance_id(9);
+    store.record(&[block_event(101, 101, 100)]).await.unwrap();
+    let target = ObservedBlock::at_height(vec![170; 32], 102);
+    store
+        .begin_history_cycle(
+            "block",
+            Some(9),
+            Some(&id),
+            101,
+            None,
+            &target,
+            None,
+            Some(100),
+            128,
+        )
+        .await
+        .unwrap();
+    store
+        .record_history_page(
+            &[block_event(102, 170, 169)],
+            HistoryPage {
+                stream: "block",
+                sidechain: Some(9),
+                sidechain_instance_id: Some(&id),
+                expected_next: &target,
+                next: None,
+            },
+        )
+        .await
+        .expect_err("counting two heights cannot prove their parent linkage");
+    assert_eq!(
+        store
+            .history_coverage("block", Some(9), Some(&id))
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        HistoryStatus::Running
+    );
+}
+
+#[tokio::test]
+async fn confirmed_fees_resume_and_never_rewrite_the_block() {
+    let store = store_for("confirmed_fees", "enforcer").await;
+    let header = match chain_tip(4, 4) {
+        events::enforcer_event::Event::ChainTip(tip) => tip.header.unwrap(),
+        _ => unreachable!(),
+    };
+    let anchor = ObservedBlock::at_height(header.hash.clone(), header.height);
+    let delta = envelope(
+        events::enforcer_event::Event::Bip300BlockDelta(events::Bip300BlockDelta {
+            header: Some(header.clone()),
+            confirmed_bmm_requests: vec![events::ConfirmedBmmRequest {
+                sidechain_number: 9,
+                txid: vec![7; 32],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }),
+        Some(anchor.clone()),
+        1_700_000_000_004,
+    );
+    store.record(&[delta]).await.unwrap();
+    let (source, block) = store.next_fee_block().await.unwrap().unwrap();
+    assert_eq!(block, anchor);
+    let make_fee = |txid, fee_sats| {
+        envelope(
+            events::enforcer_event::Event::ConfirmedBmmFees(events::ConfirmedBmmFees {
+                header: Some(header.clone()),
+                source: "ecash-node:getblock:3".into(),
+                fees: vec![events::ConfirmedBmmFee {
+                    sidechain_number: 9,
+                    txid: vec![txid; 32],
+                    fee_sats,
+                    unavailable_reason: if fee_sats.is_some() {
+                        String::new()
+                    } else {
+                        "historical_prevouts_unavailable".into()
+                    },
+                }],
+            }),
+            Some(anchor.clone()),
+            1_700_000_000_005,
+        )
+    };
+    assert!(
+        store
+            .record_fee_enrichment(source, &make_fee(8, Some(42)))
+            .await
+            .is_err()
+    );
+    store
+        .record_fee_enrichment(source, &make_fee(7, None))
+        .await
+        .unwrap();
+    assert!(store.next_fee_block().await.unwrap().is_none());
+    let client = query_client("confirmed_fees").await;
+    client
+        .execute(
+            "UPDATE bmm_fee_job SET next_retry_at=now()-interval '1 second'",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(store.next_fee_block().await.unwrap().unwrap().0, source);
+    store
+        .record_fee_enrichment(source, &make_fee(7, Some(u64::MAX)))
+        .await
+        .unwrap();
+    assert!(store.next_fee_block().await.unwrap().is_none());
+    let counts = client.query_one("SELECT count(*) FILTER(WHERE kind='bip300_block_delta'),count(*) FILTER(WHERE kind='confirmed_bmm_fees') FROM event",&[]).await.unwrap();
+    assert_eq!(counts.get::<_, i64>(0), 1);
+    assert_eq!(counts.get::<_, i64>(1), 2);
+}
+
+#[tokio::test]
+async fn a_stable_label_cannot_hide_a_revision_change() {
+    let store = store_for("stable_revision", "enforcer").await;
+    let anchor = ObservedBlock::at_height(vec![1; 32], 2);
+    let mut metadata = SnapshotMetadata {
+        started_at: SystemTime::now(),
+        finished_at: SystemTime::now(),
+        tip_before: anchor.clone(),
+        tip_after: anchor.clone(),
+        consistency: SnapshotConsistency::Stable,
+        attempts: 1,
+        revision_before: Some("test:1".into()),
+        revision_after: Some("test:3".into()),
+    };
+    let event = envelope(ctip(9, 42), Some(anchor), 1_700_000_000_000);
+    assert!(
+        store
+            .record_snapshot(std::slice::from_ref(&event), CaptureMethod::Poll, &metadata)
+            .await
+            .is_err()
+    );
+    metadata.consistency = SnapshotConsistency::Changed;
+    store
+        .record_snapshot(std::slice::from_ref(&event), CaptureMethod::Poll, &metadata)
+        .await
+        .unwrap();
+    let client = query_client("stable_revision").await;
+    let count: i64 = client
+        .query_one("SELECT count(*) FROM state_snapshot_stable", &[])
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(count, 0);
+    metadata.consistency = SnapshotConsistency::Stable;
+    metadata.revision_before = metadata.revision_after.clone();
+    store
+        .record_snapshot(&[event], CaptureMethod::Poll, &metadata)
+        .await
+        .unwrap();
+    let count: i64 = client
+        .query_one("SELECT count(*) FROM state_snapshot_stable", &[])
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(count, 1);
 }

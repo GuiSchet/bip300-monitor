@@ -48,8 +48,10 @@ variant in the first pilot.
 - Proposal, active-sidechain, CTIP, and withdrawal-bundle-proposal messages are
   snapshots, not deltas. They are published once at startup and then again
   whenever a connected or disconnected block changed their value, so a consumer
-  sees the latest state without diffing. An unchanged snapshot is not
-  republished, and `ChainInfo` and `ChainTip` are published only at startup.
+  sees the latest state without diffing. A stable observation after a changed
+  window republishes even an identical payload. Changed windows are retried
+  after 30 seconds even without a new tip. `ChainInfo` and `ChainTip` are
+  published only at startup.
 - Because a refresh is a poll rather than a per-block query, a snapshot
   describes the state at the moment it was read. Under fast blocks two heights
   can coalesce into one refresh, so consecutive snapshots are consecutive
@@ -62,23 +64,34 @@ variant in the first pilot.
   moving chain can be a later block than the one whose arrival triggered the
   read — and can therefore be a block with no `BlockConnected` of its own yet.
 - PostgreSQL wraps every unary snapshot in a `snapshot_group` containing
-  `tip_before`, `tip_after`, the read interval, attempt count and either
-  `stable` or `changed`. Three bounded attempts are made; a moving chain is
-  persisted explicitly as `changed`, never mislabeled stable.
+  `tip_before`, `tip_after`, the read interval, attempt count, chain revisions
+  and either `stable` or `changed`. Three bounded attempts are made; a moving
+  chain is persisted as `changed`, anchored to `tip_before` for diagnostics.
+  Join `state_snapshot_stable` for state at a proved anchor: it requires equal
+  non-null revisions and equal tips. Consistency belongs to each occurrence,
+  not to the deduplicated payload fact.
 - A live BMM auction has a stricter rule: the extractor reads the tip, asks
   `GetSeenBmmRequests` for exactly that parent, and reads the tip again. It
   discards and retries a response when the parent moved and persists only a
-  `stable` group whose two tips, event anchor, and payload parent are equal.
+  `stable` group whose two tips, event anchor, and payload parent are equal,
+  with an unchanged persisted revision to reject A → B → A races. A non-empty
+  mempool session and ready generation are required; a syncing or disabled
+  mempool is never represented as a successful empty auction.
   The BMM worker reads the current tip on its own five-second sampling cycle.
   The independent 30-second tip poll can also wake it early after that poll
   detects a move, but this notification is not immediate and correctness does
   not depend on it.
-- Reorgs are recorded, not repaired. `BlockDisconnected` says a block left the
-  chain; the preceding `BlockConnected` fact remains because this is an
-  observation log, not a mutable current-chain view. The fact is idempotent,
-  while `event_observation` retains every repeated capture and
-  `tip_observation` retains transitions such as `A -> B -> A` in `capture_seq`
-  order. Reconstructing the surviving chain is the consumer's job.
+- `BlockDisconnected` says a block left the chain; its `BlockConnected` fact
+  remains immutable. A slot-independent `MainchainTransition` stream records
+  connects, disconnects and subscription boundaries with a session/sequence.
+  Sequence gaps, stream failures and process restarts leave durable entries in
+  `observation_failure`; offline transitions cannot be reconstructed as live
+  observations. Backfill repairs canonical history to a certified ancestor,
+  preserving the previous coverage proof until the replacement completes.
+  `event_observation` retains captures and `tip_observation` retains observed
+  tips. Capture order is not a consensus ordering across RPCs and streams.
+  Observatory materializes canonical membership from linked parent hashes;
+  operator verification independently checks the node's selected chain.
 - `WithdrawalBundleProposalsSnapshot` carries the bundles still being voted on.
   Its `vote_count` is read against
   `Bip300Constants.withdrawal_bundle_inclusion_threshold` and its
@@ -101,10 +114,16 @@ Conversions reject missing required input fields, malformed hex, and hashes
 that are not exactly 32 bytes. This prevents incomplete upstream responses from
 being published as valid-looking zero values.
 
-`ConfirmedBmmRequest.fee_sats` is absent in the reviewed enforcer response and
-the monitor does not infer it. Confirmed M8 history therefore contains the
-request identity and effects exposed by the enforcer; live mempool samples are
-the source of `bid_sats`.
+`BlockHeader.block_work` is per-block work; `cumulative_work` is absolute
+chain work, both 32-byte consensus-encoded values. Contract v7 reserves the old
+misnamed `chain_work` field instead of changing its wire meaning.
+
+`ConfirmedBmmRequest.fee_sats` remains absent in historical deltas. Optional
+`ConfirmedBmmFees` facts independently enrich confirmed requests using node
+transaction fees in exact satoshis. Missing historical prevouts yield an
+explicit unknown reason and a resumable retry, never a zero fee. Live mempool
+samples remain the source of `bid_sats`. JSON consumers must parse `u64` values
+losslessly; JavaScript numbers cannot represent every value above 2^53.
 
 Core NATS transport is at-most-once and non-durable. A successful bounded client
 flush confirms that its transport write buffer was emptied; it does not confirm

@@ -54,6 +54,9 @@ pub fn bmm_requests(
         previous_mainchain_block_hash,
         "bmm_requests.previous_mainchain_block_hash",
     )?;
+    if response.observer_session.is_empty() || response.mempool_generation == 0 {
+        bail!("BMM response has no ready observer generation");
+    }
     let mut requests = response
         .requests
         .into_iter()
@@ -66,7 +69,7 @@ pub fn bmm_requests(
                 );
             }
             Ok(events::BmmRequest {
-                sidechain_number: request.sidechain_number,
+                sidechain_number: slot(request.sidechain_number, "request.sidechain_number")?,
                 txid: hash_from_reverse(request.txid, "bmm_request.txid")?,
                 critical_hash: fixed_consensus_hex(
                     request.critical_hash,
@@ -76,6 +79,16 @@ pub fn bmm_requests(
             })
         })
         .collect::<Result<Vec<_>>>()?;
+    let mut identities = std::collections::BTreeSet::new();
+    for request in &requests {
+        if !identities.insert((request.sidechain_number, request.txid.clone())) {
+            bail!(
+                "duplicate BMM request for slot {} and txid {}",
+                request.sidechain_number,
+                hex::encode(&request.txid)
+            );
+        }
+    }
     requests.sort_by(|left, right| {
         left.sidechain_number
             .cmp(&right.sidechain_number)
@@ -85,10 +98,82 @@ pub fn bmm_requests(
 
     Ok(enforcer_event(events::enforcer_event::Event::BmmRequests(
         events::BmmRequestsSnapshot {
+            observer_session: response.observer_session,
+            mempool_generation: response.mempool_generation,
             previous_mainchain_block_hash,
             requests,
         },
     )))
+}
+
+/// Global events remain meaningful with no configured or active sidechain.
+pub fn mainchain_transition(
+    response: mainchain::SubscribeMainchainEventsResponse,
+) -> Result<events::EnforcerEvent> {
+    if response.observer_session.is_empty() {
+        bail!("global observation has no session");
+    }
+    if !(1..=3).contains(&response.action) {
+        bail!("unknown mainchain transition action");
+    }
+    if (response.action == 3) != response.header_info.is_none() {
+        bail!("mainchain transition header does not match its action");
+    }
+    Ok(enforcer_event(
+        events::enforcer_event::Event::MainchainTransition(events::MainchainTransition {
+            observer_session: response.observer_session,
+            sequence: response.sequence,
+            action: response.action,
+            header: response.header_info.map(block_header).transpose()?,
+        }),
+    ))
+}
+
+pub fn confirmed_bmm_fees(
+    response: mainchain::GetConfirmedBmmFeesResponse,
+) -> Result<events::EnforcerEvent> {
+    if response.source != "ecash-node:getblock:3" {
+        bail!("unknown confirmed fee source");
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    let mut fees = Vec::new();
+    for fee in response.fees {
+        let sidechain_number = slot(fee.sidechain_number, "confirmed_fee.sidechain_number")?;
+        let txid = hash_from_reverse(fee.txid, "confirmed_fee.txid")?;
+        if !seen.insert((sidechain_number, txid.clone())) {
+            bail!("duplicate confirmed BMM fee");
+        }
+        if fee.fee_sats.is_some() != fee.unavailable_reason.is_empty() {
+            bail!("confirmed fee availability is contradictory");
+        }
+        fees.push(events::ConfirmedBmmFee {
+            sidechain_number,
+            txid,
+            fee_sats: fee.fee_sats,
+            unavailable_reason: fee.unavailable_reason,
+        });
+    }
+    fees.sort_by(|a, b| (a.sidechain_number, &a.txid).cmp(&(b.sidechain_number, &b.txid)));
+    Ok(enforcer_event(
+        events::enforcer_event::Event::ConfirmedBmmFees(events::ConfirmedBmmFees {
+            header: Some(block_header(required(
+                response.header_info,
+                "confirmed_fees.header",
+            )?)?),
+            fees,
+            source: response.source,
+        }),
+    ))
+}
+
+pub(crate) fn chain_revision(response: &mainchain::GetChainTipResponse) -> Result<String> {
+    if response.observer_session.is_empty() {
+        bail!("chain observation has no session");
+    }
+    Ok(format!(
+        "{}:{}",
+        response.observer_session, response.chain_revision
+    ))
 }
 
 /// Convert `GetBlockInfo` results, preserving the upstream newest-first order.
@@ -175,14 +260,14 @@ fn bip300_coinbase_message(
             )?;
             validate_description_hash(&description, &description_hash, "bip300_m1")?;
             events::bip300_coinbase_message::Message::M1(events::M1Delta {
-                sidechain_number: m1.sidechain_number,
+                sidechain_number: slot(m1.sidechain_number, "m1.sidechain_number")?,
                 description,
                 description_hash,
             })
         }
         mainchain::bip300_coinbase_message::Message::M2(m2) => {
             events::bip300_coinbase_message::Message::M2(events::M2Delta {
-                sidechain_number: m2.sidechain_number,
+                sidechain_number: slot(m2.sidechain_number, "m2.sidechain_number")?,
                 description_hash: hash_from_reverse(
                     m2.description_sha256d_hash,
                     "bip300_m2.description_sha256d_hash",
@@ -192,8 +277,8 @@ fn bip300_coinbase_message(
         }
         mainchain::bip300_coinbase_message::Message::M3(m3) => {
             events::bip300_coinbase_message::Message::M3(events::M3Delta {
-                sidechain_number: m3.sidechain_number,
-                m6id: consensus_hex(m3.m6id, "bip300_m3.m6id")?,
+                sidechain_number: slot(m3.sidechain_number, "m3.sidechain_number")?,
+                m6id: fixed_consensus_hex(m3.m6id, "bip300_m3.m6id")?,
             })
         }
         mainchain::bip300_coinbase_message::Message::M4(m4) => {
@@ -205,16 +290,23 @@ fn bip300_coinbase_message(
                     .into_iter()
                     .map(|effect| {
                         Ok(events::M4Effect {
-                            sidechain_number: effect.sidechain_number,
+                            sidechain_number: slot(
+                                effect.sidechain_number,
+                                "effect.sidechain_number",
+                            )?,
                             action: effect.action,
                             upvoted_m6id: effect
                                 .upvoted_m6id
-                                .map(|value| consensus_hex(Some(value), "bip300_m4.upvoted_m6id"))
+                                .map(|value| {
+                                    fixed_consensus_hex(Some(value), "bip300_m4.upvoted_m6id")
+                                })
                                 .transpose()?,
                             downvoted_m6ids: effect
                                 .downvoted_m6ids
                                 .into_iter()
-                                .map(|value| consensus_hex(Some(value), "bip300_m4.downvoted_m6id"))
+                                .map(|value| {
+                                    fixed_consensus_hex(Some(value), "bip300_m4.downvoted_m6id")
+                                })
                                 .collect::<Result<Vec<_>>>()?,
                         })
                     })
@@ -223,8 +315,8 @@ fn bip300_coinbase_message(
         }
         mainchain::bip300_coinbase_message::Message::M7(m7) => {
             events::bip300_coinbase_message::Message::M7(events::M7Delta {
-                sidechain_number: m7.sidechain_number,
-                hstar: consensus_hex(m7.hstar, "bip300_m7.hstar")?,
+                sidechain_number: slot(m7.sidechain_number, "m7.sidechain_number")?,
+                hstar: fixed_consensus_hex(m7.hstar, "bip300_m7.hstar")?,
             })
         }
     };
@@ -244,7 +336,7 @@ fn treasury_transition(
 ) -> Result<events::TreasuryTransition> {
     Ok(events::TreasuryTransition {
         kind: transition.kind,
-        sidechain_number: transition.sidechain_number,
+        sidechain_number: slot(transition.sidechain_number, "transition.sidechain_number")?,
         previous_ctip: transition
             .previous_ctip
             .map(treasury_delta_ctip)
@@ -256,7 +348,7 @@ fn treasury_transition(
         fee_sats: transition.fee_sats,
         m6id: transition
             .m6id
-            .map(|value| consensus_hex(Some(value), "treasury_transition.m6id"))
+            .map(|value| fixed_consensus_hex(Some(value), "treasury_transition.m6id"))
             .transpose()?,
         sidechain_address: transition
             .sidechain_address
@@ -283,10 +375,10 @@ fn confirmed_bmm_request(
     request: mainchain::ConfirmedBmmRequest,
 ) -> Result<events::ConfirmedBmmRequest> {
     Ok(events::ConfirmedBmmRequest {
-        sidechain_number: request.sidechain_number,
+        sidechain_number: slot(request.sidechain_number, "request.sidechain_number")?,
         txid: hash_from_reverse(request.txid, "confirmed_bmm_request.txid")?,
         transaction: consensus_hex(request.transaction, "confirmed_bmm_request.transaction")?,
-        hstar: consensus_hex(request.hstar, "confirmed_bmm_request.hstar")?,
+        hstar: fixed_consensus_hex(request.hstar, "confirmed_bmm_request.hstar")?,
         previous_mainchain_block_hash: hash_from_reverse(
             request.previous_mainchain_block_hash,
             "confirmed_bmm_request.previous_mainchain_block_hash",
@@ -408,7 +500,7 @@ fn connected_block(
 ) -> Result<events::EnforcerEvent> {
     let bmm_commitment = info
         .bmm_commitment
-        .map(|value| consensus_hex(Some(value), "block_info.bmm_commitment"))
+        .map(|value| fixed_consensus_hex(Some(value), "block_info.bmm_commitment"))
         .transpose()?;
     let sidechain_events = info
         .events
@@ -435,7 +527,11 @@ fn block_header(header: mainchain::BlockHeaderInfo) -> Result<events::BlockHeade
         hash: hash_from_reverse(header.block_hash, "block_header.block_hash")?,
         previous_hash: hash_from_reverse(header.prev_block_hash, "block_header.prev_block_hash")?,
         height: header.height,
-        chain_work: fixed_consensus_hex(header.work, "block_header.work")?,
+        block_work: fixed_consensus_hex(header.work, "block_header.work")?,
+        cumulative_work: fixed_consensus_hex(
+            header.cumulative_work,
+            "block_header.cumulative_work",
+        )?,
         timestamp: header.timestamp,
     })
 }
@@ -450,8 +546,11 @@ fn sidechain_proposal(
     )?;
     validate_description_hash(&raw_description, &description_hash, "sidechain_proposal")?;
     Ok(events::SidechainProposal {
-        sidechain_number: required(
-            proposal.sidechain_number,
+        sidechain_number: slot(
+            required(
+                proposal.sidechain_number,
+                "sidechain_proposal.sidechain_number",
+            )?,
             "sidechain_proposal.sidechain_number",
         )?,
         raw_description,
@@ -476,8 +575,11 @@ fn active_sidechain(
     let description_hash = shared::bip300::sidechain_description_hash(&raw_description)
         .context("calculating active_sidechain.description_hash")?;
     Ok(events::ActiveSidechain {
-        sidechain_number: required(
-            sidechain.sidechain_number,
+        sidechain_number: slot(
+            required(
+                sidechain.sidechain_number,
+                "active_sidechain.sidechain_number",
+            )?,
             "active_sidechain.sidechain_number",
         )?,
         raw_description,
@@ -542,7 +644,7 @@ fn withdrawal_bundle_proposal(
     proposal: mainchain::get_withdrawal_bundle_proposals_response::ResponseItem,
 ) -> Result<events::WithdrawalBundleProposal> {
     Ok(events::WithdrawalBundleProposal {
-        m6id: consensus_hex(proposal.m6id, "withdrawal_bundle_proposal.m6id")?,
+        m6id: fixed_consensus_hex(proposal.m6id, "withdrawal_bundle_proposal.m6id")?,
         vote_count: required(proposal.vote_count, "withdrawal_bundle_proposal.vote_count")?,
         proposal_height: required(
             proposal.proposal_height,
@@ -614,7 +716,7 @@ fn withdrawal_event(
     };
 
     Ok(events::WithdrawalBundleEvent {
-        m6id: consensus_hex(withdrawal.m6id, "withdrawal_bundle.m6id")?,
+        m6id: fixed_consensus_hex(withdrawal.m6id, "withdrawal_bundle.m6id")?,
         state: Some(state),
     })
 }
@@ -643,6 +745,13 @@ fn network(value: i32) -> events::Network {
         mainchain::Network::Signet => events::Network::Signet,
         mainchain::Network::Testnet => events::Network::Testnet,
     }
+}
+
+fn slot(value: u32, field: &str) -> Result<u32> {
+    if value > u32::from(u8::MAX) {
+        bail!("invalid sidechain slot in {field}: {value}");
+    }
+    Ok(value)
 }
 
 fn fixed_consensus_hex(value: Option<common::ConsensusHex>, field: &str) -> Result<Vec<u8>> {
@@ -728,6 +837,8 @@ mod tests {
     #[test]
     fn live_bmm_requests_are_validated_and_canonically_sorted() {
         let response = mainchain::GetSeenBmmRequestsResponse {
+            observer_session: "test-session".into(),
+            mempool_generation: 1,
             requests: vec![
                 mainchain::get_seen_bmm_requests_response::BmmRequest {
                     sidechain_number: 9,
@@ -768,10 +879,73 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_bmm_requests_and_unready_generations_are_rejected() {
+        let request = mainchain::get_seen_bmm_requests_response::BmmRequest {
+            sidechain_number: 9,
+            txid: Some(reverse_hex(0x22)),
+            critical_hash: Some(consensus_hex(&[0x33; 32])),
+            bid_sats: 10,
+        };
+        for (session, generation, requests) in [
+            ("ready", 1, vec![request.clone(), request]),
+            ("", 1, vec![]),
+            ("syncing", 0, vec![]),
+        ] {
+            assert!(
+                bmm_requests(
+                    vec![0xaa; 32],
+                    mainchain::GetSeenBmmRequestsResponse {
+                        observer_session: session.into(),
+                        mempool_generation: generation,
+                        requests,
+                    }
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn m3_and_m7_reject_short_hashes_and_out_of_range_slots() {
+        use mainchain::bip300_coinbase_message::Message;
+        for (slot, length, valid) in [
+            (255, 32, true),
+            (256, 32, false),
+            (9, 31, false),
+            (9, 33, false),
+        ] {
+            for message in [
+                Message::M3(mainchain::M3Delta {
+                    sidechain_number: slot,
+                    m6id: Some(consensus_hex(&vec![0x33; length])),
+                }),
+                Message::M7(mainchain::M7Delta {
+                    sidechain_number: slot,
+                    hstar: Some(consensus_hex(&vec![0x44; length])),
+                }),
+            ] {
+                let result = super::bip300_coinbase_message(mainchain::Bip300CoinbaseMessage {
+                    vout: 0,
+                    accepted: true,
+                    message: Some(message),
+                    raw_script_pubkey: Some(common::Hex {
+                        hex: Some("6a".into()),
+                    }),
+                });
+                assert_eq!(result.is_ok(), valid, "slot={slot}, length={length}");
+            }
+        }
+    }
+
+    #[test]
     fn an_observed_empty_bmm_auction_is_a_valid_snapshot() {
         let event = bmm_requests(
             vec![0xaa; 32],
-            mainchain::GetSeenBmmRequestsResponse::default(),
+            mainchain::GetSeenBmmRequestsResponse {
+                observer_session: "test-session".into(),
+                mempool_generation: 1,
+                requests: vec![],
+            },
         )
         .expect("an empty response is observed data");
         let events::enforcer_event::Event::BmmRequests(snapshot) =
@@ -788,6 +962,9 @@ mod tests {
         let response = mainchain::GetBip300BlockDeltaResponse {
             deltas: vec![mainchain::Bip300BlockDelta {
                 header_info: Some(mainchain::BlockHeaderInfo {
+                    cumulative_work: Some(common::ConsensusHex {
+                        hex: Some("55".repeat(32)),
+                    }),
                     block_hash: Some(reverse_hex(0x11)),
                     prev_block_hash: Some(reverse_hex(0x10)),
                     height: 963_648,

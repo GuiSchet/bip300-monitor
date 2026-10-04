@@ -107,6 +107,10 @@ trait TipSource: Send {
 
 /// Source used to bracket one BMM auction response with exact tip reads.
 trait BmmSource: Send {
+    fn revision(&mut self) -> SourceFuture<'_, Option<String>> {
+        Box::pin(async { Ok(None) })
+    }
+
     fn current_tip(&mut self) -> SourceFuture<'_, ObservedBlock>;
     fn bmm_requests(
         &mut self,
@@ -115,6 +119,10 @@ trait BmmSource: Send {
 }
 
 impl BmmSource for EnforcerClient {
+    fn revision(&mut self) -> SourceFuture<'_, Option<String>> {
+        Box::pin(async { Ok(Some(convert::chain_revision(&self.get_chain_tip().await?)?)) })
+    }
+
     fn current_tip(&mut self) -> SourceFuture<'_, ObservedBlock> {
         Box::pin(snapshot::current_tip(self))
     }
@@ -153,6 +161,7 @@ impl StateSource for EnforcerClient {
 }
 
 struct PreparedStartup {
+    mainchain_stream: tonic::Streaming<mainchain::SubscribeMainchainEventsResponse>,
     recorder: Recorder,
     client: EnforcerClient,
     /// Desired slots: either explicitly configured (including currently inactive
@@ -193,6 +202,7 @@ pub async fn run(args: Args, mut shutdown_rx: watch::Receiver<bool>) -> Result<(
     };
 
     let PreparedStartup {
+        mainchain_stream,
         recorder,
         client,
         sidechains,
@@ -262,9 +272,25 @@ pub async fn run(args: Args, mut shutdown_rx: watch::Receiver<bool>) -> Result<(
                 })
                 .expect("at most 256 sidechain slots fit in the initial backfill queue");
         }
-        let tracker = state::Tracker::new(snapshot.state);
+        let tracker =
+            state::Tracker::new(snapshot.state).with_consistency(snapshot_metadata.consistency);
 
         let mut workers = JoinSet::new();
+        if args.confirmed_bmm_fees {
+            workers.spawn(crate::fees::monitor(
+                client.clone(),
+                recorder.clone(),
+                shutdown_rx.clone(),
+            ));
+        }
+        workers.spawn(crate::mainchain::monitor(
+            client.clone(),
+            mainchain_stream,
+            recorder.clone(),
+            block_tx.clone(),
+            tip_tx.clone(),
+            shutdown_rx.clone(),
+        ));
         workers.spawn(monitor_sidechains(
             streams,
             instances,
@@ -788,14 +814,22 @@ async fn prepare_startup(args: &Args) -> Result<PreparedStartup> {
         .await
         .context("connecting the enforcer client")?;
 
+    let mainchain_stream = client.subscribe_mainchain_events().await?;
+    let revision_before = Some(convert::chain_revision(&client.get_chain_tip().await?)?);
     let (sidechains, observation) = prepare_stable_observation(&mut client, &args.sidechains)
         .await
         .context("preparing enforcer subscriptions and initial snapshot")?;
     let PreparedObservation {
         streams,
         snapshot,
-        snapshot_metadata,
+        mut snapshot_metadata,
     } = observation;
+    snapshot_metadata.revision_before = revision_before;
+    snapshot_metadata.revision_after =
+        Some(convert::chain_revision(&client.get_chain_tip().await?)?);
+    if snapshot_metadata.revision_before != snapshot_metadata.revision_after {
+        snapshot_metadata.consistency = SnapshotConsistency::Changed;
+    }
     validate_chain_identity(args, &snapshot).context("validating the enforcer chain identity")?;
     // Opening the recorder creates an extractor_run. Do it only after every
     // fallible, read-only startup probe has succeeded so a failed connection or
@@ -811,11 +845,21 @@ async fn prepare_startup(args: &Args) -> Result<PreparedStartup> {
     .await
     .context("connecting the event recorder")?;
     recorder
-        .initialize_worker_statuses(&[ExtractorWorker::MainchainTip, ExtractorWorker::BmmRequests])
+        .initialize_worker_statuses(&[
+            ExtractorWorker::MainchainTip,
+            ExtractorWorker::BmmRequests,
+            ExtractorWorker::MainchainEvents,
+        ])
         .await
         .context("initializing extractor worker status")?;
+    if args.confirmed_bmm_fees {
+        recorder
+            .initialize_worker_statuses(&[ExtractorWorker::ConfirmedBmmFees])
+            .await?;
+    }
 
     Ok(PreparedStartup {
+        mainchain_stream,
         recorder,
         client,
         sidechains,
@@ -927,6 +971,8 @@ where
             return Ok((
                 snapshot,
                 SnapshotMetadata {
+                    revision_before: None,
+                    revision_after: None,
                     started_at,
                     finished_at: SystemTime::now(),
                     tip_before,
@@ -1464,6 +1510,7 @@ async fn collect_bmm_sample<S: BmmSource>(
 ) -> Result<(events::EnforcerEvent, SnapshotMetadata)> {
     let started_at = SystemTime::now();
     for attempts in 1..=max_attempts {
+        let revision_before = source.revision().await?;
         let tip_before = source
             .current_tip()
             .await
@@ -1476,12 +1523,15 @@ async fn collect_bmm_sample<S: BmmSource>(
             .current_tip()
             .await
             .context("reading the mainchain tip after sampling BMM requests")?;
-        if tip_before.hash == tip_after.hash {
+        let revision_after = source.revision().await?;
+        if tip_before.hash == tip_after.hash && revision_before == revision_after {
             let payload = convert::bmm_requests(tip_before.hash.clone(), response)
                 .context("converting live BMM requests")?;
             return Ok((
                 payload,
                 SnapshotMetadata {
+                    revision_before,
+                    revision_after,
                     started_at,
                     finished_at: SystemTime::now(),
                     tip_before,
@@ -1617,7 +1667,8 @@ async fn monitor_state(
                     .record_snapshot_batch(events, CaptureMethod::Poll, &metadata)
                     .await
                     .context("recording refreshed enforcer state")?;
-                if active_sidechains_changed {
+                if active_sidechains_changed && metadata.consistency == SnapshotConsistency::Stable
+                {
                     sidechain_state_tx.send_modify(|version| {
                         *version = version.wrapping_add(1);
                     });
@@ -1661,6 +1712,7 @@ where
         tokio::select! {
             biased;
             () = wait_for_shutdown(&mut shutdown_rx) => return Ok(()),
+            () = tokio::time::sleep(Duration::from_secs(30)), if tracker.needs_retry() => {},
             result = block_rx.changed() => {
                 if result.is_err() {
                     // Nothing holds a sender any more, so no further tip change
@@ -1675,31 +1727,30 @@ where
         let block = block_rx.borrow_and_update().clone();
         // Each configured slot reports the same mainchain block, and startup can
         // replay the snapshot tip. Only the first report of a block refreshes.
-        if block == refreshed_at {
+        if block == refreshed_at && !tracker.needs_retry() {
             continue;
         }
 
-        // A failed refresh is fatal for the same reason a failed publication is:
-        // silently skipping it would leave a gap that looks like "nothing
-        // changed". The deployment restarts the extractor, which republishes the
-        // whole snapshot.
-        let reading = source
-            .collect_state(&sidechains, discover_new_slots)
-            .await
-            .with_context(|| {
-                format!("refreshing enforcer state at block {}", hex::encode(&block))
-            })?;
-        refreshed_at = block;
-
-        let metadata = reading.metadata;
-        let anchor = reading.anchor;
-        let changed = tracker.take_changed(reading.payloads)?;
-        if changed.is_empty() {
-            continue;
+        for attempt in 1..=SNAPSHOT_MAX_ATTEMPTS {
+            let reading = source
+                .collect_state(&sidechains, discover_new_slots)
+                .await
+                .with_context(|| {
+                    format!("refreshing enforcer state at block {}", hex::encode(&block))
+                })?;
+            refreshed_at = block.clone();
+            let mut metadata = reading.metadata;
+            metadata.attempts = attempt;
+            let changed = tracker.take_observation(reading.payloads, metadata.consistency)?;
+            if !changed.is_empty() {
+                publish(reading.anchor, changed, metadata)
+                    .await
+                    .context("publishing refreshed enforcer state")?;
+            }
+            if !tracker.needs_retry() {
+                break;
+            }
         }
-        publish(anchor, changed, metadata)
-            .await
-            .context("publishing refreshed enforcer state")?;
     }
 }
 
@@ -2182,9 +2233,13 @@ mod tests {
             tips: Arc::new(Mutex::new(tips.iter().copied().map(observed_tip).collect())),
             parents: Arc::new(Mutex::new(Vec::new())),
             responses: Arc::new(Mutex::new(
-                std::iter::repeat_with(mainchain::GetSeenBmmRequestsResponse::default)
-                    .take(response_count)
-                    .collect(),
+                std::iter::repeat_with(|| mainchain::GetSeenBmmRequestsResponse {
+                    observer_session: "test-session".into(),
+                    mempool_generation: 1,
+                    requests: vec![],
+                })
+                .take(response_count)
+                .collect(),
             )),
         }
     }
@@ -2244,6 +2299,8 @@ mod tests {
             .lock()
             .unwrap()
             .push_back(mainchain::GetSeenBmmRequestsResponse {
+                observer_session: "test-session".into(),
+                mempool_generation: 1,
                 requests: vec![mainchain::get_seen_bmm_requests_response::BmmRequest {
                     sidechain_number: 256,
                     ..Default::default()
@@ -2368,6 +2425,9 @@ mod tests {
                     mainchain::subscribe_events_response::event::Event::ConnectBlock(
                         mainchain::subscribe_events_response::event::ConnectBlock {
                             header_info: Some(mainchain::BlockHeaderInfo {
+                                cumulative_work: Some(common::ConsensusHex {
+                                    hex: Some("55".repeat(32)),
+                                }),
                                 block_hash: reverse_hex(hash),
                                 prev_block_hash: reverse_hex(previous_hash),
                                 height,
@@ -2535,6 +2595,8 @@ mod tests {
                     anchor: anchor.clone(),
                     payloads: collection.context("configured fake state collection")?,
                     metadata: SnapshotMetadata {
+                        revision_before: None,
+                        revision_after: None,
                         started_at: SystemTime::now(),
                         finished_at: SystemTime::now(),
                         tip_before: anchor.clone(),

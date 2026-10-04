@@ -46,10 +46,14 @@ pub(crate) async fn collect(
     discover_new_slots: bool,
 ) -> Result<Reading> {
     let started_at = SystemTime::now();
-    let tip_before = tip_anchor(&convert::chain_tip(client.get_chain_tip().await?)?)?;
+    let before = client.get_chain_tip().await?;
+    let revision_before = Some(convert::chain_revision(&before)?);
+    let tip_before = tip_anchor(&convert::chain_tip(before)?)?;
     let payloads = collect_payloads(client, sidechains, discover_new_slots).await?;
-    let tip_after = tip_anchor(&convert::chain_tip(client.get_chain_tip().await?)?)?;
-    let consistency = if tip_before.hash == tip_after.hash {
+    let after = client.get_chain_tip().await?;
+    let revision_after = Some(convert::chain_revision(&after)?);
+    let tip_after = tip_anchor(&convert::chain_tip(after)?)?;
+    let consistency = if tip_before.hash == tip_after.hash && revision_before == revision_after {
         SnapshotConsistency::Stable
     } else {
         SnapshotConsistency::Changed
@@ -58,6 +62,8 @@ pub(crate) async fn collect(
         anchor: tip_before.clone(),
         payloads,
         metadata: SnapshotMetadata {
+            revision_before,
+            revision_after,
             started_at,
             finished_at: SystemTime::now(),
             tip_before,
@@ -102,12 +108,44 @@ pub(crate) async fn collect_payloads(
 /// Remembers the last published value of each mutable-state payload.
 pub(crate) struct Tracker {
     last: Vec<events::EnforcerEvent>,
+    last_consistency: SnapshotConsistency,
 }
 
 impl Tracker {
     /// Seed the tracker with the payloads published in the initial snapshot.
     pub(crate) const fn new(published: Vec<events::EnforcerEvent>) -> Self {
-        Self { last: published }
+        Self {
+            last: published,
+            last_consistency: SnapshotConsistency::Stable,
+        }
+    }
+
+    pub(crate) const fn with_consistency(mut self, consistency: SnapshotConsistency) -> Self {
+        self.last_consistency = consistency;
+        self
+    }
+
+    pub(crate) fn needs_retry(&self) -> bool {
+        self.last_consistency == SnapshotConsistency::Changed
+    }
+
+    pub(crate) fn take_observation(
+        &mut self,
+        current: Vec<events::EnforcerEvent>,
+        consistency: SnapshotConsistency,
+    ) -> Result<Vec<events::EnforcerEvent>> {
+        let force = self.needs_retry() || consistency == SnapshotConsistency::Changed;
+        self.last_consistency = consistency;
+        if force {
+            // Validate identities even when every payload must be published.
+            for payload in &current {
+                payload_key(payload)?;
+            }
+            self.last = current.clone();
+            Ok(current)
+        } else {
+            self.take_changed(current)
+        }
     }
 
     /// Return the payloads that differ from the last published value, and
@@ -218,6 +256,7 @@ pub(crate) fn block_anchor(payload: &events::EnforcerEvent) -> Result<ObservedBl
 #[cfg(test)]
 mod tests {
     use shared::protobuf::enforcer_extractor as events;
+    use shared::store::SnapshotConsistency;
 
     use super::{Tracker, active_instances, block_anchor, tip_anchor};
 
@@ -256,7 +295,8 @@ mod tests {
             hash: vec![hash; 32],
             previous_hash: vec![hash.wrapping_sub(1); 32],
             height,
-            chain_work: vec![0x44; 32],
+            block_work: vec![1; 32],
+            cumulative_work: vec![0x44; 32],
             timestamp: 1_750_000_000,
         }
     }
@@ -272,6 +312,32 @@ mod tests {
                 },
             )),
         }
+    }
+
+    #[test]
+    fn a_stable_read_after_a_changed_read_is_evidence_even_when_payload_is_identical() {
+        let payload = vec![ctip(9, 100)];
+        let mut tracker = Tracker::new(payload.clone());
+        assert_eq!(
+            tracker
+                .take_observation(payload.clone(), SnapshotConsistency::Changed)
+                .unwrap(),
+            payload
+        );
+        assert!(tracker.needs_retry());
+        assert_eq!(
+            tracker
+                .take_observation(payload.clone(), SnapshotConsistency::Stable)
+                .unwrap(),
+            payload
+        );
+        assert!(!tracker.needs_retry());
+        assert!(
+            tracker
+                .take_observation(payload, SnapshotConsistency::Stable)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

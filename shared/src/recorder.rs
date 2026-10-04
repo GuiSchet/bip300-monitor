@@ -82,6 +82,14 @@ impl Recorder {
         self.record_batch(vec![event]).await
     }
 
+    pub async fn record_fee_enrichment(&self, source_event_id: i64, event: Event) -> Result<()> {
+        self.store
+            .record_fee_enrichment(source_event_id, &event)
+            .await?;
+        self.fan_out(&[event]).await;
+        Ok(())
+    }
+
     /// Record an event against the exact activation whose stream supplied it.
     pub async fn record_for_instance(
         &self,

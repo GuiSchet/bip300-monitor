@@ -139,6 +139,14 @@ pub struct Args {
     )]
     pub bmm_request_poll_interval_seconds: u64,
 
+    /// Enable independent, resumable confirmed-fee enrichment (phase 2).
+    #[arg(
+        long,
+        env = "BIP300_MONITOR_CONFIRMED_BMM_FEES",
+        default_value_t = false
+    )]
+    pub confirmed_bmm_fees: bool,
+
     /// Maximum time a live event stream may remain silent after the tip moves.
     ///
     /// This is deliberately separate from the unary RPC timeout: historical
@@ -260,7 +268,7 @@ impl Args {
 
     /// Build the durable dataset/run manifest stored with observations.
     pub fn dataset_manifest(&self) -> DatasetManifest {
-        DatasetManifest {
+        let mut manifest = DatasetManifest {
             network_id: self.network_id.clone(),
             activation_height: self.activation_height,
             activation_block_hash: self.activation_block_hash.clone(),
@@ -285,10 +293,24 @@ impl Args {
                 "bip300_description_hash_identity",
                 "stable_parent_bmm_snapshots",
                 "validated_chain_identity",
-                "orphan_run_reconciliation"
+                "orphan_run_reconciliation",
+                "absolute_chain_work",
+                "mempool_readiness_generation",
+                "global_mainchain_transitions",
+                "certified_hash_history",
+                "immutable_fact_conflicts",
+                "snapshot_state_revision"
             ]),
-            creation_reason: "pre-Drivechain Pulse L1 observation dataset".to_owned(),
+            creation_reason: "Drivechain Observatory v7 observation dataset".to_owned(),
+        };
+        if self.confirmed_bmm_fees {
+            manifest
+                .capabilities
+                .as_array_mut()
+                .expect("capability array")
+                .push(serde_json::json!("confirmed_bmm_fees"));
         }
+        manifest
     }
 }
 

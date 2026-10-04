@@ -7,21 +7,16 @@ These protobuf files are copied from the reviewed observer fork:
 - Base commit: `0e27251ef351a522c72ab9ef079f75e06075390f`
 - Latest upstream commit reviewed for compatibility (not deployed):
   `6e5f79f7668b0f82eab788531adb2ea21664d972`
-- Observer commit: `0740a39380b39885fe8655f79f78150001d8a15b`
-- Local branch: `feature/betanet-monitor-observer` in the sibling enforcer checkout
+- Observer commit: `9b2a15621469a88ea5d3b8f1dcd5ee1bb21e0ac4`
+- Local branch: `fix/observer-data-quality-v7` in the enforcer worktree
 - Published branch: `feature/betanet-monitor-observer` in the observer fork
-- Copied: 2026-09-22
+- Copied: 2026-10-04
 
-Only the read-only `ValidatorService` contract and its direct CUSF message
-dependencies are vendored. The monitor does not link to the enforcer
-implementation. The observer commit is based directly on the latest reviewed
-upstream base required by the observer fork, retains upstream
-`GetSeenBmmRequests`, and adds only `GetBip300BlockDelta`. The later upstream
-revision recorded above was reviewed on 2026-09-24: it does not change these
-protobufs or the validator observer paths, and its behavior fix is wallet-only.
-The runtime therefore remains on the tested observer commit instead of taking
-an unrelated upgrade. `ENFORCER_UPSTREAM_REVIEWED_COMMIT` preserves that audit
-boundary separately from the deployed base and observer pins.
+The v7 observer adds absolute cumulative work, generation-scoped mempool
+readiness, committed global chain transitions, persisted chain revisions and
+independent confirmed-fee enrichment. It preserves the original per-block work
+field in the upstream RPC. This source is a local reviewed release candidate;
+publication and production cutover are separate release steps.
 
 `validator-observer.patch` is the reproducible delta from the official
 `validator.proto` to the vendored observer contract. This lets CI reconstruct
@@ -33,7 +28,7 @@ local fork to have been published first.
 ```text
 aa6f2f0f2afa1794e98ffecd71466c689b8ede823ecfd4963a04a23598931e80  cusf/common/v1/common.proto
 7b9fabbd734dcac30fc76e08ccc286b66828bf739eeb6af7bd5ade818ba899b0  cusf/mainchain/v1/common.proto
-5d0cc889a051fde2d875155cb59161d93d4eff4f9f8554c400dea7d79614671e  cusf/mainchain/v1/validator.proto
+cce860b032a699bab93088231c24c4c2a8d8f9293f42382a29f4cfc6139e1bef  cusf/mainchain/v1/validator.proto
 ```
 
 The pinned upstream commit does not contain a root license file. This
@@ -50,7 +45,7 @@ enforces that, re-checks the checksums against disk, downloads the official
 base, applies the checked-in observer patch and confirms the reconstructed API
 byte for byte. If the sibling
 `upstream/enforcer` checkout is available, it additionally verifies the exact
-observer commit and its parent. A later observer update therefore requires
+observer commit and ancestry. A later observer update therefore requires
 re-vendoring and changing the immutable runtime pin in the same change.
 
 Before updating these files:

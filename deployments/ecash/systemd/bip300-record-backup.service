@@ -1,0 +1,12 @@
+[Unit]
+Description=Private BIP300 record backup
+Requires=docker.service
+After=docker.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/bip300-monitor/deployments/ecash
+ExecStart=/usr/bin/bash scripts/backup-record.sh daily
+UMask=0077
+Nice=10
+IOSchedulingClass=idle

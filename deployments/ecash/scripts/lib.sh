@@ -469,7 +469,7 @@ postgres_query() {
 
     compose exec -T postgres \
         psql --username="${POSTGRES_USER}" --dbname="${POSTGRES_DB}" \
-        --no-align --tuples-only --quiet "$@" <<<"${statement}"
+        --no-align --tuples-only --quiet --set=ON_ERROR_STOP=1 "$@" <<<"${statement}"
 }
 
 postgres_is_healthy() {
@@ -811,174 +811,115 @@ record_current_worker_status_json() {
 
 record_current_workers_are_healthy() {
     local result
-
-    result="$(
-        postgres_query \
-            "WITH current_run AS (
-                 SELECT run_id
-                   FROM extractor_run
-                  WHERE source = 'enforcer' AND status = 'running'
-                  ORDER BY started_at DESC, run_id DESC
-                  LIMIT 1
-             )
-             SELECT count(*) = 2
-                    AND count(*) FILTER (
-                        WHERE worker.worker IN ('mainchain_tip', 'bmm_requests')
-                          AND worker.last_success_at IS NOT NULL
-                          AND worker.last_error IS NULL
-                    ) = 2
-               FROM current_run
-               JOIN extractor_worker_status worker USING (run_id)"
-    )" || return 1
+    result="$(record_scoped_query "WITH scope AS ($(record_scope_sql))
+        SELECT count(*) FILTER (WHERE w.worker IN ('mainchain_tip','bmm_requests','mainchain_events'))=3
+          AND bool_and(w.last_success_at IS NOT NULL AND w.last_error IS NULL)
+          FROM scope s JOIN extractor_worker_status w USING(run_id)")" || return 1
     [[ "${result}" == t ]]
 }
 
-# Whether the record holds one specific block for one slot, by hash.
+# All verification uses the locked deployment identity and its current run.
+record_scope_sql() {
+    cat <<'SQL'
+SELECT d.dataset_id, r.event_contract_version, r.run_id
+  FROM dataset_manifest d JOIN extractor_status x USING(dataset_id)
+  JOIN extractor_run r ON r.run_id=x.run_id
+ WHERE d.network_id=:'network' AND d.activation_height=:'network_activation'::integer
+   AND d.activation_block_hash=:'network_activation_hash'
+   AND d.initial_event_contract_version=:'contract'::integer
+   AND r.event_contract_version=:'contract'::integer
+   AND x.source='enforcer' AND r.source='enforcer' AND r.status='running'
+SQL
+}
+
+record_scoped_query() {
+    postgres_query "$@" \
+        --set=network="${NETWORK_ID}" \
+        --set=network_activation="${ECASH_ACTIVATION_HEIGHT}" \
+        --set=network_activation_hash="${ECASH_ACTIVATION_BLOCK_HASH}" \
+        --set=contract="${MONITOR_EVENT_CONTRACT_VERSION}"
+}
+
 record_has_block() {
-    local kind="$1"
-    local sidechain="$2"
-    local block_hash="$3"
-    local count
-
+    local kind="$1" sidechain="$2" block_hash="$3" result
     valid_event_kind "${kind}" || return 1
-    [[ "${sidechain}" =~ ^[0-9]+$ ]] || return 1
-    [[ "${block_hash}" =~ ^[[:xdigit:]]{64}$ ]] || return 1
-
-    count="$(
-        postgres_query \
-            "SELECT count(*) FROM event
-             WHERE kind = :'kind'
-               AND sidechain = :'sidechain'::smallint
-               AND block_hash = decode(:'block_hash', 'hex')" \
-            --set=kind="${kind}" \
-            --set=sidechain="${sidechain}" \
-            --set=block_hash="${block_hash}"
-    )" || return 1
-    [[ "${count}" =~ ^[0-9]+$ ]] || return 1
-    ((count >= 1))
+    [[ "${sidechain}" =~ ^[0-9]+$ && "${block_hash}" =~ ^[[:xdigit:]]{64}$ ]] || return 1
+    result="$(record_scoped_query "WITH scope AS ($(record_scope_sql))
+        SELECT count(*)=1 FROM event e JOIN scope s USING(dataset_id,event_contract_version)
+        JOIN current_sidechain_instance i USING(dataset_id,sidechain,sidechain_instance_id)
+        WHERE e.source='enforcer' AND e.kind=:'kind' AND e.sidechain=:'slot'::smallint
+          AND e.block_hash=decode(:'hash','hex')" \
+        --set=kind="${kind}" --set=slot="${sidechain}" --set=hash="${block_hash}")" || return 1
+    [[ "${result}" == t ]]
 }
 
-# Whether the record holds one global (slot-less) event for a block hash.
 record_has_global_block() {
-    local kind="$1"
-    local block_hash="$2"
-    local count
-
+    local kind="$1" block_hash="$2" result
     valid_event_kind "${kind}" || return 1
     [[ "${block_hash}" =~ ^[[:xdigit:]]{64}$ ]] || return 1
-    count="$(
-        postgres_query \
-            "SELECT count(*) FROM event
-             WHERE kind = :'kind'
-               AND sidechain IS NULL
-               AND block_hash = decode(:'block_hash', 'hex')" \
-            --set=kind="${kind}" \
-            --set=block_hash="${block_hash}"
-    )" || return 1
-    [[ "${count}" =~ ^[0-9]+$ ]] || return 1
-    ((count >= 1))
+    result="$(record_scoped_query "WITH scope AS ($(record_scope_sql))
+        SELECT count(*)=1 FROM event e JOIN scope s USING(dataset_id,event_contract_version)
+        WHERE e.source='enforcer' AND e.kind=:'kind' AND e.sidechain IS NULL
+          AND e.sidechain_instance_id IS NULL AND e.block_hash=decode(:'hash','hex')" \
+        --set=kind="${kind}" --set=hash="${block_hash}")" || return 1
+    [[ "${result}" == t ]]
 }
 
-# Whether the observer RPC has supplied a gap-free global BIP300/301 range
-# from network activation through at least the requested target height.
+record_history_is_complete() {
+    local stream="$1" sidechain="$2" activation="$3" minimum="$4"
+    local height canonical_hash activation_hash result
+    [[ "${activation}" =~ ^[0-9]+$ && "${minimum}" =~ ^[0-9]+$ ]] || return 1
+    [[ "${stream}" == block || "${stream}" == bip300_delta ]] || return 1
+    [[ -z "${sidechain}" || "${sidechain}" =~ ^[0-9]+$ ]] || return 1
+    local coverage_sql="SELECT c.* FROM history_coverage c
+        JOIN scope s USING(dataset_id,event_contract_version)
+        WHERE c.source='enforcer' AND c.stream=:'stream'
+          AND c.sidechain IS NOT DISTINCT FROM NULLIF(:'slot','')::smallint
+          AND (c.sidechain IS NULL OR EXISTS(SELECT 1 FROM current_sidechain_instance i
+              WHERE (i.dataset_id,i.sidechain,i.sidechain_instance_id)=
+                    (c.dataset_id,c.sidechain,c.sidechain_instance_id)))
+          AND c.status='complete' AND c.next_hash IS NULL
+          AND c.covered_tip_hash=c.target_tip_hash AND c.covered_tip_height=c.target_tip_height
+          AND c.coverage_start_height=:'activation'::integer
+          AND c.covered_tip_height>=:'minimum'::integer"
+    height="$(record_scoped_query "WITH scope AS ($(record_scope_sql)), coverage AS (${coverage_sql})
+        SELECT covered_tip_height FROM coverage" \
+        --set=stream="${stream}" --set=slot="${sidechain}" --set=activation="${activation}" --set=minimum="${minimum}")" || return 1
+    [[ "${height}" =~ ^[0-9]+$ ]] || return 1
+    canonical_hash="$(node_cli getblockhash "${height}")" || return 1
+    activation_hash="$(node_cli getblockhash "${activation}")" || return 1
+    result="$(record_scoped_query "WITH RECURSIVE scope AS ($(record_scope_sql)),
+        coverage AS (${coverage_sql}), facts AS NOT MATERIALIZED (
+            SELECT e.* FROM event e JOIN coverage c ON
+                (e.dataset_id,e.event_contract_version,e.source)=(c.dataset_id,c.event_contract_version,c.source)
+                AND e.sidechain IS NOT DISTINCT FROM c.sidechain
+                AND e.sidechain_instance_id IS NOT DISTINCT FROM c.sidechain_instance_id
+            WHERE e.kind=CASE :'stream' WHEN 'block' THEN 'block_connected' ELSE 'bip300_block_delta' END
+        ), path AS (
+            SELECT e.id,e.block_hash,e.previous_hash,e.height FROM facts e JOIN coverage c
+                ON e.block_hash=c.covered_tip_hash AND e.height=c.covered_tip_height
+                AND e.block_hash=decode(:'canonical','hex')
+            UNION ALL
+            SELECT e.id,e.block_hash,e.previous_hash,e.height FROM path p JOIN facts e
+                ON e.block_hash=p.previous_hash AND e.height=p.height-1
+                WHERE p.height>:'activation'::integer
+        ) SELECT count(*)=:'height'::bigint-:'activation'::bigint+1
+            AND count(*)=count(DISTINCT height)
+            AND bool_or(height=:'activation'::integer AND block_hash=decode(:'activation_hash','hex'))
+            AND NOT EXISTS(SELECT 1 FROM event_conflict c JOIN path p
+                ON p.id=c.first_event_id OR p.id=c.conflicting_event_id)
+            FROM path" \
+        --set=stream="${stream}" --set=slot="${sidechain}" --set=activation="${activation}" --set=minimum="${minimum}" \
+        --set=height="${height}" --set=canonical="${canonical_hash}" --set=activation_hash="${activation_hash}")" || return 1
+    [[ "${result}" == t ]]
+}
+
 record_bip300_history_is_complete() {
-    local activation_height="$1"
-    local minimum_target_height="$2"
-    local complete
-
-    [[ "${activation_height}" =~ ^[0-9]+$ ]] || return 1
-    [[ "${minimum_target_height}" =~ ^[0-9]+$ ]] || return 1
-    complete="$(
-        postgres_query \
-            "SELECT CASE WHEN EXISTS (
-                 SELECT 1
-                   FROM history_coverage coverage
-                   JOIN extractor_status extractor
-                     ON extractor.dataset_id = coverage.dataset_id
-                    AND extractor.source = coverage.source
-                   JOIN extractor_run run
-                     ON run.run_id = extractor.run_id
-                  WHERE coverage.source = 'enforcer'
-                    AND coverage.stream = 'bip300_delta'
-                    AND coverage.sidechain IS NULL
-                    AND coverage.sidechain_instance_id IS NULL
-                    AND coverage.event_contract_version = run.event_contract_version
-                    AND coverage.status = 'complete'
-                    AND coverage.coverage_start_height = :'activation'::integer
-                    AND coverage.covered_tip_height = coverage.target_tip_height
-                    AND coverage.covered_tip_height >= :'minimum_target'::integer
-                    AND coverage.next_hash IS NULL
-                    AND (
-                        SELECT count(DISTINCT event.height)
-                          FROM event
-                         WHERE event.source = coverage.source
-                           AND event.dataset_id = coverage.dataset_id
-                           AND event.event_contract_version = coverage.event_contract_version
-                           AND event.kind = 'bip300_block_delta'
-                           AND event.sidechain IS NULL
-                           AND event.sidechain_instance_id IS NULL
-                           AND event.height BETWEEN coverage.coverage_start_height
-                                                AND coverage.covered_tip_height
-                    ) = coverage.covered_tip_height - coverage.coverage_start_height + 1
-             ) THEN 1 ELSE 0 END" \
-            --set=activation="${activation_height}" \
-            --set=minimum_target="${minimum_target_height}"
-    )" || return 1
-    [[ "${complete}" == 1 ]]
+    record_history_is_complete bip300_delta '' "$1" "$2"
 }
 
-# Whether one slot has a proven, gap-free range from its activation through at
-# least the requested target height.
 record_block_history_is_complete() {
-    local sidechain="$1"
-    local activation_height="$2"
-    local minimum_target_height="$3"
-    local complete
-
-    [[ "${sidechain}" =~ ^[0-9]+$ ]] || return 1
-    [[ "${activation_height}" =~ ^[0-9]+$ ]] || return 1
-    [[ "${minimum_target_height}" =~ ^[0-9]+$ ]] || return 1
-    complete="$(
-        postgres_query \
-            "SELECT CASE WHEN EXISTS (
-                 SELECT 1
-                   FROM history_coverage coverage
-                   JOIN extractor_status extractor
-                     ON extractor.dataset_id = coverage.dataset_id
-                    AND extractor.source = coverage.source
-                   JOIN extractor_run run
-                     ON run.run_id = extractor.run_id
-                   JOIN current_sidechain_instance current_instance
-                     ON current_instance.dataset_id = coverage.dataset_id
-                    AND current_instance.sidechain = coverage.sidechain
-                    AND current_instance.sidechain_instance_id = coverage.sidechain_instance_id
-                  WHERE coverage.source = 'enforcer'
-                    AND coverage.stream = 'block'
-                    AND coverage.sidechain = :'sidechain'::smallint
-                    AND coverage.event_contract_version = run.event_contract_version
-                    AND coverage.status = 'complete'
-                    AND coverage.coverage_start_height = :'activation'::integer
-                    AND coverage.covered_tip_height = coverage.target_tip_height
-                    AND coverage.covered_tip_height >= :'minimum_target'::integer
-                    AND coverage.next_hash IS NULL
-                    AND (
-                        SELECT count(DISTINCT event.height)
-                          FROM event
-                         WHERE event.source = coverage.source
-                           AND event.dataset_id = coverage.dataset_id
-                           AND event.event_contract_version = coverage.event_contract_version
-                           AND event.kind = 'block_connected'
-                           AND event.sidechain = coverage.sidechain
-                           AND event.sidechain_instance_id = coverage.sidechain_instance_id
-                           AND event.height BETWEEN coverage.coverage_start_height
-                                                AND coverage.covered_tip_height
-                    ) = coverage.covered_tip_height - coverage.coverage_start_height + 1
-             ) THEN 1 ELSE 0 END" \
-            --set=sidechain="${sidechain}" \
-            --set=activation="${activation_height}" \
-            --set=minimum_target="${minimum_target_height}"
-    )" || return 1
-    [[ "${complete}" == 1 ]]
+    record_history_is_complete block "$1" "$2" "$3"
 }
 
 history_coverage_json() {

@@ -124,6 +124,35 @@ impl EnforcerClient {
             .map(tonic::Response::into_inner)
     }
 
+    pub async fn get_confirmed_bmm_fees(
+        &mut self,
+        hash: &[u8],
+    ) -> Result<mainchain::GetConfirmedBmmFeesResponse> {
+        self.inner
+            .get_confirmed_bmm_fees(self.unary_request(mainchain::GetConfirmedBmmFeesRequest {
+                block_hash: Some(reverse_hex(hex::encode(hash))),
+            }))
+            .await
+            .context("reading confirmed BMM fees")
+            .map(tonic::Response::into_inner)
+    }
+
+    pub async fn subscribe_mainchain_events(
+        &mut self,
+    ) -> Result<Streaming<mainchain::SubscribeMainchainEventsResponse>> {
+        let timeout = self.request_timeout;
+        tokio::time::timeout(
+            timeout,
+            self.inner.subscribe_mainchain_events(Request::new(
+                mainchain::SubscribeMainchainEventsRequest {},
+            )),
+        )
+        .await
+        .context("opening global mainchain stream timed out")?
+        .context("subscribing to committed mainchain events")
+        .map(tonic::Response::into_inner)
+    }
+
     /// Fetch all active sidechains.
     pub async fn get_sidechains(&mut self) -> Result<mainchain::GetSidechainsResponse> {
         self.inner

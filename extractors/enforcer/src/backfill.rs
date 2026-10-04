@@ -276,7 +276,7 @@ pub(crate) async fn run_history<S: HistoryStream>(
             }
         };
 
-        let payloads = match page {
+        let mut payloads = match page {
             Page::Found(payloads) => payloads,
             Page::Unavailable(error) => {
                 let current_tip = match snapshot::current_tip(client).await {
@@ -335,7 +335,7 @@ pub(crate) async fn run_history<S: HistoryStream>(
                         unavailable_cursor = %hex::encode(&cursor.hash),
                         previous_target = %hex::encode(&progress.target_tip.hash),
                         current_target = %hex::encode(&current_tip.hash),
-                        "historical target left the available branch; restarting from activation"
+                        "historical target left the available branch; repairing toward a certified ancestor"
                     );
                     progress = begin_full_cycle(
                         recorder,
@@ -383,13 +383,49 @@ pub(crate) async fn run_history<S: HistoryStream>(
             )
             .await;
         }
+        // A recorded fact is insufficient: only a certified contiguous prefix
+        // permits truncating the requested page on a new branch.
+        let hashes = payloads
+            .iter()
+            .map(|p| stream.header(p).map(|h| h.hash.clone()))
+            .collect::<Result<Vec<_>>>()?;
+        let certified = recorder
+            .store()
+            .certified_history_floor(
+                scope.stream,
+                scope.sidechain,
+                scope.sidechain_instance_id,
+                &hashes,
+            )
+            .await?;
+        if let Some(certified) = &certified {
+            let index = hashes
+                .iter()
+                .position(|hash| *hash == certified.hash)
+                .context("certified block was not in the requested page")?;
+            let header = stream.header(&payloads[index])?;
+            progress.floor_height = header.height.checked_sub(1);
+            progress.floor_hash = progress.floor_height.map(|_| header.previous_hash.clone());
+            recorder
+                .store()
+                .set_history_floor(
+                    scope.stream,
+                    scope.sidechain,
+                    scope.sidechain_instance_id,
+                    &cursor,
+                    progress.floor_hash.as_deref(),
+                    progress.floor_height,
+                )
+                .await?;
+            payloads.truncate(index + 1);
+        }
         let oldest = stream.header(
             payloads
                 .last()
                 .context("a verified historical page is not empty")?,
         )?;
         let returned = u32::try_from(payloads.len()).expect("a page length fits in a u32");
-        let completes_cycle = u64::from(returned) == remaining;
+        let completes_cycle = certified.is_some() || u64::from(returned) == remaining;
 
         if let Err(error) = validate_expected_start_hash(
             &scope,
@@ -418,7 +454,7 @@ pub(crate) async fn run_history<S: HistoryStream>(
                     recorder,
                     &scope,
                     anyhow::anyhow!(
-                        "history branch still failed to reach its floor after restarting from activation"
+                        "history branch still failed to reach its floor after repairing toward a certified ancestor"
                     ),
                     &progress.target_tip,
                     blocks,
@@ -432,7 +468,7 @@ pub(crate) async fn run_history<S: HistoryStream>(
                 sidechain = ?scope.sidechain,
                 expected_floor_hash = %hex::encode(floor_hash),
                 actual_floor_hash = %hex::encode(&oldest.previous_hash),
-                "covered tip is not an ancestor of the target; restarting from activation"
+                "covered tip is not an ancestor of the target; repairing toward a certified ancestor"
             );
             progress = begin_full_cycle(
                 recorder,
@@ -918,7 +954,8 @@ mod tests {
                         hash: vec![hash; 32],
                         previous_hash: vec![previous_hash; 32],
                         height,
-                        chain_work: vec![0x44; 32],
+                        block_work: vec![1; 32],
+                        cumulative_work: vec![0x44; 32],
                         timestamp: 1_750_000_000,
                     }),
                     sidechain_number: 9,

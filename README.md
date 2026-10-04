@@ -57,6 +57,20 @@ path.
 
 ## Event contract
 
+Contract v7 / SQL schema8 uses a **new dataset**. `BlockHeader` now exposes
+`block_work` and `cumulative_work` separately. A ready mempool generation and a
+persisted chain revision qualify BMM samples and state snapshots. The global
+mainchain stream also observes transitions with zero active sidechains.
+Conflicting immutable block facts remain stored and prevent certification.
+Reorg repair joins a certified ancestor without erasing the previous proof;
+operator verification walks exact parent hashes and checks the node's tip.
+
+All five-second BMM occurrences are retained. Optional confirmed-fee enrichment
+(`--confirmed-bmm-fees`) runs independently and records unavailable historical
+fees explicitly. Writer wait/transaction times are logged; no connection pool
+or partitioning is introduced. See [backup and cutover](deployments/ecash/BACKUP_V7.md)
+and [quality report SQL](deployments/ecash/scripts/quality-report.sql).
+
 The monitor publishes a versioned normalized protobuf contract rather than
 forwarding raw enforcer responses. Event contract v5 added mempool-backed live
 BMM request snapshots. Event contract v6 corrects the BIP300 description-hash

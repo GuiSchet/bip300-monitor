@@ -3,17 +3,17 @@
 include!(concat!(env!("OUT_DIR"), "/enforcer_extractor.rs"));
 
 /// Version of the normalized enforcer event contract stored with every fact.
-pub const EVENT_CONTRACT_VERSION: u32 = 6;
+pub const EVENT_CONTRACT_VERSION: u32 = 7;
 
 // These fingerprints deliberately live beside the version. Any edit to either
 // protobuf contract makes the test below fail until the compatibility review
 // records a new version/fingerprint pair here.
 #[cfg(test)]
-const EVENT_CONTRACT_V6_ENVELOPE_SHA256: &str =
+const EVENT_CONTRACT_V7_ENVELOPE_SHA256: &str =
     "02f7fa9e75ecc965fe46a0fdb4a9757274f6e29e33b741d5108f954f15574b3e";
 #[cfg(test)]
-const EVENT_CONTRACT_V6_PAYLOAD_SHA256: &str =
-    "65f42692a82d962e22e81ac6c3afbd8be2ba79b58f5729174287586e35ef65ad";
+const EVENT_CONTRACT_V7_PAYLOAD_SHA256: &str =
+    "37651d1935a895cceb8bbd23d3be7373fa41e23d72fd30ebab1e5af810ea9fd4";
 
 impl enforcer_event::Event {
     /// Stable name of this event variant.
@@ -32,6 +32,8 @@ impl enforcer_event::Event {
             Self::WithdrawalBundleProposals(_) => "withdrawal_bundle_proposals",
             Self::Bip300BlockDelta(_) => "bip300_block_delta",
             Self::BmmRequests(_) => "bmm_requests",
+            Self::MainchainTransition(_) => "mainchain_transition",
+            Self::ConfirmedBmmFees(_) => "confirmed_bmm_fees",
         }
     }
 
@@ -41,7 +43,9 @@ impl enforcer_event::Event {
             Self::ChainInfo(_)
             | Self::ChainTip(_)
             | Self::Bip300BlockDelta(_)
-            | Self::BmmRequests(_) => None,
+            | Self::BmmRequests(_)
+            | Self::MainchainTransition(_)
+            | Self::ConfirmedBmmFees(_) => None,
             Self::SidechainProposals(_) | Self::ActiveSidechains(_) => None,
             Self::Ctip(snapshot) => Some(snapshot.sidechain_number),
             Self::BlockConnected(block) => Some(block.sidechain_number),
@@ -59,17 +63,17 @@ mod kind_tests {
 
     #[test]
     fn contract_version_matches_the_reviewed_proto_fingerprints() {
-        assert_eq!(super::EVENT_CONTRACT_VERSION, 6);
+        assert_eq!(super::EVENT_CONTRACT_VERSION, 7);
         assert_eq!(
             hex::encode(Sha256::digest(include_bytes!("../../../proto/event.proto"))),
-            super::EVENT_CONTRACT_V6_ENVELOPE_SHA256,
+            super::EVENT_CONTRACT_V7_ENVELOPE_SHA256,
             "event.proto changed: review compatibility and bump EVENT_CONTRACT_VERSION"
         );
         assert_eq!(
             hex::encode(Sha256::digest(include_bytes!(
                 "../../../proto/enforcer_extractor.proto"
             ))),
-            super::EVENT_CONTRACT_V6_PAYLOAD_SHA256,
+            super::EVENT_CONTRACT_V7_PAYLOAD_SHA256,
             "enforcer_extractor.proto changed: review compatibility and bump EVENT_CONTRACT_VERSION"
         );
     }
