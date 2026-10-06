@@ -34,7 +34,7 @@ require_boolean() {
 }
 
 require_ready_release() {
-    [[ "${RELEASE_STATUS:-}" == ready ]] || die "candidate artifacts are not verified; this release cannot be started"
+    [[ "${RELEASE_STATUS:-}" == ready ]] || die "release is not marked ready; this candidate cannot be started"
     [[ "${ENFORCER_REPO}" == https://github.com/LayerTwo-Labs/bip300301_enforcer.git ]] || die "enforcer must use official upstream"
     [[ "${ENFORCER_COMMIT}" == "${ENFORCER_UPSTREAM_REVIEWED_COMMIT}" ]] || die "official enforcer commit mismatch"
 }

@@ -28,10 +28,26 @@ reads are `tip_matched`, never atomic `stable`. Historical private deltas and
 revision/readiness fields are not produced. Old protobuf types remain solely
 for decoding archived records.
 
-## Future cutover
+## Validated local candidate
 
-Do not merge/deploy until the full candidate checks and artifact hashes are
-recorded. `RELEASE_STATUS=preparing` blocks enforcer-up and monitor-up.
+[RELEASE_OFFICIAL.json](RELEASE_OFFICIAL.json) records exact source revisions,
+OCI manifest/config digests and the paired Observatory image. Monitor image
+source is `2f2574d46d1bc9d888932f1161a2ab18d3b9dee6`; Observatory image source is
+`026d0c739c86eb4c18ba87be7de4ebbae25c91ad`. Both source commits are GPG-signed.
+The fork archive commit `7a7b625ae5a46a085b3617fdedf37a92181ea048` retires its
+publishing workflows; that fork branch is not part of the deployment.
+
+Validation passed: 153 monitor tests, 14 Observatory units, Clippy, static
+configuration, exact official protobuf comparison, dedicated RPC permissions,
+real PostgreSQL importer/API/reorg/conflict checks, Chromium and paired restore.
+All five CLI binaries were checked in local containers without network access.
+
+The images are local OCI archives, not published registry tags. Keep
+`RELEASE_STATUS=preparing` until registry digests have been checked. The final
+reviewed promotion changes this marker to `ready` before an approved start.
+The old RELEASE_V7.md and its OCI files are superseded archives, not this release.
+
+## Future cutover
 
 1. Freeze and export the old monitor record using the existing backup workflow.
    Verify a separate restore and the paired Observatory backup before finalizing.

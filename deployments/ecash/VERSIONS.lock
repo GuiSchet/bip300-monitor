@@ -1,4 +1,4 @@
-# Candidate images must be regenerated and verified before deployment.
+# Candidate images verified locally; publication is pending.
 RELEASE_STATUS=preparing
 # shellcheck shell=bash
 # Reproducible eCash Betanet network, image, tool, and snapshot lock.
@@ -42,9 +42,9 @@ POSTGRES_USER=bip300_monitor
 # Keep contract, source commit, and both immutable image
 # digests together.
 MONITOR_EVENT_CONTRACT_VERSION=8
-MONITOR_IMAGE_COMMIT=ecf5b8290e6b5501508a4a3913bd93c83728cca1
-ENFORCER_EXTRACTOR_IMAGE=docker.io/guischet/bip300-enforcer-extractor:sha-ecf5b8290e6b@sha256:e5e1b9fbcaa7a3493cbc25b9efddb9e5f70a52ecddd29b01919760757b9c3bf8
-EVENT_LOGGER_IMAGE=docker.io/guischet/bip300-event-logger:sha-ecf5b8290e6b@sha256:e6328fb87385d8b6210999c2d32aed85104520acdd1f60dfc3db338157dca328
+MONITOR_IMAGE_COMMIT=2f2574d46d1bc9d888932f1161a2ab18d3b9dee6
+ENFORCER_EXTRACTOR_IMAGE=docker.io/guischet/bip300-enforcer-extractor:sha-2f2574d46d1b@sha256:e953a8bbf2280bb85fe568c5b5f4bdd0082e3055742123690a83e64a57dfd506
+EVENT_LOGGER_IMAGE=docker.io/guischet/bip300-event-logger:sha-2f2574d46d1b@sha256:b84a360bc26fd1e8ac40e12ce676d722b28f7bb176dbd2956acf5ad8ae3b701c
 
 JUST_VERSION=1.57.0
 JUST_TARGET=x86_64-unknown-linux-musl

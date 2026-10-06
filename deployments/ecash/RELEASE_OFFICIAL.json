@@ -1,0 +1,90 @@
+{
+  "release_id": "observer-official-v8-20261005",
+  "prepared_at": "2026-10-06",
+  "status": "validated-local-unpublished-not-deployed",
+  "event_contract": 8,
+  "record_schema": 9,
+  "observatory_projection": 7,
+  "requires_fresh_databases": true,
+  "commits": {
+    "enforcer_official": "1753fc0c23863bcb39c681e1cfaea2705613516f",
+    "monitor_image_source": "2f2574d46d1bc9d888932f1161a2ab18d3b9dee6",
+    "observatory_image_source": "026d0c739c86eb4c18ba87be7de4ebbae25c91ad",
+    "retired_fork_archive": "7a7b625ae5a46a085b3617fdedf37a92181ea048"
+  },
+  "images": [
+    {
+      "artifact": "enforcer.oci.tar",
+      "destination": "ghcr.io/guischet/bip300-enforcer-official:sha-1753fc0c2386",
+      "digest": "sha256:20ee50366ee941731d26a47580481fd88ec2747014bc6cd18628a8844f4154dc",
+      "config_digest": "sha256:9e15b7d1dad53d373bf725998faa2937790ef9b1e61a49b43803b3cf15fd2e8b",
+      "source_commit": "1753fc0c23863bcb39c681e1cfaea2705613516f",
+      "platform": "linux/amd64",
+      "rootfs": [
+        "sha256:1d69a5fd31932841d7825ef4780c06f008eea65aaa9f3110fe09d5832ed5c7d8",
+        "sha256:e8cfe20cbdcc249662081748ab6ba2d19bc6292793787ac0b04592df9e2f4b65",
+        "sha256:68cf3f7e4b5cf33cc84f41f0b04f845af35270a4be4010d120423ff3284f2c3e"
+      ]
+    },
+    {
+      "artifact": "enforcer-extractor.oci.tar",
+      "destination": "docker.io/guischet/bip300-enforcer-extractor:sha-2f2574d46d1b",
+      "digest": "sha256:e953a8bbf2280bb85fe568c5b5f4bdd0082e3055742123690a83e64a57dfd506",
+      "config_digest": "sha256:36765b61853006664ba628a08ce0db5c7978711cef40dbe54dfad0331a18ce67",
+      "source_commit": "2f2574d46d1bc9d888932f1161a2ab18d3b9dee6",
+      "platform": "linux/amd64",
+      "rootfs": [
+        "sha256:81f823b9617547261c907396f63f770deaa554748ff739bedfa650e3bb74595a",
+        "sha256:8eb409f343f7d78dbc2bf2cedbae7594a8636b10644a4b8790eb02bc69fc2e6e",
+        "sha256:4a5782c39a224d711c6d9a4f40bed6bae5ad3e2e54adb448b4da075f29936cf7",
+        "sha256:5cd74f044aebdb99f8bf56bb83183c007b64458afe2a69882c24826a49df2e50"
+      ]
+    },
+    {
+      "artifact": "event-logger.oci.tar",
+      "destination": "docker.io/guischet/bip300-event-logger:sha-2f2574d46d1b",
+      "digest": "sha256:b84a360bc26fd1e8ac40e12ce676d722b28f7bb176dbd2956acf5ad8ae3b701c",
+      "config_digest": "sha256:acadab5184f567574319c0388c8c48aac25cb3de608f2722cf0508473b2332c5",
+      "source_commit": "2f2574d46d1bc9d888932f1161a2ab18d3b9dee6",
+      "platform": "linux/amd64",
+      "rootfs": [
+        "sha256:81f823b9617547261c907396f63f770deaa554748ff739bedfa650e3bb74595a",
+        "sha256:8eb409f343f7d78dbc2bf2cedbae7594a8636b10644a4b8790eb02bc69fc2e6e",
+        "sha256:4a5782c39a224d711c6d9a4f40bed6bae5ad3e2e54adb448b4da075f29936cf7",
+        "sha256:1fcb9f2ecb985f9a3210467d06adf92d140dde034d82258225c303bb487b837b"
+      ]
+    },
+    {
+      "artifact": "observatory.oci.tar",
+      "destination": "docker.io/guischet/drivechain-observatory:sha-026d0c739c86",
+      "digest": "sha256:12d1779804e7f14aef228ab81f2246e63aa40dd1b9cca4d340349b16da2fff30",
+      "config_digest": "sha256:14c522b1c92eaccf9358c6044fcc34372d2d16f4658447bf3ec6f99385d9fadb",
+      "source_commit": "026d0c739c86eb4c18ba87be7de4ebbae25c91ad",
+      "platform": "linux/amd64",
+      "rootfs": [
+        "sha256:1d69a5fd31932841d7825ef4780c06f008eea65aaa9f3110fe09d5832ed5c7d8",
+        "sha256:78284dbaeacbf4641af3dda55f8337e38ad992d5ff212fc2d83939b8159ab5be",
+        "sha256:34867e8a7d5499c9d91fa4f518444c23d7a6905e38e0cf2808d265fa93f2988c",
+        "sha256:8b2575bfb6172f29844aee85c1770948cca429d50da9c317c3697dd13f9ee336",
+        "sha256:0649685e64acd00e1ce9822032c820bcb723a56d0f1fe6e0734459c99dc1fbed"
+      ]
+    }
+  ],
+  "validation": {
+    "monitor_tests_passed": 153,
+    "observatory_unit_tests_passed": 14,
+    "real_postgres_integration": true,
+    "browser": true,
+    "paired_dump_restore": true,
+    "official_protobuf_online_match": true,
+    "least_privilege_rpc_regtest": true
+  },
+  "remaining_release_steps": [
+    "review and merge the monitor and Observatory changes; do not merge the archived enforcer fork",
+    "publish exact OCI bytes preserving recorded digests",
+    "verify registry digests, then mark RELEASE_STATUS=ready in a reviewed deployment commit",
+    "HOSTKEY read-only preflight and operator-approved cutover",
+    "freeze writers, verify paired production backups off-host, use fresh databases and official enforcer directory",
+    "verify and verify-live including zero-slot global stream; retain 24-hour production observation"
+  ]
+}
