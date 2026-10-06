@@ -1,6 +1,7 @@
-//! One global stream covers transitions even when no sidechain exists.
+//! Global observations via the official slot subscription. Slot 0 is a transport
+//! selector only: these records never claim a sidechain instance or server revision.
 use crate::{EnforcerClient, convert, proto::mainchain};
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use shared::{
     protobuf::{
         enforcer_extractor as events,
@@ -14,83 +15,63 @@ use tokio::sync::watch;
 
 pub(crate) async fn monitor(
     mut client: EnforcerClient,
-    mut stream: tonic::Streaming<mainchain::SubscribeMainchainEventsResponse>,
+    mut stream: tonic::Streaming<mainchain::SubscribeEventsResponse>,
     recorder: Recorder,
     block_tx: watch::Sender<Vec<u8>>,
     tip_tx: watch::Sender<ObservedBlock>,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
     loop {
-        let mut previous: Option<(String, u64)> = None;
         let failure = loop {
-            let item = tokio::select! {
-                biased;
-                _ = shutdown.changed() => return Ok(()),
-                item = stream.message() => item,
-            };
+            let item =
+                tokio::select! { _=shutdown.changed()=>return Ok(()), item=stream.message()=>item };
             let response = match item {
-                Ok(Some(response)) => response,
-                Ok(None) => break "global mainchain stream ended".to_owned(),
-                Err(error) => break format!("global mainchain stream interrupted: {error}"),
+                Ok(Some(r)) => r,
+                Ok(None) => break "official global subscription ended".to_owned(),
+                Err(error) => break format!("official global subscription interrupted: {error}"),
             };
-            let payload = match convert::mainchain_transition(response) {
-                Ok(payload) => payload,
-                Err(error) => break format!("invalid global mainchain event: {error:#}"),
-            };
-            let Some(events::enforcer_event::Event::MainchainTransition(transition)) =
-                &payload.event
-            else {
-                unreachable!()
-            };
-            if let Err(error) = check_sequence(previous.as_ref(), transition) {
-                break error.to_string();
-            }
-            previous = Some((transition.observer_session.clone(), transition.sequence));
-            let anchor = transition
-                .header
-                .as_ref()
-                .map(|h| ObservedBlock::at_height(h.hash.clone(), h.height));
-            let tip = match (&transition.header, transition.action) {
-                (Some(h), 1) => Some(ObservedBlock::at_height(h.hash.clone(), h.height)),
-                (Some(h), 2) => h
-                    .height
-                    .checked_sub(1)
-                    .map(|height| ObservedBlock::at_height(h.previous_hash.clone(), height)),
-                _ => None,
-            };
-            let event = Event::new(MonitorEvent::Enforcer(payload), anchor)?;
+            let (payload, anchor) = global_event(response)?;
             recorder
-                .record(event)
-                .await
-                .context("recording global chain transition")?;
-            if let Some(tip) = tip {
-                let prior = tip_tx.borrow().clone();
-                recorder
-                    .record_tip_observation(
-                        &tip,
-                        Some(&prior),
-                        CaptureMethod::Live,
-                        SystemTime::now(),
-                    )
-                    .await?;
-                block_tx.send_replace(tip.hash.clone());
-                tip_tx.send_replace(tip);
-            }
-            recorder
-                .record_worker_success(ExtractorWorker::MainchainEvents)
+                .record(Event::new(MonitorEvent::Enforcer(payload), Some(anchor))?)
                 .await?;
+            // Stream delivery has no atomic baseline/revision. Ask for the actual
+            // enforcer tip instead of promoting a buffered event to current tip.
+            match client.get_chain_tip().await.and_then(convert::chain_tip) {
+                Ok(payload) => {
+                    let tip = crate::state::tip_anchor(&payload)?;
+                    let prior = tip_tx.borrow().clone();
+                    recorder
+                        .record_tip_observation(
+                            &tip,
+                            Some(&prior),
+                            CaptureMethod::Poll,
+                            SystemTime::now(),
+                        )
+                        .await?;
+                    block_tx.send_replace(tip.hash.clone());
+                    tip_tx.send_replace(tip);
+                    recorder
+                        .record_worker_success(ExtractorWorker::MainchainEvents)
+                        .await?;
+                }
+                Err(error) => {
+                    recorder
+                        .record_worker_failure(
+                            ExtractorWorker::MainchainEvents,
+                            &format!("tip reconciliation: {error:#}"),
+                            1,
+                        )
+                        .await?;
+                }
+            }
         };
         recorder
             .record_worker_failure(ExtractorWorker::MainchainEvents, &failure, 1)
             .await?;
         let mut delay = 1;
         loop {
-            tokio::select! {
-                biased;
-                _ = shutdown.changed() => return Ok(()),
-                _ = tokio::time::sleep(Duration::from_secs(delay)) => {},
-            }
-            match client.subscribe_mainchain_events().await {
+            tokio::select! { _=shutdown.changed()=>return Ok(()), _=tokio::time::sleep(Duration::from_secs(delay))=>{} }
+            match client.subscribe_events(0).await {
                 Ok(next) => {
                     stream = next;
                     break;
@@ -99,7 +80,7 @@ pub(crate) async fn monitor(
                     recorder
                         .record_worker_failure(
                             ExtractorWorker::MainchainEvents,
-                            &format!("global resubscription failed: {error:#}"),
+                            &format!("resubscription: {error:#}"),
                             1,
                         )
                         .await?;
@@ -109,43 +90,89 @@ pub(crate) async fn monitor(
         }
     }
 }
-
-fn check_sequence(
-    previous: Option<&(String, u64)>,
-    event: &events::MainchainTransition,
-) -> Result<()> {
-    match previous {
-        None if event.action == 3 => Ok(()),
-        Some((session, sequence))
-            if (1..=2).contains(&event.action)
-                && session == &event.observer_session
-                && sequence.checked_add(1) == Some(event.sequence) =>
-        {
-            Ok(())
+fn global_event(
+    response: mainchain::SubscribeEventsResponse,
+) -> Result<(events::EnforcerEvent, ObservedBlock)> {
+    let event = convert::subscription_event(0, response)?;
+    let (header, anchor, action) = match event.event.context("missing subscription event")? {
+        events::enforcer_event::Event::BlockConnected(block) => {
+            let h = block.header.context("connection without header")?;
+            let anchor = ObservedBlock::at_height(h.hash.clone(), h.height);
+            (Some(h), anchor, 1)
         }
-        _ => bail!(
-            "mainchain observation gap or missing subscription boundary; reconciliation required"
-        ),
-    }
+        events::enforcer_event::Event::BlockDisconnected(block) => {
+            (None, ObservedBlock::without_height(block.block_hash), 2)
+        }
+        _ => anyhow::bail!("unexpected subscription event"),
+    };
+    Ok((
+        events::EnforcerEvent {
+            event: Some(events::enforcer_event::Event::MainchainTransition(
+                events::MainchainTransition {
+                    observer_session: String::new(),
+                    sequence: 0,
+                    action,
+                    header,
+                },
+            )),
+        },
+        anchor,
+    ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::proto::common;
     #[test]
-    fn sequence_gaps_and_new_sessions_are_not_silent_reorganizations() {
-        let mut event = events::MainchainTransition {
-            observer_session: "s".into(),
-            action: 3,
-            sequence: 100,
-            ..Default::default()
+    fn empty_slot_transport_still_reports_global_connect_and_disconnect() {
+        use mainchain::subscribe_events_response::{Event, event};
+        let response = mainchain::SubscribeEventsResponse {
+            event: Some(Event {
+                event: Some(event::Event::ConnectBlock(event::ConnectBlock {
+                    header_info: Some(mainchain::BlockHeaderInfo {
+                        block_hash: Some(common::ReverseHex {
+                            hex: Some("11".repeat(32)),
+                        }),
+                        prev_block_hash: Some(common::ReverseHex {
+                            hex: Some("22".repeat(32)),
+                        }),
+                        height: 42,
+                        work: Some(common::ConsensusHex {
+                            hex: Some("01".repeat(32)),
+                        }),
+                        timestamp: 1,
+                    }),
+                    block_info: Some(mainchain::BlockInfo {
+                        bmm_commitment: None,
+                        events: vec![],
+                    }),
+                })),
+            }),
         };
-        assert!(check_sequence(None, &event).is_ok());
-        event.action = 1;
-        event.sequence = 101;
-        assert!(check_sequence(Some(&("s".into(), 100)), &event).is_ok());
-        assert!(check_sequence(Some(&("s".into(), 99)), &event).is_err());
-        assert!(check_sequence(Some(&("other".into(), 100)), &event).is_err());
-        assert!(check_sequence(None, &event).is_err());
+        let (payload, anchor) = global_event(response).unwrap();
+        assert_eq!(anchor.height, Some(42));
+        let Some(events::enforcer_event::Event::MainchainTransition(t)) = payload.event else {
+            panic!("global event expected")
+        };
+        assert_eq!(t.action, 1);
+        assert_eq!(t.sequence, 0);
+        assert!(t.observer_session.is_empty());
+        let response = mainchain::SubscribeEventsResponse {
+            event: Some(Event {
+                event: Some(event::Event::DisconnectBlock(event::DisconnectBlock {
+                    block_hash: Some(common::ReverseHex {
+                        hex: Some("11".repeat(32)),
+                    }),
+                })),
+            }),
+        };
+        let (payload, anchor) = global_event(response).unwrap();
+        assert_eq!(anchor.height, None);
+        let Some(events::enforcer_event::Event::MainchainTransition(t)) = payload.event else {
+            panic!("global event expected")
+        };
+        assert_eq!(t.action, 2);
+        assert!(t.header.is_none());
     }
 }

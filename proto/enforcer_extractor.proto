@@ -61,6 +61,7 @@ message BlockHeader {
   // Proof contributed by this block, uint256 little-endian.
   bytes block_work = 6;
   // Absolute accumulated proof from genesis, uint256 little-endian.
+  // Empty for official enforcer headers; only the node supplies this evidence.
   bytes cumulative_work = 7;
   // Block timestamp in seconds since the Unix epoch.
   uint64 timestamp = 5;
@@ -208,6 +209,8 @@ message ConfirmedBmmRequest {
 // not a complete transaction history: requests may enter and leave between
 // polls. The envelope is anchored to the same parent block recorded here.
 message BmmRequestsSnapshot {
+  // Legacy contract 7 fields. Contract 8 always leaves these empty/zero:
+  // upstream does not expose readiness or an internal mempool generation.
   string observer_session = 3;
   uint64 mempool_generation = 4;
   // 32-byte parent block hash in conventional display order.
@@ -364,6 +367,8 @@ message BlockDisconnected {
 // Session/sequence describe observation order, not block height. A subscription
 // boundary records the beginning of evidence and carries no block header.
 message MainchainTransition {
+  // Legacy server sequence fields: empty/zero in contract 8. Capture order
+  // belongs to event_observation; upstream provides no durable sequence.
   string observer_session = 1;
   uint64 sequence = 2;
   // 3 = subscription boundary, 1 = connected, 2 = disconnected.

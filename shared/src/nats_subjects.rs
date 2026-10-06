@@ -10,6 +10,8 @@ pub const ENFORCER_EVENTS: &str = "bip300.enforcer";
 pub enum Subject {
     /// Chain state, sidechain snapshots, and live block events.
     Enforcer,
+    Node,
+    All,
 }
 
 impl Subject {
@@ -17,6 +19,8 @@ impl Subject {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Enforcer => ENFORCER_EVENTS,
+            Self::Node => "bip300.node",
+            Self::All => "bip300.*",
         }
     }
 }

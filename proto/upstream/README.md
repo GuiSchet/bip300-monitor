@@ -1,60 +1,13 @@
-# Vendored enforcer API
+# Official enforcer API
 
-These protobuf files are copied from the reviewed observer fork:
+- Repository: https://github.com/LayerTwo-Labs/bip300301_enforcer
+- Official commit: `1753fc0c23863bcb39c681e1cfaea2705613516f`
 
-- Official repository: <https://github.com/LayerTwo-Labs/bip300301_enforcer>
-- Observer fork: <https://github.com/GuiSchet/bip300301_enforcer>
-- Base commit: `0e27251ef351a522c72ab9ef079f75e06075390f`
-- Latest upstream commit reviewed for compatibility (not deployed):
-  `6e5f79f7668b0f82eab788531adb2ea21664d972`
-- Observer commit: `9b2a15621469a88ea5d3b8f1dcd5ee1bb21e0ac4`
-- Local branch: `fix/observer-data-quality-v7` in the enforcer worktree
-- Published branch: `feature/betanet-monitor-observer` in the observer fork
-- Copied: 2026-10-04
+Files are copied verbatim from `proto/` at that commit. `SHA256SUMS` records
+their bytes. No patch, private LMDB access, or fork-specific RPC is supported.
+Run `.github/scripts/check-proto-vendor.sh --online` when updating the pin.
 
-The v7 observer adds absolute cumulative work, generation-scoped mempool
-readiness, committed global chain transitions, persisted chain revisions and
-independent confirmed-fee enrichment. It preserves the original per-block work
-field in the upstream RPC. This source is a local reviewed release candidate;
-publication and production cutover are separate release steps.
-
-`validator-observer.patch` is the reproducible delta from the official
-`validator.proto` to the vendored observer contract. This lets CI reconstruct
-and verify the contract without trusting a moving branch or requiring the
-local fork to have been published first.
-
-## Files and SHA-256
-
-```text
-aa6f2f0f2afa1794e98ffecd71466c689b8ede823ecfd4963a04a23598931e80  cusf/common/v1/common.proto
-7b9fabbd734dcac30fc76e08ccc286b66828bf739eeb6af7bd5ade818ba899b0  cusf/mainchain/v1/common.proto
-cce860b032a699bab93088231c24c4c2a8d8f9293f42382a29f4cfc6139e1bef  cusf/mainchain/v1/validator.proto
-```
-
-The pinned upstream commit does not contain a root license file. This
-provenance note records that fact rather than attributing a license that is not
-present upstream. The `bip300-monitor` source outside this directory is
-licensed under MIT.
-
-The base and observer commits above must equal `ENFORCER_BASE_COMMIT` and
-`ENFORCER_OBSERVER_COMMIT` in the deployment lock selected through
-`BIP300_MONITOR_PROTO_VERSIONS_FILE`. CI also selects
-`deployments/ecash/VERSIONS.betanet.lock.example` to prove its audit reference
-has not drifted from the active lock. `.github/scripts/check-proto-vendor.sh`
-enforces that, re-checks the checksums against disk, downloads the official
-base, applies the checked-in observer patch and confirms the reconstructed API
-byte for byte. If the sibling
-`upstream/enforcer` checkout is available, it additionally verifies the exact
-observer commit and ancestry. A later observer update therefore requires
-re-vendoring and changing the immutable runtime pin in the same change.
-
-Before updating these files:
-
-1. review the upstream API and commit;
-2. replace all three files and `validator-observer.patch` together;
-3. update both commits and the checksums above;
-4. run `.github/scripts/check-proto-vendor.sh --online`;
-5. run the CI-equivalent workspace tests and
-   `deployments/ecash/scripts/static-check.sh`;
-6. after deploying the reviewed commit, run `just verify` and
-   `just verify-live` from `deployments/ecash` against the real enforcer.
+Contract 8 capabilities are documented in `docs/official-sources.md`. The
+official enforcer supplies per-block work, no transactional revision, and no
+mempool readiness proof. Normalization must not invent these guarantees.
+The pinned upstream has no root license file; no upstream license is inferred.

@@ -19,6 +19,7 @@ use crate::protobuf::event::Event;
 /// `hexadecimal_field_list_covers_every_proto_bytes_field` test keeps the list
 /// complete.
 pub const BYTE_FIELDS: &[&str] = &[
+    "raw_block",
     "address",
     "block_hash",
     "bmm_commitment",

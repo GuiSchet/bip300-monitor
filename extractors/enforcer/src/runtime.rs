@@ -26,7 +26,6 @@ use tonic::{Status, Streaming};
 use crate::backfill;
 use crate::config::Args;
 use crate::event::envelope;
-use crate::header_backfill;
 use crate::proto::mainchain;
 use crate::snapshot::{self, InitialSnapshot, record_snapshot};
 use crate::state;
@@ -120,7 +119,7 @@ trait BmmSource: Send {
 
 impl BmmSource for EnforcerClient {
     fn revision(&mut self) -> SourceFuture<'_, Option<String>> {
-        Box::pin(async { Ok(Some(convert::chain_revision(&self.get_chain_tip().await?)?)) })
+        Box::pin(async { Ok(None) })
     }
 
     fn current_tip(&mut self) -> SourceFuture<'_, ObservedBlock> {
@@ -161,7 +160,7 @@ impl StateSource for EnforcerClient {
 }
 
 struct PreparedStartup {
-    mainchain_stream: tonic::Streaming<mainchain::SubscribeMainchainEventsResponse>,
+    mainchain_stream: EventStream,
     recorder: Recorder,
     client: EnforcerClient,
     /// Desired slots: either explicitly configured (including currently inactive
@@ -188,7 +187,6 @@ struct BackfillRequest {
 pub async fn run(args: Args, mut shutdown_rx: watch::Receiver<bool>) -> Result<()> {
     args.validate()
         .context("validating extractor configuration")?;
-    let activation_block_hash = args.activation_block_hash_bytes()?;
 
     let startup = prepare_startup(&args);
     tokio::pin!(startup);
@@ -276,13 +274,6 @@ pub async fn run(args: Args, mut shutdown_rx: watch::Receiver<bool>) -> Result<(
             state::Tracker::new(snapshot.state).with_consistency(snapshot_metadata.consistency);
 
         let mut workers = JoinSet::new();
-        if args.confirmed_bmm_fees {
-            workers.spawn(crate::fees::monitor(
-                client.clone(),
-                recorder.clone(),
-                shutdown_rx.clone(),
-            ));
-        }
         workers.spawn(crate::mainchain::monitor(
             client.clone(),
             mainchain_stream,
@@ -333,20 +324,6 @@ pub async fn run(args: Args, mut shutdown_rx: watch::Receiver<bool>) -> Result<(
             sidechain_state_tx,
             shutdown_rx.clone(),
         ));
-        workers.spawn(backfill_bip300_history(
-            client.clone(),
-            recorder.clone(),
-            args.activation_height,
-            activation_block_hash,
-            snapshot.anchor.clone(),
-            backfill::Settings {
-                page_blocks: args.backfill_page_blocks,
-                page_pause: args.backfill_page_pause(),
-            },
-            args.tip_poll_interval(),
-            tip_rx.clone(),
-            shutdown_rx.clone(),
-        ));
         // Live workers are installed before this task. Historical pages are small,
         // persisted without NATS fan-out, and use the same short Postgres critical
         // section as live writes, so catch-up cannot build an unbounded stream
@@ -387,101 +364,6 @@ pub async fn run(args: Args, mut shutdown_rx: watch::Receiver<bool>) -> Result<(
                 );
             }
             Err(error)
-        }
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn backfill_bip300_history(
-    mut client: EnforcerClient,
-    recorder: Recorder,
-    activation_height: u32,
-    activation_block_hash: Option<Vec<u8>>,
-    mut target: ObservedBlock,
-    settings: backfill::Settings,
-    retry_interval: Duration,
-    mut tip_rx: watch::Receiver<ObservedBlock>,
-    mut shutdown_rx: watch::Receiver<bool>,
-) -> Result<()> {
-    tracing::info!(activation_height, "started global BIP300 history worker");
-    loop {
-        let requested_target = target.clone();
-        match header_backfill::run(
-            &mut client,
-            &recorder,
-            activation_height,
-            activation_block_hash.as_deref(),
-            &target,
-            settings,
-            shutdown_rx.clone(),
-        )
-        .await?
-        {
-            header_backfill::Outcome::Interrupted { .. } => return Ok(()),
-            header_backfill::Outcome::Superseded { .. } => {
-                bail!("global BIP300 history was unexpectedly superseded")
-            }
-            header_backfill::Outcome::Deferred {
-                target: deferred_target,
-                ..
-            } => {
-                target = deferred_target;
-                tokio::select! {
-                    biased;
-                    () = wait_for_shutdown(&mut shutdown_rx) => return Ok(()),
-                    () = tokio::time::sleep(retry_interval) => {}
-                }
-            }
-            header_backfill::Outcome::UpToDate {
-                target: reached_target,
-            }
-            | header_backfill::Outcome::Completed {
-                target: reached_target,
-                ..
-            } => {
-                if reached_target.hash != requested_target.hash {
-                    tracing::info!(
-                        reached_target = %hex::encode(&reached_target.hash),
-                        requested_target = %hex::encode(&requested_target.hash),
-                        "completed the persisted global-history target; reconciling from the reached branch"
-                    );
-                }
-                target = reached_target;
-                let current_tip = match snapshot::current_tip(&mut client).await {
-                    Ok(current_tip) => current_tip,
-                    Err(error) if backfill::retryable_rpc_error(&error) => {
-                        tracing::warn!(
-                            retry_seconds = retry_interval.as_secs(),
-                            error = %format!("{error:#}"),
-                            "could not reconcile global BIP300 history with the tip; retrying"
-                        );
-                        tokio::select! {
-                            biased;
-                            () = wait_for_shutdown(&mut shutdown_rx) => return Ok(()),
-                            () = tokio::time::sleep(retry_interval) => {}
-                        }
-                        continue;
-                    }
-                    Err(error) => {
-                        return Err(error)
-                            .context("reconciling global BIP300 history with the tip");
-                    }
-                };
-                if current_tip.hash != target.hash {
-                    target = current_tip;
-                    continue;
-                }
-                tokio::select! {
-                    biased;
-                    () = wait_for_shutdown(&mut shutdown_rx) => return Ok(()),
-                    changed = tip_rx.changed() => {
-                        if changed.is_err() {
-                            return Ok(());
-                        }
-                        target = tip_rx.borrow_and_update().clone();
-                    }
-                }
-            }
         }
     }
 }
@@ -814,8 +696,8 @@ async fn prepare_startup(args: &Args) -> Result<PreparedStartup> {
         .await
         .context("connecting the enforcer client")?;
 
-    let mainchain_stream = client.subscribe_mainchain_events().await?;
-    let revision_before = Some(convert::chain_revision(&client.get_chain_tip().await?)?);
+    let mainchain_stream = client.subscribe_events(0).await?;
+    let revision_before = None;
     let (sidechains, observation) = prepare_stable_observation(&mut client, &args.sidechains)
         .await
         .context("preparing enforcer subscriptions and initial snapshot")?;
@@ -825,8 +707,7 @@ async fn prepare_startup(args: &Args) -> Result<PreparedStartup> {
         mut snapshot_metadata,
     } = observation;
     snapshot_metadata.revision_before = revision_before;
-    snapshot_metadata.revision_after =
-        Some(convert::chain_revision(&client.get_chain_tip().await?)?);
+    snapshot_metadata.revision_after = None;
     if snapshot_metadata.revision_before != snapshot_metadata.revision_after {
         snapshot_metadata.consistency = SnapshotConsistency::Changed;
     }
@@ -852,11 +733,6 @@ async fn prepare_startup(args: &Args) -> Result<PreparedStartup> {
         ])
         .await
         .context("initializing extractor worker status")?;
-    if args.confirmed_bmm_fees {
-        recorder
-            .initialize_worker_statuses(&[ExtractorWorker::ConfirmedBmmFees])
-            .await?;
-    }
 
     Ok(PreparedStartup {
         mainchain_stream,
@@ -963,11 +839,11 @@ where
             &snapshot.anchor.hash,
             &tip_after.hash,
         ) {
-            SnapshotConsistency::Stable
+            SnapshotConsistency::TipMatched
         } else {
             SnapshotConsistency::Changed
         };
-        if consistency == SnapshotConsistency::Stable || attempts == SNAPSHOT_MAX_ATTEMPTS {
+        if consistency == SnapshotConsistency::TipMatched || attempts == SNAPSHOT_MAX_ATTEMPTS {
             return Ok((
                 snapshot,
                 SnapshotMetadata {
@@ -1536,7 +1412,7 @@ async fn collect_bmm_sample<S: BmmSource>(
                     finished_at: SystemTime::now(),
                     tip_before,
                     tip_after,
-                    consistency: SnapshotConsistency::Stable,
+                    consistency: SnapshotConsistency::TipMatched,
                     attempts,
                 },
             ));
@@ -1667,7 +1543,8 @@ async fn monitor_state(
                     .record_snapshot_batch(events, CaptureMethod::Poll, &metadata)
                     .await
                     .context("recording refreshed enforcer state")?;
-                if active_sidechains_changed && metadata.consistency == SnapshotConsistency::Stable
+                if active_sidechains_changed
+                    && metadata.consistency == SnapshotConsistency::TipMatched
                 {
                     sidechain_state_tx.send_modify(|version| {
                         *version = version.wrapping_add(1);
@@ -1878,7 +1755,7 @@ async fn abort_and_drain<T: 'static>(workers: &mut JoinSet<T>) {
 fn enforcer_payload(event: &Event) -> Result<&events::EnforcerEvent> {
     match event.monitor_event.as_ref() {
         Some(MonitorEvent::Enforcer(payload)) => Ok(payload),
-        None => bail!("event envelope does not contain a monitor event"),
+        _ => bail!("event envelope does not contain an enforcer event"),
     }
 }
 
@@ -2234,8 +2111,6 @@ mod tests {
             parents: Arc::new(Mutex::new(Vec::new())),
             responses: Arc::new(Mutex::new(
                 std::iter::repeat_with(|| mainchain::GetSeenBmmRequestsResponse {
-                    observer_session: "test-session".into(),
-                    mempool_generation: 1,
                     requests: vec![],
                 })
                 .take(response_count)
@@ -2250,7 +2125,7 @@ mod tests {
         let (payload, metadata) = collect_bmm_sample(&mut source, 3)
             .await
             .expect("stable BMM sample");
-        assert_eq!(metadata.consistency, SnapshotConsistency::Stable);
+        assert_eq!(metadata.consistency, SnapshotConsistency::TipMatched);
         assert_eq!(metadata.attempts, 1);
         assert_eq!(metadata.tip_before.hash, vec![0x11; 32]);
         let events::enforcer_event::Event::BmmRequests(snapshot) =
@@ -2299,8 +2174,6 @@ mod tests {
             .lock()
             .unwrap()
             .push_back(mainchain::GetSeenBmmRequestsResponse {
-                observer_session: "test-session".into(),
-                mempool_generation: 1,
                 requests: vec![mainchain::get_seen_bmm_requests_response::BmmRequest {
                     sidechain_number: 256,
                     ..Default::default()
@@ -2425,9 +2298,6 @@ mod tests {
                     mainchain::subscribe_events_response::event::Event::ConnectBlock(
                         mainchain::subscribe_events_response::event::ConnectBlock {
                             header_info: Some(mainchain::BlockHeaderInfo {
-                                cumulative_work: Some(common::ConsensusHex {
-                                    hex: Some("55".repeat(32)),
-                                }),
                                 block_hash: reverse_hex(hash),
                                 prev_block_hash: reverse_hex(previous_hash),
                                 height,
@@ -2601,7 +2471,7 @@ mod tests {
                         finished_at: SystemTime::now(),
                         tip_before: anchor.clone(),
                         tip_after: anchor,
-                        consistency: SnapshotConsistency::Stable,
+                        consistency: SnapshotConsistency::TipMatched,
                         attempts: 1,
                     },
                 })

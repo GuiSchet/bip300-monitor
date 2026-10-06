@@ -1,5 +1,5 @@
 -- Operational counters; run read-only daily and retain the output for trends.
--- Scope is explicit: psql -v dataset=UUID -v contract=7 -f quality-report.sql.
+-- Scope is explicit: psql -v dataset=UUID -v contract=8 -f quality-report.sql.
 \set ON_ERROR_STOP on
 SELECT now() AS sampled_at,pg_database_size(current_database()) AS database_bytes;
 SELECT kind,count(*) AS facts,sum(pg_column_size(envelope)) AS envelope_bytes,

@@ -1,7 +1,9 @@
+# Candidate images must be regenerated and verified before deployment.
+RELEASE_STATUS=preparing
 # shellcheck shell=bash
 # Reproducible eCash Betanet network, image, tool, and snapshot lock.
 LOCK_FORMAT=5
-LOCKED_AT=2026-10-04
+LOCKED_AT=2026-10-05
 
 NETWORK_ID=betanet
 ECASH_NODE_CHAIN=main
@@ -23,13 +25,11 @@ ECASH_NODE_COMMIT=ca64033c137457a3c8ca394186759819a2ab0694
 ECASH_NODE_IMAGE=ghcr.io/ecash-com/bitcoin:betanet@sha256:b98407f8853d2d7f6c060e6c4b99641402ede40d9227730474bfa2beea239f52
 ECASH_NODE_EXPECTED_VERSION=31
 
-ENFORCER_REPO=https://github.com/GuiSchet/bip300301_enforcer.git
-ENFORCER_BRANCH=fix/observer-data-quality-v7
-ENFORCER_BASE_COMMIT=0e27251ef351a522c72ab9ef079f75e06075390f
-ENFORCER_UPSTREAM_REVIEWED_COMMIT=6e5f79f7668b0f82eab788531adb2ea21664d972
-ENFORCER_OBSERVER_COMMIT=9b2a15621469a88ea5d3b8f1dcd5ee1bb21e0ac4
-ENFORCER_COMMIT=9b2a15621469a88ea5d3b8f1dcd5ee1bb21e0ac4
-ENFORCER_IMAGE=ghcr.io/guischet/bip300301_enforcer:sha-9b2a15621469@sha256:c5b2bb10650d8226671e9c1d8fe5cc791a8041cc7b7b85b86e2d90267c63cc5c
+ENFORCER_REPO=https://github.com/LayerTwo-Labs/bip300301_enforcer.git
+ENFORCER_BRANCH=master
+ENFORCER_UPSTREAM_REVIEWED_COMMIT=1753fc0c23863bcb39c681e1cfaea2705613516f
+ENFORCER_COMMIT=1753fc0c23863bcb39c681e1cfaea2705613516f
+ENFORCER_IMAGE=ghcr.io/guischet/bip300-enforcer-official:sha-1753fc0c2386@sha256:20ee50366ee941731d26a47580481fd88ec2747014bc6cd18628a8844f4154dc
 ENFORCER_NETWORK_PRESET=betanet
 ENFORCER_API_NETWORK=NETWORK_MAINNET
 
@@ -41,7 +41,7 @@ POSTGRES_USER=bip300_monitor
 # Local reviewed release candidate; OCI artifacts must be published before apply.
 # Keep contract, source commit, and both immutable image
 # digests together.
-MONITOR_EVENT_CONTRACT_VERSION=7
+MONITOR_EVENT_CONTRACT_VERSION=8
 MONITOR_IMAGE_COMMIT=ecf5b8290e6b5501508a4a3913bd93c83728cca1
 ENFORCER_EXTRACTOR_IMAGE=docker.io/guischet/bip300-enforcer-extractor:sha-ecf5b8290e6b@sha256:e5e1b9fbcaa7a3493cbc25b9efddb9e5f70a52ecddd29b01919760757b9c3bf8
 EVENT_LOGGER_IMAGE=docker.io/guischet/bip300-event-logger:sha-ecf5b8290e6b@sha256:e6328fb87385d8b6210999c2d32aed85104520acdd1f60dfc3db338157dca328

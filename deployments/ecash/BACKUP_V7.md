@@ -35,11 +35,12 @@ Cutover sequence, after release approval:
    cutover-TIMESTAMP`. It refuses without the matching receipt, refuses a
    restarted or replaced extractor (container identity and full precision
    startup timestamp), and moves the old cluster into the permanent archive.
-4. Apply the approved v7 enforcer+monitor images. The new monitor creates a
-   fresh dataset; it refuses an existing v6 identity before applying migrations.
+4. Preserve the old enforcer directory and use a fresh `enforcer-official-v8`
+   directory. Apply the approved official enforcer+monitor images. The new monitor creates a
+   fresh dataset; it refuses an existing pre-contract-8 identity before applying migrations.
 5. Grant the Observatory reader SELECT on `observation_failure`, configure the
-   new dataset UUID and run the projection6 importer. Preserve the old record
-   and old Observatory generation for archival access with their paired binary.
+   new dataset UUID and run the projection7 importer. Preserve the old record
+   and a separate old Observatory database for archival access with their paired binary.
 6. Run `just verify`, `just verify-live` for every slot and `just accept`.
    Collect `quality-report.sql` daily and retain transaction wait/duration logs.
    Enable `BIP300_MONITOR_CONFIRMED_BMM_FEES=true` only after core acceptance.
@@ -47,7 +48,7 @@ Cutover sequence, after release approval:
 
 Rollback stops the new extractor and Postgres, archives the new cluster, and
 restores the old cluster **with the old images from its archived lock**. Never
-start an older monitor against schema8. Run verification again and keep both
+start an older monitor against schema9. Run verification again and keep both
 cutover archives. Do not reset node chainstate or enforcer LMDB.
 
 Local regression checks: `python3 scripts/test-backup-cutover.py` simulates

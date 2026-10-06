@@ -48,7 +48,6 @@ fn header(hash_byte: u8, height: u32) -> mainchain::BlockHeaderInfo {
         prev_block_hash: reverse_hex(hash_byte.saturating_sub(1)),
         height,
         work: consensus_hex(&[0x44; 32]),
-        cumulative_work: consensus_hex(&[0x55; 32]),
         timestamp: 1_750_000_000,
     }
 }
@@ -148,8 +147,6 @@ fn converts_chain_info_and_tip() {
     assert_eq!(constants.activation_height, 100);
 
     let chain_tip = convert::chain_tip(mainchain::GetChainTipResponse {
-        observer_session: "test-session".into(),
-        chain_revision: 0,
         block_header_info: Some(header(0x22, 321)),
     })
     .expect("valid chain tip");
@@ -160,7 +157,7 @@ fn converts_chain_info_and_tip() {
     assert_eq!(header.hash, vec![0x22; 32]);
     assert_eq!(header.previous_hash, vec![0x21; 32]);
     assert_eq!(header.block_work, vec![0x44; 32]);
-    assert_eq!(header.cumulative_work, vec![0x55; 32]);
+    assert!(header.cumulative_work.is_empty());
     assert_eq!(header.height, 321);
     assert_eq!(header.timestamp, 1_750_000_000);
 }
@@ -459,8 +456,6 @@ fn a_block_holding_nothing_for_the_slot_still_converts_to_one_event() {
 #[test]
 fn rejects_missing_and_malformed_required_fields() {
     let missing = convert::chain_tip(mainchain::GetChainTipResponse {
-        observer_session: "test-session".into(),
-        chain_revision: 0,
         block_header_info: None,
     })
     .expect_err("missing header must fail");
@@ -471,8 +466,6 @@ fn rejects_missing_and_malformed_required_fields() {
     );
 
     let malformed = convert::chain_tip(mainchain::GetChainTipResponse {
-        observer_session: "test-session".into(),
-        chain_revision: 0,
         block_header_info: Some(mainchain::BlockHeaderInfo {
             block_hash: Some(common::ReverseHex {
                 hex: Some("not-hex".to_owned()),
@@ -488,8 +481,6 @@ fn rejects_missing_and_malformed_required_fields() {
     );
 
     let wrong_length = convert::chain_tip(mainchain::GetChainTipResponse {
-        observer_session: "test-session".into(),
-        chain_revision: 0,
         block_header_info: Some(mainchain::BlockHeaderInfo {
             block_hash: Some(common::ReverseHex {
                 hex: Some("00".to_owned()),

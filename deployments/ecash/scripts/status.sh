@@ -158,7 +158,7 @@ fi
 info "enforcer event subscriptions"
 if subscriptions="$(nats_monitor '/subsz?subs=true' 2>/dev/null)" &&
     jq -e '.subscriptions_list' <<<"${subscriptions}" >/dev/null; then
-    jq '[.subscriptions_list[] | select(.subject == "bip300.enforcer") | {account, subject, msgs}]' \
+    jq '[.subscriptions_list[] | select(.subject == "bip300.*") | {account, subject, msgs}]' \
         <<<"${subscriptions}"
 else
     info "NATS subscription details are temporarily unavailable"

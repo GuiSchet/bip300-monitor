@@ -20,8 +20,7 @@ The extractor:
 - records every capture occurrence separately from its idempotent event fact;
 - records tip transitions and snapshot-consistency windows durably;
 - samples the live BMM auction, including successful empty states;
-- recovers both per-slot block history and global BIP300/301 deltas after
-  startup or downtime.
+- recovers per-slot official block history and independent raw node history.
 
 Postgres is authoritative. Core NATS is best-effort live delivery: historical
 pages go directly to Postgres and do not flood live consumers.
@@ -32,58 +31,44 @@ The workspace contains:
 - `extractors/enforcer`: gRPC client, conversion and extraction runtime;
 - `tools/event-logger`: live event decoder and logger.
 
-## Historical recovery
+## Official sources and recovery
 
-Two resumable streams have distinct coverage:
+Contract **8 / SQL schema 9** uses a fresh dataset. The enforcer is unmodified
+LayerTwo-Labs upstream, pinned in `deployments/ecash/VERSIONS.lock`. No private
+observer RPCs or local BIP300 consensus replay are required.
 
-- `block`, per sidechain instance, walks through that instance's activation
-  height and stores headers, BMM commitments, deposits and terminal withdrawal
-  outcomes;
-- `bip300_delta`, global even when no slot is active, walks from the network
-  activation height and stores exact BIP300 coinbase scripts, resolved
-  M1/M2/M3/M4/M7 effects, M5/M6 treasury transitions and confirmed M8
-  requests.
+Two independently checkpointed history streams are captured:
 
-Pages and cursors commit atomically, are bounded, reorg-aware and bypass NATS.
-The unary state RPCs still expose only current CTIP/proposal/pending-bundle
-state. Historical snapshots are therefore never fabricated; historical
-transitions come from persisted enforcer diffs and unpruned Core blocks.
+- `block` from official GetBlockInfo, per active sidechain instance: headers,
+  deposits, BMM commitments and withdrawal outcomes;
+- `mainchain_block` from the node: verified raw blocks, parent links and absolute
+  cumulative work, from network activation even without active slots.
 
-`GetBip300BlockDelta` lives in the reviewed enforcer observer fork recorded in
-[`proto/upstream/README.md`](proto/upstream/README.md). The deployment lock pins
-that exact commit and its immutable OCI image, so the global delta history is a
-required part of deployment verification rather than an optional development
-path.
+Pages and cursors commit atomically. Reorg repair joins a certified ancestor and
+preserves the earlier proof while the replacement completes. Conflicting facts
+remain as evidence and prevent certification. The node worker continues if the
+enforcer RPC is unavailable. Their tips are separate observations.
 
-## Event contract
+The global official SubscribeEvents(0) connection records live transitions with
+zero active slots. Reconnects are recorded as gaps; missing offline disconnects,
+server sequence numbers and historical protocol effects are not invented.
 
-Contract v7 / SQL schema8 uses a **new dataset**. `BlockHeader` now exposes
-`block_work` and `cumulative_work` separately. A ready mempool generation and a
-persisted chain revision qualify BMM samples and state snapshots. The global
-mainchain stream also observes transitions with zero active sidechains.
-Conflicting immutable block facts remain stored and prevent certification.
-Reorg repair joins a certified ancestor without erasing the previous proof;
-operator verification walks exact parent hashes and checks the node's tip.
+State RPC responses are unanchored observations with before/after tip reads.
+`tip_matched` means equal observed tips, not an atomic snapshot or proof against
+an A → B → A race. Revisions and mempool readiness are unavailable upstream.
+Every five-second BMM sample is retained, including empty responses; empty does
+not prove the mempool is ready. Optional confirmed-fee enrichment covers only
+previously observed bids matched to official commitments and node transactions.
+Missing prevouts remain unknown; money uses exact integer arithmetic.
 
-All five-second BMM occurrences are retained. Optional confirmed-fee enrichment
-(`--confirmed-bmm-fees`) runs independently and records unavailable historical
-fees explicitly. Writer wait/transaction times are logged; no connection pool
-or partitioning is introduced. See [backup and cutover](deployments/ecash/BACKUP_V7.md)
-and [quality report SQL](deployments/ecash/scripts/quality-report.sql).
+PostgreSQL is authoritative. NATS subjects are `bip300.enforcer` and
+`bip300.node`; the logger subscribes to `bip300.*`. The writer remains serialized;
+transaction wait/duration metrics and growth should be monitored. No retention
+of observations is silently introduced.
 
-The monitor publishes a versioned normalized protobuf contract rather than
-forwarding raw enforcer responses. Event contract v5 added mempool-backed live
-BMM request snapshots. Event contract v6 corrects the BIP300 description-hash
-identity, records only BMM samples bracketed by one stable parent, validates the
-enforcer network and activation height inside the extractor, and reconciles
-orphaned runs after an unclean stop. PostgreSQL schema v5 permits multiple
-auction states at one parent block without duplicating repeated observations;
-schema v6 adds independent worker health plus observation-ordered lookup; and
-schema v7 enforces one active writer run per dataset and source. Schema v4 binds
-each fact and occurrence to a dataset and extractor run, preserves `A -> B -> A`
-tip order, tracks sidechain instances and retains coverage revisions. See
-[event schema and semantics](proto/README.md) for event variants, byte order,
-snapshot semantics, idempotency and reorg handling.
+See [event semantics](proto/README.md), [candidate cutover](deployments/ecash/RELEASE_OFFICIAL.md),
+[backup/rollback](deployments/ecash/BACKUP_V7.md), and
+[quality SQL](deployments/ecash/scripts/quality-report.sql).
 
 ## Run locally
 

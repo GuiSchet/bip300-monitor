@@ -47,14 +47,14 @@ pub(crate) async fn collect(
 ) -> Result<Reading> {
     let started_at = SystemTime::now();
     let before = client.get_chain_tip().await?;
-    let revision_before = Some(convert::chain_revision(&before)?);
+    let revision_before = None;
     let tip_before = tip_anchor(&convert::chain_tip(before)?)?;
     let payloads = collect_payloads(client, sidechains, discover_new_slots).await?;
     let after = client.get_chain_tip().await?;
-    let revision_after = Some(convert::chain_revision(&after)?);
+    let revision_after = None;
     let tip_after = tip_anchor(&convert::chain_tip(after)?)?;
     let consistency = if tip_before.hash == tip_after.hash && revision_before == revision_after {
-        SnapshotConsistency::Stable
+        SnapshotConsistency::TipMatched
     } else {
         SnapshotConsistency::Changed
     };
@@ -116,7 +116,7 @@ impl Tracker {
     pub(crate) const fn new(published: Vec<events::EnforcerEvent>) -> Self {
         Self {
             last: published,
-            last_consistency: SnapshotConsistency::Stable,
+            last_consistency: SnapshotConsistency::TipMatched,
         }
     }
 
@@ -327,14 +327,14 @@ mod tests {
         assert!(tracker.needs_retry());
         assert_eq!(
             tracker
-                .take_observation(payload.clone(), SnapshotConsistency::Stable)
+                .take_observation(payload.clone(), SnapshotConsistency::TipMatched)
                 .unwrap(),
             payload
         );
         assert!(!tracker.needs_retry());
         assert!(
             tracker
-                .take_observation(payload, SnapshotConsistency::Stable)
+                .take_observation(payload, SnapshotConsistency::TipMatched)
                 .unwrap()
                 .is_empty()
         );

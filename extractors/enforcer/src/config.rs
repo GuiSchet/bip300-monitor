@@ -15,6 +15,14 @@ use crate::proto::mainchain;
 #[derive(Clone, Parser)]
 #[command(version, about, long_about = None)]
 pub struct Args {
+    /// Official node HTTP RPC, reachable only on the private network.
+    #[arg(long, env = "BIP300_MONITOR_NODE_RPC_ENDPOINT")]
+    pub node_rpc_endpoint: Option<String>,
+
+    /// File containing user:password. Deployment uses a dedicated read-only RPC identity;
+    /// reread for each request to support credential rotation.
+    #[arg(long, env = "BIP300_MONITOR_NODE_RPC_COOKIE_FILE")]
+    pub node_rpc_cookie_file: Option<std::path::PathBuf>,
     /// Core NATS connection settings, used for best-effort live fan-out.
     #[command(flatten)]
     pub nats: NatsArgs,
@@ -190,6 +198,9 @@ pub struct Args {
 impl Args {
     /// Validate invariants that are not expressible directly through clap.
     pub fn validate(&self) -> Result<()> {
+        if self.node_rpc_endpoint.is_some() != self.node_rpc_cookie_file.is_some() {
+            bail!("node RPC endpoint and cookie file must be configured together");
+        }
         if std::env::var_os("BIP300_MONITOR_BACKFILL_MAX_BLOCKS").is_some() {
             bail!(
                 "BIP300_MONITOR_BACKFILL_MAX_BLOCKS was removed: use \
@@ -284,31 +295,36 @@ impl Args {
                 "extractor_status",
                 "per_worker_health",
                 "resumable_sidechain_history",
-                "resumable_global_bip300_history",
-                "raw_bip300_coinbase_scripts",
-                "resolved_m1_m8_deltas",
-                "treasury_transitions",
                 "live_bmm_bid_snapshots",
-                "mempool_backed_bmm_bid_snapshots",
                 "bip300_description_hash_identity",
-                "stable_parent_bmm_snapshots",
                 "validated_chain_identity",
                 "orphan_run_reconciliation",
-                "absolute_chain_work",
-                "mempool_readiness_generation",
                 "global_mainchain_transitions",
                 "certified_hash_history",
                 "immutable_fact_conflicts",
-                "snapshot_state_revision"
+                "official_enforcer_api",
+                "tip_matched_snapshots",
+                "bmm_readiness_unknown",
             ]),
-            creation_reason: "Drivechain Observatory v7 observation dataset".to_owned(),
+            creation_reason: "Drivechain Observatory official-source contract 8 dataset".to_owned(),
         };
-        if self.confirmed_bmm_fees {
+        if self.node_rpc_endpoint.is_some() {
+            manifest
+                .capabilities
+                .as_array_mut()
+                .expect("array")
+                .extend([
+                    serde_json::json!("node_block_evidence"),
+                    serde_json::json!("absolute_chain_work"),
+                    serde_json::json!("resumable_node_history"),
+                ]);
+        }
+        if self.confirmed_bmm_fees && self.node_rpc_endpoint.is_some() {
             manifest
                 .capabilities
                 .as_array_mut()
                 .expect("capability array")
-                .push(serde_json::json!("confirmed_bmm_fees"));
+                .push(serde_json::json!("observed_bmm_confirmed_fees"));
         }
         manifest
     }

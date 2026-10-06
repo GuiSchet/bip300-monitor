@@ -64,21 +64,27 @@ pub(crate) struct HistoryScope<'a> {
     pub(crate) expected_start_hash: Option<&'a [u8]>,
 }
 
-type FetchFuture<'a> =
-    Pin<Box<dyn Future<Output = Result<Vec<events::EnforcerEvent>>> + Send + 'a>>;
+type FetchFuture<'a, T> = Pin<Box<dyn Future<Output = Result<Vec<T>>> + Send + 'a>>;
 
 /// The two operations that differ between historical streams.
 pub(crate) trait HistoryStream {
+    type Client;
+    type Payload;
+    fn envelope(&self, payload: Self::Payload, anchor: ObservedBlock) -> Result<Event>;
+    fn current_tip<'a>(
+        &self,
+        client: &'a mut Self::Client,
+    ) -> Pin<Box<dyn Future<Output = Result<ObservedBlock>> + Send + 'a>>;
     fn scope(&self) -> HistoryScope<'_>;
 
     fn fetch<'a>(
         &'a self,
-        client: &'a mut EnforcerClient,
+        client: &'a mut Self::Client,
         cursor: &'a ObservedBlock,
         requested: u32,
-    ) -> FetchFuture<'a>;
+    ) -> FetchFuture<'a, Self::Payload>;
 
-    fn header<'a>(&self, payload: &'a events::EnforcerEvent) -> Result<&'a events::BlockHeader>;
+    fn header<'a>(&self, payload: &'a Self::Payload) -> Result<&'a events::BlockHeader>;
 
     fn unavailable_error(&self, error: &Error) -> bool {
         error_has_code(error, Code::NotFound)
@@ -94,6 +100,18 @@ struct BlockHistory<'a> {
 }
 
 impl HistoryStream for BlockHistory<'_> {
+    type Client = EnforcerClient;
+    type Payload = events::EnforcerEvent;
+    fn envelope(&self, payload: Self::Payload, anchor: ObservedBlock) -> Result<Event> {
+        envelope(payload, anchor)
+    }
+    fn current_tip<'a>(
+        &self,
+        client: &'a mut Self::Client,
+    ) -> Pin<Box<dyn Future<Output = Result<ObservedBlock>> + Send + 'a>> {
+        Box::pin(snapshot::current_tip(client))
+    }
+
     fn scope(&self) -> HistoryScope<'_> {
         HistoryScope {
             stream: HISTORY_STREAM,
@@ -106,10 +124,10 @@ impl HistoryStream for BlockHistory<'_> {
 
     fn fetch<'a>(
         &'a self,
-        client: &'a mut EnforcerClient,
+        client: &'a mut Self::Client,
         cursor: &'a ObservedBlock,
         requested: u32,
-    ) -> FetchFuture<'a> {
+    ) -> FetchFuture<'a, Self::Payload> {
         Box::pin(async move {
             let response = client
                 .get_block_info(
@@ -122,7 +140,7 @@ impl HistoryStream for BlockHistory<'_> {
         })
     }
 
-    fn header<'a>(&self, payload: &'a events::EnforcerEvent) -> Result<&'a events::BlockHeader> {
+    fn header<'a>(&self, payload: &'a Self::Payload) -> Result<&'a events::BlockHeader> {
         connected_header(payload)
     }
 }
@@ -149,7 +167,7 @@ pub(crate) async fn run(
 
 /// Run the common newest-first historical cursor for one stream adapter.
 pub(crate) async fn run_history<S: HistoryStream>(
-    client: &mut EnforcerClient,
+    client: &mut S::Client,
     recorder: &Recorder,
     stream: &S,
     tip: &ObservedBlock,
@@ -202,8 +220,8 @@ pub(crate) async fn run_history<S: HistoryStream>(
         let requested = u32::try_from(remaining.min(u64::from(progress.effective_page_blocks)))
             .expect("a page size fits in a u32");
 
-        enum Page {
-            Found(Vec<events::EnforcerEvent>),
+        enum Page<T> {
+            Found(Vec<T>),
             Unavailable(Error),
         }
         let page = match stream.fetch(client, &cursor, requested).await {
@@ -279,7 +297,7 @@ pub(crate) async fn run_history<S: HistoryStream>(
         let mut payloads = match page {
             Page::Found(payloads) => payloads,
             Page::Unavailable(error) => {
-                let current_tip = match snapshot::current_tip(client).await {
+                let current_tip = match stream.current_tip(client).await {
                     Ok(current_tip) => current_tip,
                     Err(tip_error) if retryable_rpc_error(&tip_error) => {
                         return settle_failure(
@@ -679,7 +697,7 @@ async fn begin_full_cycle(
 
 async fn target_is_available<S: HistoryStream>(
     stream: &S,
-    client: &mut EnforcerClient,
+    client: &mut S::Client,
     target: &ObservedBlock,
 ) -> Result<Option<bool>> {
     match stream.fetch(client, target, 1).await {
@@ -730,7 +748,7 @@ async fn mark_superseded(recorder: &Recorder, scope: &HistoryScope<'_>) -> Resul
 
 fn historical_events<S: HistoryStream>(
     stream: &S,
-    mut payloads: Vec<events::EnforcerEvent>,
+    mut payloads: Vec<S::Payload>,
 ) -> Result<Vec<Event>> {
     payloads.reverse();
     payloads
@@ -738,7 +756,7 @@ fn historical_events<S: HistoryStream>(
         .map(|payload| {
             let header = stream.header(&payload)?;
             let anchor = ObservedBlock::at_height(header.hash.clone(), header.height);
-            envelope(payload, anchor)
+            stream.envelope(payload, anchor)
         })
         .collect()
 }
@@ -787,7 +805,7 @@ fn validate_expected_start_hash(
 
 pub(crate) fn verify_page_with<S: HistoryStream>(
     stream: &S,
-    payloads: &[events::EnforcerEvent],
+    payloads: &[S::Payload],
     cursor: &ObservedBlock,
     requested: u32,
 ) -> Result<()> {

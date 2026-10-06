@@ -39,6 +39,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../schema/0006_worker_health_and_observation_order.sql"),
     include_str!("../schema/0007_single_active_run.sql"),
     include_str!("../schema/0008_observation_quality.sql"),
+    include_str!("../schema/0009_official_sources.sql"),
 ];
 
 /// Advisory-lock key that serializes the migration of one record.
@@ -179,9 +180,23 @@ struct Facts<'a> {
 }
 
 fn facts(event: &Event) -> Result<Facts<'_>> {
+    if let Some(MonitorEvent::Node(node)) = event.monitor_event.as_ref() {
+        let payload = node.event.as_ref().context("missing node event")?;
+        let anchor = event.observed_at_block.as_ref();
+        return Ok(Facts {
+            kind: payload.kind(),
+            sidechain: None,
+            block_hash: anchor.map(|a| a.hash.as_slice()),
+            height: anchor
+                .and_then(|a| a.height)
+                .map(i32::try_from)
+                .transpose()?,
+        });
+    }
+
     let payload = match event.monitor_event.as_ref() {
         Some(MonitorEvent::Enforcer(payload)) => payload,
-        None => bail!("event envelope does not contain a monitor event"),
+        _ => bail!("event envelope does not contain a monitor event"),
     };
     let payload = payload
         .event
@@ -278,6 +293,7 @@ pub enum CaptureMethod {
 /// worker's status.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ExtractorWorker {
+    NodeHistory,
     MainchainTip,
     BmmRequests,
     MainchainEvents,
@@ -287,6 +303,7 @@ pub enum ExtractorWorker {
 impl ExtractorWorker {
     const fn as_str(self) -> &'static str {
         match self {
+            Self::NodeHistory => "node_history",
             Self::MainchainTip => "mainchain_tip",
             Self::BmmRequests => "bmm_requests",
             Self::MainchainEvents => "mainchain_events",
@@ -298,7 +315,9 @@ impl ExtractorWorker {
 /// Whether the mainchain tip stayed fixed around a grouped unary snapshot.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SnapshotConsistency {
-    Stable,
+    Stable, // Archived contract 7 only.
+    TipMatched,
+    Unknown,
     Changed,
 }
 
@@ -306,6 +325,8 @@ impl SnapshotConsistency {
     const fn as_str(self) -> &'static str {
         match self {
             Self::Stable => "stable",
+            Self::TipMatched => "tip_matched",
+            Self::Unknown => "unknown",
             Self::Changed => "changed",
         }
     }
@@ -476,7 +497,7 @@ impl Store {
             run_id: String::new(),
             event_contract_version: 0,
         };
-        if manifest.event_contract_version >= 7 {
+        if manifest.event_contract_version >= 8 {
             let client = store.client.lock().await;
             let exists: bool = client
                 .query_one("SELECT to_regclass('dataset_manifest') IS NOT NULL", &[])
@@ -485,12 +506,12 @@ impl Store {
             if exists {
                 let incompatible: bool = client.query_one(
                     "SELECT EXISTS(SELECT 1 FROM dataset_manifest WHERE network_id=$1 AND activation_height=$2
-                        AND activation_block_hash=$3 AND initial_event_contract_version<>7)",
+                        AND activation_block_hash=$3 AND initial_event_contract_version<>8)",
                     &[&manifest.network_id,&height_to_i32(manifest.activation_height)?,&manifest.activation_block_hash],
                 ).await?.get(0);
                 if incompatible {
                     bail!(
-                        "event contract v7 requires a fresh v7 dataset; no migrations were applied"
+                        "event contract v8 requires a fresh v8 dataset; no migrations were applied"
                     );
                 }
             }
@@ -540,20 +561,20 @@ impl Store {
             .await
             .context("resolving the record dataset identity")?
             .get(0);
-        if manifest.event_contract_version >= 7 {
+        if manifest.event_contract_version >= 8 {
             let incompatible: bool = transaction
                 .query_one(
-                    "SELECT initial_event_contract_version <> 7
+                    "SELECT initial_event_contract_version <> 8
                        FROM dataset_manifest
                       WHERE dataset_id = $1::text::uuid",
                     &[&dataset_id],
                 )
                 .await
-                .context("checking the v7 dataset compatibility boundary")?
+                .context("checking the v8 dataset compatibility boundary")?
                 .get(0);
             if incompatible {
                 bail!(
-                    "event contract v7 requires a fresh v7 dataset; create a recoverable record backup and start an empty dataset"
+                    "event contract v8 requires a fresh v8 dataset; create a recoverable record backup and start an empty dataset"
                 );
             }
         }
@@ -592,7 +613,7 @@ impl Store {
             .get(0);
         // A new subscription starts at the current tip: it cannot replay live
         // transitions missed between processes, even after a clean shutdown.
-        if self.source == "enforcer" && manifest.event_contract_version >= 7 {
+        if self.source == "enforcer" && manifest.event_contract_version >= 8 {
             transaction
                 .execute(
                     "INSERT INTO observation_failure(dataset_id, run_id, worker, error)
@@ -791,6 +812,16 @@ impl Store {
         }
         require_hash(&metadata.tip_before.hash, "snapshot tip before")?;
         require_hash(&metadata.tip_after.hash, "snapshot tip after")?;
+        if metadata.consistency == SnapshotConsistency::TipMatched
+            && (metadata.tip_before != metadata.tip_after
+                || metadata.revision_before.is_some()
+                || metadata.revision_after.is_some())
+        {
+            bail!("tip-matched snapshots require matching tips and no claimed server revision");
+        }
+        if self.event_contract_version >= 8 && metadata.consistency == SnapshotConsistency::Stable {
+            bail!("official API cannot establish atomic stable snapshots");
+        }
         if metadata.consistency == SnapshotConsistency::Stable
             && (metadata.tip_before != metadata.tip_after
                 || metadata
@@ -1176,7 +1207,7 @@ impl Store {
         let client = self.client.lock().await;
         let row = client.query_opt(
             "WITH next AS (SELECT id,block_hash,height FROM event
-              WHERE dataset_id=$1::text::uuid AND event_contract_version=$2 AND source=$3 AND kind='bip300_block_delta'
+              WHERE dataset_id=$1::text::uuid AND event_contract_version=$2 AND source=$3 AND kind=CASE WHEN $3='node' THEN 'mainchain_block' ELSE 'bip300_block_delta' END
                 AND id>COALESCE((SELECT max(source_event_id) FROM bmm_fee_job
                     WHERE dataset_id=$1::text::uuid AND event_contract_version=$2 AND source=$3),0)
               ORDER BY id LIMIT 1), retry AS (
@@ -1196,6 +1227,9 @@ impl Store {
     }
 
     pub async fn record_fee_enrichment(&self, source_event_id: i64, event: &Event) -> Result<()> {
+        if let Some(MonitorEvent::Node(node)) = &event.monitor_event {
+            return self.record_node_fees(source_event_id, event, node).await;
+        }
         use crate::protobuf::enforcer_extractor::enforcer_event::Event as Payload;
         let Some(MonitorEvent::Enforcer(payload)) = &event.monitor_event else {
             bail!("missing fee payload");
@@ -1257,6 +1291,105 @@ impl Store {
                     ON CONFLICT(dataset_id,event_contract_version,source,source_event_id) DO UPDATE
                     SET last_observed_at=now(),next_retry_at=excluded.next_retry_at",
             &[&self.dataset_id,&self.event_contract_version,&self.source,&source_event_id,&unavailable]).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Only bids observed through the official API and a matching official
+    /// commitment are candidates. Inclusion/transaction fees are checked by the
+    /// node worker; missing observations never become a complete BMM history.
+    pub async fn observed_bmm_candidates(
+        &self,
+        block_hash: &[u8],
+        parent: &[u8],
+    ) -> Result<Vec<(u32, Vec<u8>)>> {
+        let client = self.client.lock().await;
+        let rows=client.query("SELECT DISTINCT (r->>'sidechain_number')::integer,decode(r->>'txid','hex')
+            FROM event e CROSS JOIN LATERAL jsonb_array_elements(e.payload #> '{monitor_event,Enforcer,event,BmmRequests,requests}') r
+            WHERE e.dataset_id=$1::text::uuid AND e.event_contract_version=$2 AND e.source='enforcer'
+            AND e.kind='bmm_requests' AND e.payload #>> '{monitor_event,Enforcer,event,BmmRequests,previous_mainchain_block_hash}'=encode($3::bytea,'hex')
+            AND EXISTS(SELECT 1 FROM event b WHERE b.dataset_id=e.dataset_id AND b.event_contract_version=e.event_contract_version
+                AND b.source='enforcer' AND b.kind='block_connected' AND b.block_hash=$4
+                AND b.sidechain=(r->>'sidechain_number')::smallint
+                AND b.payload #>> '{monitor_event,Enforcer,event,BlockConnected,bmm_commitment}'=r->>'critical_hash'
+                AND NOT EXISTS(SELECT 1 FROM event_conflict c WHERE c.dataset_id=b.dataset_id AND (c.first_event_id=b.id OR c.conflicting_event_id=b.id)))",
+            &[&self.dataset_id,&self.event_contract_version,&parent,&block_hash]).await?;
+        rows.into_iter()
+            .map(|r| Ok((u32::try_from(r.get::<_, i32>(0))?, r.get(1))))
+            .collect()
+    }
+
+    async fn record_node_fees(
+        &self,
+        source_id: i64,
+        event: &Event,
+        node: &crate::protobuf::event::NodeEvent,
+    ) -> Result<()> {
+        use crate::protobuf::event::node_event;
+        let Some(node_event::Event::ConfirmedBmmFees(fees)) = &node.event else {
+            bail!("expected node fee enrichment");
+        };
+        let header = fees.header.as_ref().context("missing fee header")?;
+        let candidates = self
+            .observed_bmm_candidates(&header.hash, &header.previous_hash)
+            .await?;
+        let mut identities = std::collections::BTreeSet::new();
+        for fee in &fees.fees {
+            if !candidates.contains(&(fee.sidechain_number, fee.txid.clone()))
+                || !identities.insert((fee.sidechain_number, fee.txid.clone()))
+                || fee.fee_sats.is_some() != fee.unavailable_reason.is_empty()
+            {
+                bail!("fee has no unambiguous official evidence");
+            }
+        }
+        let mut client = self.client.lock().await;
+        let tx = client.transaction().await?;
+        let row=tx.query_opt("SELECT envelope FROM event WHERE id=$1 AND dataset_id=$2::text::uuid
+            AND event_contract_version=$3 AND source='node' AND kind='mainchain_block' AND block_hash=$4",
+            &[&source_id,&self.dataset_id,&self.event_contract_version,&header.hash]).await?.context("missing node source block")?;
+        let bytes: Vec<u8> = row.get(0);
+        let original = Event::decode(bytes.as_slice())?;
+        let Some(MonitorEvent::Node(original)) = original.monitor_event else {
+            bail!("invalid node block envelope");
+        };
+        let Some(node_event::Event::MainchainBlock(block)) = original.event else {
+            bail!("invalid node block kind");
+        };
+        if block.header.as_ref() != Some(header) {
+            bail!("fee enrichment changed the block header");
+        }
+        let block: bitcoin::Block = bitcoin::consensus::deserialize(&block.raw_block)?;
+        for fee in &fees.fees {
+            if !block
+                .txdata
+                .iter()
+                .any(|t| t.compute_txid().to_string() == hex::encode(&fee.txid))
+            {
+                bail!("fee transaction is not in the block");
+            }
+        }
+        let sequence = reserve_capture_sequences(&tx, &self.run_id, 1).await?;
+        insert(
+            &tx,
+            self.source,
+            &self.dataset_id,
+            &self.run_id,
+            self.event_contract_version,
+            CaptureMethod::Backfill,
+            None,
+            None,
+            None,
+            sequence,
+            event,
+            &mut BTreeMap::new(),
+        )
+        .await?;
+        // Retry partial associations too: the official slot backfill can arrive
+        // after the node block. Never close that enrichment race permanently.
+        tx.execute("INSERT INTO bmm_fee_job(dataset_id,event_contract_version,source,source_event_id,next_retry_at)
+            VALUES($1::text::uuid,$2,$3,$4,now()+interval '24 hours') ON CONFLICT(dataset_id,event_contract_version,source,source_event_id)
+            DO UPDATE SET last_observed_at=now(),next_retry_at=excluded.next_retry_at",
+            &[&self.dataset_id,&self.event_contract_version,&self.source,&source_id]).await?;
         tx.commit().await?;
         Ok(())
     }
@@ -1467,7 +1600,7 @@ impl Store {
         let conflict: bool = transaction.query_one(
             "SELECT EXISTS(SELECT 1 FROM event_conflict c JOIN event e ON e.id=c.first_event_id
                 WHERE e.dataset_id=$1::text::uuid AND e.event_contract_version=$2 AND e.source=$3
-                  AND e.kind=CASE $4::text WHEN 'block' THEN 'block_connected' ELSE 'bip300_block_delta' END
+                  AND e.kind=CASE $4::text WHEN 'block' THEN 'block_connected' WHEN 'mainchain_block' THEN 'mainchain_block' ELSE 'bip300_block_delta' END
                   AND e.sidechain IS NOT DISTINCT FROM $5 AND e.sidechain_instance_id IS NOT DISTINCT FROM $6)",
             &[&self.dataset_id,&self.event_contract_version,&self.source,&page.stream,&sidechain,&page.sidechain_instance_id],
         ).await?.get(0);
@@ -1868,6 +2001,11 @@ async fn insert(
 ) -> Result<u64> {
     let facts = facts(event).context("describing an event for the record")?;
     let previous_hash = match event.monitor_event.as_ref() {
+        Some(MonitorEvent::Node(node)) => node
+            .event
+            .as_ref()
+            .and_then(|p| p.header())
+            .map(|h| &h.previous_hash),
         Some(MonitorEvent::Enforcer(payload)) => match payload.event.as_ref() {
             Some(crate::protobuf::enforcer_extractor::enforcer_event::Event::BlockConnected(b)) => {
                 b.header.as_ref().map(|h| &h.previous_hash)
@@ -1884,12 +2022,13 @@ async fn insert(
     let envelope_sha256 = Sha256::digest(&envelope).to_vec();
     let fact_sha256 = match event.monitor_event.as_ref() {
         Some(MonitorEvent::Enforcer(payload)) => Sha256::digest(payload.encode_to_vec()).to_vec(),
+        Some(MonitorEvent::Node(payload)) => Sha256::digest(payload.encode_to_vec()).to_vec(),
         None => bail!("event envelope does not contain a monitor event"),
     };
     let observed_at = SystemTime::UNIX_EPOCH + Duration::from_millis(event.timestamp);
     let authoritative = match snapshot_group_id {
         Some(group) => transaction.query_one(
-            "SELECT consistency = 'stable' FROM snapshot_group WHERE snapshot_group_id = $1::text::uuid",
+            "SELECT consistency IN ('stable', 'tip_matched') FROM snapshot_group WHERE snapshot_group_id = $1::text::uuid",
             &[&group],
         ).await?.get::<_, bool>(0),
         None => true,

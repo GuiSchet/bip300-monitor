@@ -6,6 +6,24 @@ use std::time::{SystemTime, SystemTimeError};
 
 include!(concat!(env!("OUT_DIR"), "/event.rs"));
 
+impl node_event::Event {
+    pub const fn kind(&self) -> &'static str {
+        match self {
+            Self::MainchainBlock(_) => "mainchain_block",
+            Self::ChainTip(_) => "chain_tip",
+            Self::ConfirmedBmmFees(_) => "confirmed_bmm_fees",
+        }
+    }
+
+    pub fn header(&self) -> Option<&super::enforcer_extractor::BlockHeader> {
+        match self {
+            Self::MainchainBlock(b) => b.header.as_ref(),
+            Self::ChainTip(b) => b.header.as_ref(),
+            Self::ConfirmedBmmFees(b) => b.header.as_ref(),
+        }
+    }
+}
+
 impl Event {
     /// Wrap an extractor event with the current Unix timestamp in milliseconds
     /// and the block the observation is anchored to.

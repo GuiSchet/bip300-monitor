@@ -23,9 +23,27 @@ pub struct RenderedEvent {
 /// The full JSON form costs a complete value tree plus a recursive walk that
 /// re-encodes every byte field, so it is built only when `full_events` is set.
 pub fn render(event: &Event, full_events: bool) -> Result<RenderedEvent> {
+    if let Some(MonitorEvent::Node(node)) = &event.monitor_event {
+        let payload = node.event.as_ref().context("missing node payload")?;
+        let header = payload.header().context("missing node header")?;
+        validate_header(header)?;
+        return Ok(RenderedEvent {
+            kind: payload.kind(),
+            summary: format!(
+                "source=node height={} hash={}",
+                header.height,
+                hex::encode(&header.hash)
+            ),
+            full_json: if full_events {
+                Some(json::render_line(event)?)
+            } else {
+                None
+            },
+        });
+    }
     let payload = match event.monitor_event.as_ref() {
         Some(MonitorEvent::Enforcer(payload)) => payload,
-        None => bail!("event envelope does not contain a monitor event"),
+        _ => bail!("event envelope does not contain a monitor event"),
     };
     let payload = payload
         .event
@@ -34,7 +52,14 @@ pub fn render(event: &Event, full_events: bool) -> Result<RenderedEvent> {
     // The kind comes from the contract itself, so the logger, the record and
     // the deployment queries can never drift apart on a name.
     let kind = payload.kind();
-    let summary = summarize(payload)?;
+    let mut summary = summarize(payload)?;
+    if matches!(
+        payload,
+        events::enforcer_event::Event::MainchainTransition(_)
+    ) && let Some(anchor) = &event.observed_at_block
+    {
+        summary.push_str(&format!(" hash={}", hex::encode(&anchor.hash)));
+    }
 
     let full_json = if full_events {
         Some(json::render_line(event)?)
@@ -310,7 +335,10 @@ fn validate_header(header: &events::BlockHeader) -> Result<()> {
     require_32_bytes(&header.hash, "block_header.hash")?;
     require_32_bytes(&header.previous_hash, "block_header.previous_hash")?;
     require_32_bytes(&header.block_work, "block_header.block_work")?;
-    require_32_bytes(&header.cumulative_work, "block_header.cumulative_work")
+    if !header.cumulative_work.is_empty() {
+        require_32_bytes(&header.cumulative_work, "block_header.cumulative_work")?;
+    }
+    Ok(())
 }
 
 fn validate_proposal(proposal: &events::SidechainProposal) -> Result<()> {

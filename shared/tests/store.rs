@@ -386,7 +386,7 @@ async fn a_new_start_closes_an_orphaned_run_before_claiming_the_dataset() {
 }
 
 #[tokio::test]
-async fn v7_refuses_to_reuse_an_older_contract_dataset() {
+async fn v8_refuses_to_reuse_an_older_contract_dataset() {
     let test = "v6_identity_boundary";
     let admin_url = std::env::var("BIP300_MONITOR_TEST_POSTGRES_URL").unwrap();
     let (admin, connection) = tokio_postgres::connect(&admin_url, tokio_postgres::NoTls)
@@ -424,13 +424,13 @@ async fn v7_refuses_to_reuse_an_older_contract_dataset() {
         .expect("seed legacy sidechain identities");
 
     let error = match Store::connect(&args_for(&admin_url, &database), "enforcer").await {
-        Ok(_) => panic!("v7 must require a fresh dataset after legacy identities exist"),
+        Ok(_) => panic!("v8 must require a fresh dataset after legacy identities exist"),
         Err(error) => error,
     };
     assert!(
         error
             .to_string()
-            .contains("event contract v7 requires a fresh v7 dataset"),
+            .contains("event contract v8 requires a fresh v8 dataset"),
         "unexpected error: {error:#}"
     );
 }
@@ -1449,18 +1449,18 @@ async fn live_bmm_changes_share_a_parent_without_aliasing_facts() {
 }
 
 #[tokio::test]
-async fn a_stable_bmm_observation_proves_one_parent_in_payload_anchor_and_snapshot() {
+async fn a_tip_matched_bmm_observation_proves_one_parent_in_payload_anchor_and_snapshot() {
     let test = "stable_bmm_parent";
     let store = store_for(test, "enforcer").await;
     let parent = ObservedBlock::at_height(vec![0xdd; 32], 967_700);
     let metadata = SnapshotMetadata {
-        revision_before: Some("test:1".into()),
-        revision_after: Some("test:1".into()),
+        revision_before: None,
+        revision_after: None,
         started_at: SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000),
         finished_at: SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_001),
         tip_before: parent.clone(),
         tip_after: parent.clone(),
-        consistency: SnapshotConsistency::Stable,
+        consistency: SnapshotConsistency::TipMatched,
         attempts: 1,
     };
     store
@@ -1474,7 +1474,7 @@ async fn a_stable_bmm_observation_proves_one_parent_in_payload_anchor_and_snapsh
             &metadata,
         )
         .await
-        .expect("record stable BMM snapshot");
+        .expect("record tip-matched BMM snapshot");
 
     let client = query_client(test).await;
     let verified: bool = client
@@ -1495,7 +1495,7 @@ async fn a_stable_bmm_observation_proves_one_parent_in_payload_anchor_and_snapsh
                   WHERE run.source = 'enforcer' AND run.status = 'running'
                     AND observation.capture_method = 'poll'
                     AND fact.kind = 'bmm_requests'
-                    AND snapshot.consistency = 'stable'
+                    AND snapshot.consistency = 'tip_matched'
                     AND snapshot.tip_before_hash = snapshot.tip_after_hash
                     AND snapshot.tip_before_hash = fact.block_hash
                     AND decode(
@@ -1839,21 +1839,213 @@ async fn a_stable_label_cannot_hide_a_revision_change() {
         .unwrap();
     let client = query_client("stable_revision").await;
     let count: i64 = client
-        .query_one("SELECT count(*) FROM state_snapshot_stable", &[])
+        .query_one("SELECT count(*) FROM state_snapshot_tip_matched", &[])
         .await
         .unwrap()
         .get(0);
     assert_eq!(count, 0);
-    metadata.consistency = SnapshotConsistency::Stable;
-    metadata.revision_before = metadata.revision_after.clone();
+    metadata.consistency = SnapshotConsistency::TipMatched;
+    metadata.revision_before = None;
+    metadata.revision_after = None;
     store
         .record_snapshot(&[event], CaptureMethod::Poll, &metadata)
         .await
         .unwrap();
     let count: i64 = client
-        .query_one("SELECT count(*) FROM state_snapshot_stable", &[])
+        .query_one("SELECT count(*) FROM state_snapshot_tip_matched", &[])
         .await
         .unwrap()
         .get(0);
     assert_eq!(count, 1);
+}
+
+// Storage tests exercise identity and chain proof; node RPC tests validate raw bytes.
+fn node_block_event(height: u32, hash: u8, parent: u8) -> Event {
+    let mut event = block_event(height, hash, parent);
+    let Some(MonitorEvent::Enforcer(payload)) = event.monitor_event.take() else {
+        unreachable!()
+    };
+    let Some(events::enforcer_event::Event::BlockConnected(block)) = payload.event else {
+        unreachable!()
+    };
+    event.monitor_event = Some(MonitorEvent::Node(shared::protobuf::event::NodeEvent {
+        event: Some(shared::protobuf::event::node_event::Event::MainchainBlock(
+            shared::protobuf::event::MainchainBlock {
+                header: block.header,
+                raw_block: vec![0],
+            },
+        )),
+    }));
+    event
+}
+#[tokio::test]
+async fn node_reorg_preserves_proof_and_requires_certified_prefix() {
+    let store = store_for("node_certified_reorg", "node").await;
+    let old_tip = ObservedBlock::at_height(vec![104; 32], 104);
+    store
+        .begin_history_cycle(
+            "mainchain_block",
+            None,
+            None,
+            101,
+            None,
+            &old_tip,
+            None,
+            Some(100),
+            128,
+        )
+        .await
+        .unwrap();
+    let events = (101..=104)
+        .map(|h| node_block_event(h, h as u8, h as u8 - 1))
+        .collect::<Vec<_>>();
+    store
+        .record_history_page(
+            &events,
+            HistoryPage {
+                stream: "mainchain_block",
+                sidechain: None,
+                sidechain_instance_id: None,
+                expected_next: &old_tip,
+                next: None,
+            },
+        )
+        .await
+        .unwrap();
+    // A live fact with no proven prefix must never serve as a repair floor.
+    store
+        .record(&[node_block_event(200, 200, 199)])
+        .await
+        .unwrap();
+    let fork = ObservedBlock::at_height(vec![170; 32], 104);
+    let progress = store
+        .begin_history_cycle(
+            "mainchain_block",
+            None,
+            None,
+            101,
+            None,
+            &fork,
+            None,
+            Some(100),
+            128,
+        )
+        .await
+        .unwrap();
+    assert_eq!(progress.covered_tip, Some(old_tip));
+    assert_eq!(progress.status, HistoryStatus::Running);
+    let floor = store
+        .certified_history_floor(
+            "mainchain_block",
+            None,
+            None,
+            &[vec![200; 32], vec![170; 32], vec![103; 32]],
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(floor.height, Some(103));
+    store
+        .record_history_page(
+            &[node_block_event(104, 170, 103)],
+            HistoryPage {
+                stream: "mainchain_block",
+                sidechain: None,
+                sidechain_instance_id: None,
+                expected_next: &fork,
+                next: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .history_coverage("mainchain_block", None, None)
+            .await
+            .unwrap()
+            .unwrap()
+            .covered_tip,
+        Some(fork)
+    );
+    let client = query_client("node_certified_reorg").await;
+    assert_eq!(
+        client
+            .query_one("SELECT count(*) FROM history_certified_block", &[])
+            .await
+            .unwrap()
+            .get::<_, i64>(0),
+        5
+    );
+}
+
+#[tokio::test]
+async fn node_raw_content_conflict_survives_failed_certification() {
+    let store = store_for("node_durable_conflict", "node").await;
+    let target = ObservedBlock::at_height(vec![104; 32], 104);
+    let first = node_block_event(104, 104, 103);
+    store.record(std::slice::from_ref(&first)).await.unwrap();
+    let mut conflicting = first;
+    if let Some(MonitorEvent::Node(payload)) = &mut conflicting.monitor_event
+        && let Some(shared::protobuf::event::node_event::Event::MainchainBlock(block)) =
+            &mut payload.event
+    {
+        block.raw_block.push(1);
+    }
+    store
+        .begin_history_cycle(
+            "mainchain_block",
+            None,
+            None,
+            104,
+            None,
+            &target,
+            None,
+            Some(103),
+            128,
+        )
+        .await
+        .unwrap();
+    let error = store
+        .record_history_page(
+            &[conflicting],
+            HistoryPage {
+                stream: "mainchain_block",
+                sidechain: None,
+                sidechain_instance_id: None,
+                expected_next: &target,
+                next: None,
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("conflicting immutable"));
+    let client = query_client("node_durable_conflict").await;
+    assert_eq!(
+        client
+            .query_one(
+                "SELECT count(*) FROM event WHERE kind='mainchain_block'",
+                &[]
+            )
+            .await
+            .unwrap()
+            .get::<_, i64>(0),
+        2
+    );
+    assert_eq!(
+        client
+            .query_one("SELECT count(*) FROM event_conflict", &[])
+            .await
+            .unwrap()
+            .get::<_, i64>(0),
+        1
+    );
+    assert_eq!(
+        store
+            .history_coverage("mainchain_block", None, None)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        HistoryStatus::Error
+    );
 }

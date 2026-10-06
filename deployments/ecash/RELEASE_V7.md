@@ -1,3 +1,5 @@
+> SUPERSEDED: this documents the archived fork candidate. Do not deploy these images. See RELEASE_OFFICIAL.md.
+
 # Observer v7 release candidate — 2026-10-04
 
 This candidate is built and tested locally, not published or deployed. The

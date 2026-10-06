@@ -3,17 +3,17 @@
 include!(concat!(env!("OUT_DIR"), "/enforcer_extractor.rs"));
 
 /// Version of the normalized enforcer event contract stored with every fact.
-pub const EVENT_CONTRACT_VERSION: u32 = 7;
+pub const EVENT_CONTRACT_VERSION: u32 = 8;
 
 // These fingerprints deliberately live beside the version. Any edit to either
 // protobuf contract makes the test below fail until the compatibility review
 // records a new version/fingerprint pair here.
 #[cfg(test)]
-const EVENT_CONTRACT_V7_ENVELOPE_SHA256: &str =
-    "02f7fa9e75ecc965fe46a0fdb4a9757274f6e29e33b741d5108f954f15574b3e";
+const EVENT_CONTRACT_V8_ENVELOPE_SHA256: &str =
+    "ab2367b39710427523c903ddfe8daeae226c7754b5584ae028afaa1e9bdea3f8";
 #[cfg(test)]
-const EVENT_CONTRACT_V7_PAYLOAD_SHA256: &str =
-    "37651d1935a895cceb8bbd23d3be7373fa41e23d72fd30ebab1e5af810ea9fd4";
+const EVENT_CONTRACT_V8_PAYLOAD_SHA256: &str =
+    "d40381cfb92ca43d7988bdd676c4c1a8be4555f93ab19ac4e2bef7e0ee7b7ca0";
 
 impl enforcer_event::Event {
     /// Stable name of this event variant.
@@ -63,17 +63,17 @@ mod kind_tests {
 
     #[test]
     fn contract_version_matches_the_reviewed_proto_fingerprints() {
-        assert_eq!(super::EVENT_CONTRACT_VERSION, 7);
+        assert_eq!(super::EVENT_CONTRACT_VERSION, 8);
         assert_eq!(
             hex::encode(Sha256::digest(include_bytes!("../../../proto/event.proto"))),
-            super::EVENT_CONTRACT_V7_ENVELOPE_SHA256,
+            super::EVENT_CONTRACT_V8_ENVELOPE_SHA256,
             "event.proto changed: review compatibility and bump EVENT_CONTRACT_VERSION"
         );
         assert_eq!(
             hex::encode(Sha256::digest(include_bytes!(
                 "../../../proto/enforcer_extractor.proto"
             ))),
-            super::EVENT_CONTRACT_V7_PAYLOAD_SHA256,
+            super::EVENT_CONTRACT_V8_PAYLOAD_SHA256,
             "enforcer_extractor.proto changed: review compatibility and bump EVENT_CONTRACT_VERSION"
         );
     }
