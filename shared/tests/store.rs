@@ -2110,3 +2110,97 @@ async fn node_raw_content_conflict_survives_failed_certification() {
         HistoryStatus::Error
     );
 }
+
+fn numbered_hash(height: u32) -> Vec<u8> {
+    let mut hash = vec![0xab; 32];
+    hash[..4].copy_from_slice(&height.to_be_bytes());
+    hash
+}
+
+fn numbered_node_block(height: u32) -> Event {
+    Event {
+        timestamp: 1_700_000_000_000 + u64::from(height),
+        observed_at_block: Some(ObservedBlock::at_height(numbered_hash(height), height)),
+        monitor_event: Some(MonitorEvent::Node(shared::protobuf::event::NodeEvent {
+            event: Some(shared::protobuf::event::node_event::Event::MainchainBlock(
+                shared::protobuf::event::MainchainBlock {
+                    header: Some(events::BlockHeader {
+                        hash: numbered_hash(height),
+                        previous_hash: numbered_hash(height - 1),
+                        height,
+                        block_work: vec![1; 32],
+                        cumulative_work: vec![0x44; 32],
+                        timestamp: 1_750_000_000,
+                    }),
+                    raw_block: vec![0],
+                },
+            )),
+        })),
+    }
+}
+
+/// Wall time of the page that completes, and therefore certifies, `blocks`.
+async fn certification_time(test: &str, blocks: u32) -> Duration {
+    let store = store_for(test, "node").await;
+    let tip = ObservedBlock::at_height(numbered_hash(blocks), blocks);
+    store
+        .begin_history_cycle(
+            "mainchain_block",
+            None,
+            None,
+            1,
+            None,
+            &tip,
+            None,
+            None,
+            1_000,
+        )
+        .await
+        .unwrap();
+    let mut high = blocks;
+    loop {
+        // The final page is block 1 alone, so its time is the certification.
+        let low = if high > 1 {
+            high.saturating_sub(999).max(2)
+        } else {
+            1
+        };
+        let events = (low..=high).map(numbered_node_block).collect::<Vec<_>>();
+        let expected = ObservedBlock::at_height(numbered_hash(high), high);
+        let next = (low > 1).then(|| ObservedBlock::at_height(numbered_hash(low - 1), low - 1));
+        let started = std::time::Instant::now();
+        store
+            .record_history_page(
+                &events,
+                HistoryPage {
+                    stream: "mainchain_block",
+                    sidechain: None,
+                    sidechain_instance_id: None,
+                    expected_next: &expected,
+                    next: next.as_ref(),
+                },
+            )
+            .await
+            .unwrap();
+        if next.is_none() {
+            return started.elapsed();
+        }
+        high = low - 1;
+    }
+}
+
+/// Certification walks a chain once; it must not rescan the proof per block.
+/// Timing-based, so it is run on demand:
+/// `cargo test -p shared --features postgres_integration_tests -- --ignored certification_scales`
+#[tokio::test]
+#[ignore = "timing measurement; run explicitly"]
+async fn certification_scales_linearly_with_history_length() {
+    let small = certification_time("certify_scale_2k", 2_000).await;
+    let large = certification_time("certify_scale_8k", 8_000).await;
+    eprintln!("certification: 2k blocks {small:?}, 8k blocks {large:?}");
+    // Linear growth is ~4x; quadratic growth would be ~16x.
+    assert!(
+        large < small * 8,
+        "certifying 4x more history took {large:?} vs {small:?}"
+    );
+}

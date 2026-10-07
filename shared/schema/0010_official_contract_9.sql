@@ -41,10 +41,23 @@ BEGIN
     RETURN NEW;
 END $$;
 
-CREATE OR REPLACE FUNCTION certify_history() RETURNS trigger LANGUAGE plpgsql AS $$
-DECLARE expected bigint; actual bigint; start_hash bytea;
+-- Certification looks up proven blocks by hash once per walked block. The
+-- unique key cannot serve that lookup: its nullable slot/instance columns are
+-- compared with IS NOT DISTINCT FROM, which a btree cannot match, so every
+-- lookup scanned the scope's whole proof and certification grew quadratically.
+CREATE INDEX history_certified_block_lookup ON history_certified_block
+    (dataset_id, event_contract_version, source, stream, block_hash);
+
+-- Certification runs in the transaction that just wrote the page, before
+-- autovacuum has seen those rows. Stale statistics made the planner scan the
+-- whole scope at every step of the walk (quadratic). Each step is a lookup by
+-- hash, so sequential scans are never the right plan for this function.
+CREATE OR REPLACE FUNCTION certify_history() RETURNS trigger LANGUAGE plpgsql
+SET enable_seqscan = off AS $$
+DECLARE expected bigint; actual bigint; start_hash bytea; stream_kind text;
 BEGIN
     IF NEW.status <> 'complete' THEN RETURN NEW; END IF;
+    stream_kind := history_stream_kind(NEW.stream);
     IF NEW.covered_tip_hash <> NEW.target_tip_hash OR NEW.covered_tip_height <> NEW.target_tip_height THEN
         RAISE EXCEPTION 'coverage target differs from proven tip';
     END IF;
@@ -58,11 +71,12 @@ BEGIN
                    AND c.sidechain_instance_id IS NOT DISTINCT FROM NEW.sidechain_instance_id
                    AND c.block_hash=e.block_hash) AS certified
           FROM event e WHERE e.dataset_id=NEW.dataset_id AND e.event_contract_version=NEW.event_contract_version
-           AND e.source=NEW.source AND e.kind=history_stream_kind(NEW.stream)
+           AND e.source=NEW.source AND e.kind=stream_kind
            AND e.sidechain IS NOT DISTINCT FROM NEW.sidechain
            AND e.sidechain_instance_id IS NOT DISTINCT FROM NEW.sidechain_instance_id
            AND e.block_hash=NEW.target_tip_hash
         UNION ALL
+        -- LATERAL pins each step to an index lookup of the parent by hash.
         SELECT e.block_hash,e.previous_hash,e.height,
                EXISTS(SELECT 1 FROM history_certified_block c WHERE
                    (c.dataset_id,c.event_contract_version,c.source,c.stream) =
@@ -70,12 +84,14 @@ BEGIN
                    AND c.sidechain IS NOT DISTINCT FROM NEW.sidechain
                    AND c.sidechain_instance_id IS NOT DISTINCT FROM NEW.sidechain_instance_id
                    AND c.block_hash=e.block_hash)
-          FROM path p JOIN event e ON e.block_hash=p.previous_hash AND e.height=p.height-1
+          FROM path p CROSS JOIN LATERAL (
+               SELECT e.block_hash,e.previous_hash,e.height FROM event e
+                WHERE e.dataset_id=NEW.dataset_id AND e.event_contract_version=NEW.event_contract_version
+                  AND e.source=NEW.source AND e.kind=stream_kind
+                  AND e.block_hash=p.previous_hash AND e.height=p.height-1
+                  AND e.sidechain IS NOT DISTINCT FROM NEW.sidechain
+                  AND e.sidechain_instance_id IS NOT DISTINCT FROM NEW.sidechain_instance_id) e
          WHERE NOT p.certified AND p.height>NEW.coverage_start_height
-           AND e.dataset_id=NEW.dataset_id AND e.event_contract_version=NEW.event_contract_version
-           AND e.source=NEW.source AND e.kind=history_stream_kind(NEW.stream)
-           AND e.sidechain IS NOT DISTINCT FROM NEW.sidechain
-           AND e.sidechain_instance_id IS NOT DISTINCT FROM NEW.sidechain_instance_id
     ), checked AS (
         SELECT count(*) AS n,count(DISTINCT block_hash) AS unique_n,min(height) AS low,
                bool_or(certified) AS joined, max(height) AS high FROM path
@@ -85,33 +101,45 @@ BEGIN
                    THEN high-low+1 ELSE -1 END
       INTO actual, expected FROM checked;
     IF actual=0 OR actual<>expected THEN RAISE EXCEPTION 'history is missing, discontinuous or ambiguous'; END IF;
-    -- The application has already checked the activation hash and floor before
-    -- advancing. The independent operator verifier checks the full lineage too.
+    -- Store the newly proved suffix: the same walk, which stops at the first
+    -- certified block. The proof check stays a correlated subplan so each step
+    -- is one index lookup; a NOT EXISTS join here was planned as a scan of the
+    -- scope's entire proof per block.
     WITH RECURSIVE path AS (
-        SELECT e.block_hash,e.previous_hash,e.height FROM event e
-         WHERE e.dataset_id=NEW.dataset_id AND e.event_contract_version=NEW.event_contract_version
-           AND e.source=NEW.source AND e.kind=history_stream_kind(NEW.stream)
+        SELECT e.block_hash, e.previous_hash, e.height,
+               EXISTS(SELECT 1 FROM history_certified_block c WHERE
+                   (c.dataset_id,c.event_contract_version,c.source,c.stream) =
+                   (NEW.dataset_id,NEW.event_contract_version,NEW.source,NEW.stream)
+                   AND c.sidechain IS NOT DISTINCT FROM NEW.sidechain
+                   AND c.sidechain_instance_id IS NOT DISTINCT FROM NEW.sidechain_instance_id
+                   AND c.block_hash=e.block_hash) AS certified
+          FROM event e WHERE e.dataset_id=NEW.dataset_id AND e.event_contract_version=NEW.event_contract_version
+           AND e.source=NEW.source AND e.kind=stream_kind
            AND e.sidechain IS NOT DISTINCT FROM NEW.sidechain
            AND e.sidechain_instance_id IS NOT DISTINCT FROM NEW.sidechain_instance_id
            AND e.block_hash=NEW.target_tip_hash
         UNION ALL
-        SELECT e.block_hash,e.previous_hash,e.height FROM path p JOIN event e
-            ON e.block_hash=p.previous_hash AND e.height=p.height-1
-         WHERE p.height>NEW.coverage_start_height
-           AND NOT EXISTS(SELECT 1 FROM history_certified_block c WHERE
-               (c.dataset_id,c.event_contract_version,c.source,c.stream)=
-               (NEW.dataset_id,NEW.event_contract_version,NEW.source,NEW.stream)
-               AND c.sidechain IS NOT DISTINCT FROM NEW.sidechain
-               AND c.sidechain_instance_id IS NOT DISTINCT FROM NEW.sidechain_instance_id
-               AND c.block_hash=p.block_hash)
-           AND e.dataset_id=NEW.dataset_id AND e.event_contract_version=NEW.event_contract_version
-           AND e.source=NEW.source AND e.kind=history_stream_kind(NEW.stream)
-           AND e.sidechain IS NOT DISTINCT FROM NEW.sidechain
-           AND e.sidechain_instance_id IS NOT DISTINCT FROM NEW.sidechain_instance_id
+        -- LATERAL pins each step to an index lookup of the parent by hash.
+        SELECT e.block_hash,e.previous_hash,e.height,
+               EXISTS(SELECT 1 FROM history_certified_block c WHERE
+                   (c.dataset_id,c.event_contract_version,c.source,c.stream) =
+                   (NEW.dataset_id,NEW.event_contract_version,NEW.source,NEW.stream)
+                   AND c.sidechain IS NOT DISTINCT FROM NEW.sidechain
+                   AND c.sidechain_instance_id IS NOT DISTINCT FROM NEW.sidechain_instance_id
+                   AND c.block_hash=e.block_hash)
+          FROM path p CROSS JOIN LATERAL (
+               SELECT e.block_hash,e.previous_hash,e.height FROM event e
+                WHERE e.dataset_id=NEW.dataset_id AND e.event_contract_version=NEW.event_contract_version
+                  AND e.source=NEW.source AND e.kind=stream_kind
+                  AND e.block_hash=p.previous_hash AND e.height=p.height-1
+                  AND e.sidechain IS NOT DISTINCT FROM NEW.sidechain
+                  AND e.sidechain_instance_id IS NOT DISTINCT FROM NEW.sidechain_instance_id) e
+         WHERE NOT p.certified AND p.height>NEW.coverage_start_height
     ) INSERT INTO history_certified_block(dataset_id,event_contract_version,source,stream,
             sidechain,sidechain_instance_id,block_hash,previous_hash,height)
       SELECT NEW.dataset_id,NEW.event_contract_version,NEW.source,NEW.stream,
              NEW.sidechain,NEW.sidechain_instance_id,block_hash,previous_hash,height FROM path
+       WHERE NOT certified
       ON CONFLICT DO NOTHING;
     RETURN NEW;
 END $$;
