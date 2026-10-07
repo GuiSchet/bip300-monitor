@@ -1,5 +1,11 @@
 # HOSTKEY migration from Alphanet to Betanet
 
+> **Historical record.** This describes the contract 6 rollout on the retired
+> observer fork (`GetBip300BlockDelta`). The current deployment runs the
+> unmodified official enforcer with event contract 9; see
+> [`official-sources.md`](official-sources.md). The Betanet network values
+> below (activation, magic, ports, AssumeUTXO) remain accurate.
+
 This is the release and operational gate for replacing the existing single-VM
 Alphanet pilot. The promoted `VERSIONS.lock` contains every immutable Betanet
 value. `deployments/ecash/VERSIONS.betanet.lock.example` retains the same

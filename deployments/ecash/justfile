@@ -29,6 +29,10 @@ monitor-up:
 reset-record confirmation="" mode="--prepare" archive="":
     ./scripts/reset-record.sh "{{ confirmation }}" "{{ mode }}" "{{ archive }}"
 
+# Provision the Observatory's read-only role with the exact source grants.
+grant-reader:
+    ./scripts/grant-reader.sh
+
 backup-record:
     bash ./scripts/backup-record.sh daily
 

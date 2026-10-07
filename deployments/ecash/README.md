@@ -15,10 +15,13 @@ contains the reproduced snapshot hash and immutable image digests.
 
 Betanet is experimental. Use a dedicated data directory and no real funds.
 
-The lock pins the reviewed observer fork that adds `GetBip300BlockDelta`, while
-recording its official base commit separately for provenance. The observer
-commit and immutable image move together, and `just verify` requires complete
-global BIP300 history before this pre-Pulse deployment can be accepted.
+The lock pins the unmodified official LayerTwo-Labs enforcer and normalized
+event contract 9 (record schema 10). The official API exposes no per-block
+BIP300 deltas, replay or mempool readiness: the monitor records snapshots with
+their observation window, subscription gaps as explicit boundaries, and only
+what upstream reports. [`docs/official-sources.md`](../../docs/official-sources.md)
+describes every recorded kind and its guarantees. `just grant-reader`
+provisions the read-only role the Observatory imports through.
 
 ## Requirements
 

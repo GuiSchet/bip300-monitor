@@ -33,7 +33,7 @@ The workspace contains:
 
 ## Official sources and recovery
 
-Contract **8 / SQL schema 9** uses a fresh dataset. The enforcer is unmodified
+Contract **9 / SQL schema 10** uses a fresh dataset. The enforcer is unmodified
 LayerTwo-Labs upstream, pinned in `deployments/ecash/VERSIONS.lock`. No private
 observer RPCs or local BIP300 consensus replay are required.
 

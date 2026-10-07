@@ -38,8 +38,8 @@ Cutover sequence, after release approval:
 4. Preserve the old enforcer directory and use a fresh `enforcer-official-v8`
    directory. Apply the approved official enforcer+monitor images. The new monitor creates a
    fresh dataset; it refuses an existing pre-contract-8 identity before applying migrations.
-5. Grant the Observatory reader SELECT on `observation_failure`, configure the
-   new dataset UUID and run the projection7 importer. Preserve the old record
+5. Run `just grant-reader` (read-only role with every Observatory source grant),
+   configure the new dataset UUID and run the projection 8 importer. Preserve the old record
    and a separate old Observatory database for archival access with their paired binary.
 6. Run `just verify`, `just verify-live` for every slot and `just accept`.
    Collect `quality-report.sql` daily and retain transaction wait/duration logs.

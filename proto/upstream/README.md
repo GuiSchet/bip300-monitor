@@ -7,7 +7,7 @@ Files are copied verbatim from `proto/` at that commit. `SHA256SUMS` records
 their bytes. No patch, private LMDB access, or fork-specific RPC is supported.
 Run `.github/scripts/check-proto-vendor.sh --online` when updating the pin.
 
-Contract 8 capabilities are documented in `docs/official-sources.md`. The
+Contract 9 capabilities are documented in `docs/official-sources.md`. The
 official enforcer supplies per-block work, no transactional revision, and no
 mempool readiness proof. Normalization must not invent these guarantees.
 The pinned upstream has no root license file; no upstream license is inferred.
