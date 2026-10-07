@@ -755,6 +755,40 @@ async fn prepare_startup(args: &Args) -> Result<PreparedStartup> {
     })
 }
 
+/// BIP300 parameters the official enforcer reports for one network preset
+/// (`lib/types.rs` at the pinned enforcer commit), keyed by `network_id`.
+struct NetworkPreset {
+    network_id: &'static str,
+    activation_height: u32,
+    /// Withdrawal max age and inclusion threshold, then used-slot and
+    /// unused-slot proposal max age and activation threshold.
+    thresholds: [u32; 6],
+}
+
+const NETWORK_PRESETS: &[NetworkPreset] = &[
+    NetworkPreset {
+        network_id: "betanet",
+        activation_height: 967_680,
+        thresholds: [26_300, 13_150, 26_300, 13_150, 2_016, 1_008],
+    },
+    NetworkPreset {
+        network_id: "alphanet",
+        activation_height: 963_648,
+        thresholds: [144, 72, 144, 72, 36, 30],
+    },
+];
+
+fn reported_thresholds(constants: &events::Bip300Constants) -> [u32; 6] {
+    [
+        constants.withdrawal_bundle_max_age,
+        constants.withdrawal_bundle_inclusion_threshold,
+        constants.used_sidechain_slot_proposal_max_age,
+        constants.used_sidechain_slot_activation_threshold,
+        constants.unused_sidechain_slot_proposal_max_age,
+        constants.unused_sidechain_slot_activation_threshold,
+    ]
+}
+
 fn validate_chain_identity(args: &Args, snapshot: &InitialSnapshot) -> Result<()> {
     let chain_info = snapshot
         .constants
@@ -785,6 +819,39 @@ fn validate_chain_identity(args: &Args, snapshot: &InitialSnapshot) -> Result<()
             );
             bail!("enforcer network is {actual}, expected {expected_name}");
         }
+    }
+    match NETWORK_PRESETS
+        .iter()
+        .find(|preset| preset.network_id == args.network_id)
+    {
+        Some(preset) => {
+            if preset.activation_height != args.activation_height {
+                bail!(
+                    "network {} activates at {}, but this dataset is locked to {}",
+                    preset.network_id,
+                    preset.activation_height,
+                    args.activation_height
+                );
+            }
+            let reported = reported_thresholds(constants);
+            if reported != preset.thresholds {
+                bail!(
+                    "enforcer BIP300 thresholds {reported:?} are not the {} preset {:?}; \
+                     the enforcer is probably running another network preset",
+                    preset.network_id,
+                    preset.thresholds
+                );
+            }
+        }
+        // Production datasets name their network explicitly (`validate_identity`).
+        None if args.expected_enforcer_network.is_some() && !args.allow_unknown_network_preset => {
+            bail!(
+                "network {} has no known enforcer preset to verify; \
+                 set BIP300_MONITOR_ALLOW_UNKNOWN_NETWORK_PRESET to accept it unverified",
+                args.network_id
+            );
+        }
+        None => {}
     }
     Ok(())
 }
@@ -1953,14 +2020,39 @@ mod tests {
         network: mainchain::Network,
         activation_height: u32,
     ) -> InitialSnapshot {
+        thresholds_snapshot(
+            network,
+            activation_height,
+            [26_300, 13_150, 26_300, 13_150, 2_016, 1_008],
+        )
+    }
+
+    fn thresholds_snapshot(
+        network: mainchain::Network,
+        activation_height: u32,
+        thresholds: [u32; 6],
+    ) -> InitialSnapshot {
+        let [
+            withdrawal_bundle_max_age,
+            withdrawal_bundle_inclusion_threshold,
+            used_sidechain_slot_proposal_max_age,
+            used_sidechain_slot_activation_threshold,
+            unused_sidechain_slot_proposal_max_age,
+            unused_sidechain_slot_activation_threshold,
+        ] = thresholds;
         InitialSnapshot {
             constants: vec![events::EnforcerEvent {
                 event: Some(events::enforcer_event::Event::ChainInfo(
                     events::ChainInfo {
                         network: events::Network::Mainnet as i32,
                         bip300_constants: Some(events::Bip300Constants {
+                            withdrawal_bundle_max_age,
+                            withdrawal_bundle_inclusion_threshold,
+                            used_sidechain_slot_proposal_max_age,
+                            used_sidechain_slot_activation_threshold,
+                            unused_sidechain_slot_proposal_max_age,
+                            unused_sidechain_slot_activation_threshold,
                             activation_height,
-                            ..Default::default()
                         }),
                         raw_network: network as i32,
                     },
@@ -1974,6 +2066,7 @@ mod tests {
     #[test]
     fn startup_chain_identity_must_match_the_locked_network_and_activation() {
         let mut args = crate::config::Args::try_parse_from(["enforcer-extractor"]).unwrap();
+        args.network_id = "betanet".to_owned();
         args.activation_height = 967_680;
         args.expected_enforcer_network = Some("NETWORK_MAINNET".to_owned());
         validate_chain_identity(
@@ -1995,6 +2088,33 @@ mod tests {
         )
         .expect_err("network mismatch");
         assert!(wrong_network.to_string().contains("NETWORK_REGTEST"));
+
+        // Both forks report NETWORK_MAINNET: only the thresholds tell an
+        // alphanet-preset enforcer apart at a betanet activation height.
+        let wrong_preset = validate_chain_identity(
+            &args,
+            &thresholds_snapshot(
+                mainchain::Network::Mainnet,
+                967_680,
+                [144, 72, 144, 72, 36, 30],
+            ),
+        )
+        .expect_err("preset mismatch");
+        assert!(wrong_preset.to_string().contains("betanet preset"));
+
+        args.network_id = "gammanet".to_owned();
+        let unknown = validate_chain_identity(
+            &args,
+            &chain_identity_snapshot(mainchain::Network::Mainnet, 967_680),
+        )
+        .expect_err("an unverifiable production network");
+        assert!(unknown.to_string().contains("no known enforcer preset"));
+        args.allow_unknown_network_preset = true;
+        validate_chain_identity(
+            &args,
+            &chain_identity_snapshot(mainchain::Network::Mainnet, 967_680),
+        )
+        .expect("explicitly accepted unknown preset");
     }
 
     #[test]

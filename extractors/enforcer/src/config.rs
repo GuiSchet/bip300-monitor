@@ -47,6 +47,19 @@ pub struct Args {
     )]
     pub activation_block_hash: String,
 
+    /// Accept a production `network_id` that has no known enforcer preset.
+    ///
+    /// Known presets have their BIP300 thresholds and activation height
+    /// checked at startup, which is the only way to notice an enforcer running
+    /// with the wrong preset: the official API never reports the OP_DRIVECHAIN
+    /// opcode, and a wrong one silently produces no deposits or treasury.
+    #[arg(
+        long,
+        env = "BIP300_MONITOR_ALLOW_UNKNOWN_NETWORK_PRESET",
+        default_value_t = false
+    )]
+    pub allow_unknown_network_preset: bool,
+
     /// Exact protobuf network name expected from `GetChainInfo`.
     #[arg(long, env = "BIP300_MONITOR_EXPECTED_ENFORCER_NETWORK")]
     pub expected_enforcer_network: Option<String>,

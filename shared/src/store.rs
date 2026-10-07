@@ -28,8 +28,9 @@ const DEFAULT_PORT: u16 = 5432;
 
 /// Schema statements applied in order at startup.
 ///
-/// Every statement is idempotent, and `schema_version` records how far the
-/// record has been migrated so a future statement is applied exactly once.
+/// Each version is applied in one transaction together with its
+/// `schema_version` row, so a version is applied exactly once even across a
+/// crash; the statements themselves need not be idempotent.
 const MIGRATIONS: &[&str] = &[
     include_str!("../schema/0001_event.sql"),
     include_str!("../schema/0002_event_identity_nulls.sql"),
@@ -707,7 +708,7 @@ impl Store {
     }
 
     async fn migrate(&self) -> Result<()> {
-        let client = self.client.lock().await;
+        let mut client = self.client.lock().await;
         // Held for the whole migration, and released by the session ending even
         // if this returns early: two extractors starting at once must not both
         // decide a version is unapplied.
@@ -715,7 +716,7 @@ impl Store {
             .execute("SELECT pg_advisory_lock($1)", &[&MIGRATION_LOCK_KEY])
             .await
             .context("taking the record migration lock")?;
-        let result = Self::apply_migrations(&client).await;
+        let result = Self::apply_migrations(&mut client).await;
         // Reported rather than propagated: the session holds the lock, so a
         // failed unlock is released by the connection ending, and letting it
         // replace a migration failure would hide the error that matters.
@@ -728,7 +729,7 @@ impl Store {
         result
     }
 
-    async fn apply_migrations(client: &Client) -> Result<()> {
+    async fn apply_migrations(client: &mut Client) -> Result<()> {
         client
             .batch_execute(
                 "CREATE TABLE IF NOT EXISTS schema_version (
@@ -752,11 +753,17 @@ impl Store {
                 continue;
             }
 
-            client
+            // The statements and their version commit together: a crash in
+            // between would otherwise re-run DDL that is not idempotent.
+            let transaction = client
+                .transaction()
+                .await
+                .with_context(|| format!("opening schema version {version}"))?;
+            transaction
                 .batch_execute(statements)
                 .await
                 .with_context(|| format!("applying schema version {version}"))?;
-            client
+            transaction
                 .execute(
                     "INSERT INTO schema_version (version) VALUES ($1)
                      ON CONFLICT (version) DO NOTHING",
@@ -764,6 +771,10 @@ impl Store {
                 )
                 .await
                 .with_context(|| format!("recording schema version {version}"))?;
+            transaction
+                .commit()
+                .await
+                .with_context(|| format!("committing schema version {version}"))?;
             tracing::info!(version, "applied a record schema version");
         }
         Ok(())
