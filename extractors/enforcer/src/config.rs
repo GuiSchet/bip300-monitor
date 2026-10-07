@@ -147,6 +147,17 @@ pub struct Args {
     )]
     pub bmm_request_poll_interval_seconds: u64,
 
+    /// Seconds after the extractor starts during which BMM samples are
+    /// recorded with unknown consistency. The official API exposes no mempool
+    /// readiness, and an enforcer that just restarted reports a partial or
+    /// empty auction that would otherwise look like a healthy observation.
+    #[arg(
+        long,
+        env = "BIP300_MONITOR_BMM_READINESS_GRACE_SECONDS",
+        default_value_t = 120
+    )]
+    pub bmm_readiness_grace_seconds: u64,
+
     /// Enable independent, resumable confirmed-fee enrichment (phase 2).
     #[arg(
         long,
@@ -260,6 +271,11 @@ impl Args {
     /// Return the live BMM-auction polling interval.
     pub const fn bmm_request_poll_interval(&self) -> Duration {
         Duration::from_secs(self.bmm_request_poll_interval_seconds)
+    }
+
+    /// Return the window during which BMM samples are not trusted as complete.
+    pub const fn bmm_readiness_grace(&self) -> Duration {
+        Duration::from_secs(self.bmm_readiness_grace_seconds)
     }
 
     /// Return the live event-stream stall timeout.
@@ -399,6 +415,7 @@ mod tests {
         assert_eq!(args.log_level, LogLevel::Info);
         assert_eq!(args.request_timeout_seconds, 10);
         assert_eq!(args.bmm_request_poll_interval_seconds, 5);
+        assert_eq!(args.bmm_readiness_grace_seconds, 120);
         assert_eq!(args.stream_stall_timeout_seconds, 60);
         assert_eq!(args.backfill_page_blocks, 128);
         assert_eq!(args.backfill_page_pause_ms, 100);

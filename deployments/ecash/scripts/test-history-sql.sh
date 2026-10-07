@@ -31,7 +31,7 @@ INSERT INTO extractor_run VALUES('22222222-2222-4222-8222-222222222222',9,'enfor
 INSERT INTO extractor_status VALUES('11111111-1111-4111-8111-111111111111','22222222-2222-4222-8222-222222222222','enforcer');
 INSERT INTO extractor_run VALUES('44444444-4444-4444-8444-444444444444',9,'node','running');
 INSERT INTO extractor_status VALUES('11111111-1111-4111-8111-111111111111','44444444-4444-4444-8444-444444444444','node');
-INSERT INTO extractor_worker_status SELECT '22222222-2222-4222-8222-222222222222',unnest(ARRAY['mainchain_tip','bmm_requests','mainchain_events']),now(),NULL;
+INSERT INTO extractor_worker_status SELECT '22222222-2222-4222-8222-222222222222',unnest(ARRAY['mainchain_tip','bmm_requests','mainchain_events','enforcer_state']),now(),NULL;
 INSERT INTO event SELECT n,'11111111-1111-4111-8111-111111111111',9,'node','mainchain_block',NULL,NULL,decode(lpad(n::text,64,'0'),'hex'),decode(lpad((n-1)::text,64,'0'),'hex'),n FROM generate_series(1,3) n;
 INSERT INTO history_coverage VALUES('11111111-1111-4111-8111-111111111111',9,'node','mainchain_block',NULL,NULL,'complete',NULL,decode(lpad('3',64,'0'),'hex'),3,decode(lpad('3',64,'0'),'hex'),3,1);
 "

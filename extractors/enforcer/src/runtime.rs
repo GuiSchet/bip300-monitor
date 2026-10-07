@@ -310,6 +310,7 @@ pub async fn run(args: Args, mut shutdown_rx: watch::Receiver<bool>) -> Result<(
             client.clone(),
             recorder.clone(),
             args.bmm_request_poll_interval(),
+            args.bmm_readiness_grace(),
             tip_rx.clone(),
             shutdown_rx.clone(),
         ));
@@ -730,6 +731,7 @@ async fn prepare_startup(args: &Args) -> Result<PreparedStartup> {
             ExtractorWorker::MainchainTip,
             ExtractorWorker::BmmRequests,
             ExtractorWorker::MainchainEvents,
+            ExtractorWorker::EnforcerState,
         ])
         .await
         .context("initializing extractor worker status")?;
@@ -1306,6 +1308,7 @@ async fn monitor_bmm_requests(
     mut client: EnforcerClient,
     recorder: Recorder,
     interval: Duration,
+    readiness_grace: Duration,
     mut tip_rx: watch::Receiver<ObservedBlock>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> Result<()> {
@@ -1316,9 +1319,12 @@ async fn monitor_bmm_requests(
         "started live BMM request worker"
     );
     let mut consecutive_failures = 0_u32;
+    let ready_at = std::time::Instant::now() + readiness_grace;
     loop {
         match collect_bmm_sample(&mut client, SNAPSHOT_MAX_ATTEMPTS).await {
-            Ok((payload, metadata)) => {
+            Ok((payload, mut metadata)) => {
+                metadata.consistency =
+                    bmm_consistency(metadata.consistency, std::time::Instant::now(), ready_at);
                 let event = envelope(payload, metadata.tip_before.clone())?;
                 recorder
                     .record_snapshot_batch(vec![event], CaptureMethod::Poll, &metadata)
@@ -1377,6 +1383,21 @@ async fn monitor_bmm_requests(
             }
             () = tokio::time::sleep(interval) => {}
         }
+    }
+}
+
+/// A sample taken before the readiness window ends may describe a mempool the
+/// enforcer is still reloading. It is kept as evidence, but never as a complete
+/// auction.
+fn bmm_consistency(
+    sampled: SnapshotConsistency,
+    now: std::time::Instant,
+    ready_at: std::time::Instant,
+) -> SnapshotConsistency {
+    if now < ready_at && sampled == SnapshotConsistency::TipMatched {
+        SnapshotConsistency::Unknown
+    } else {
+        sampled
     }
 }
 
@@ -1513,6 +1534,7 @@ async fn monitor_state(
     shutdown_rx: watch::Receiver<bool>,
 ) -> Result<()> {
     tracing::info!("started enforcer state worker");
+    let health_recorder = recorder.clone();
 
     refresh_on_new_blocks(
         client,
@@ -1554,6 +1576,25 @@ async fn monitor_state(
                 Ok(())
             }
         },
+        |failure: Option<String>| {
+            let recorder = health_recorder.clone();
+            async move {
+                match failure {
+                    Some(error) => {
+                        tracing::warn!(%error, "enforcer state read failed; retrying");
+                        recorder
+                            .record_worker_failure(ExtractorWorker::EnforcerState, &error, 1)
+                            .await
+                            .map(|_| ())
+                    }
+                    None => {
+                        recorder
+                            .record_worker_success(ExtractorWorker::EnforcerState)
+                            .await
+                    }
+                }
+            }
+        },
     )
     .await?;
 
@@ -1562,7 +1603,7 @@ async fn monitor_state(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn refresh_on_new_blocks<S, P, F>(
+async fn refresh_on_new_blocks<S, P, F, H, G>(
     mut source: S,
     sidechains: Vec<u8>,
     discover_new_slots: bool,
@@ -1571,11 +1612,15 @@ async fn refresh_on_new_blocks<S, P, F>(
     mut block_rx: watch::Receiver<Vec<u8>>,
     mut shutdown_rx: watch::Receiver<bool>,
     mut publish: P,
+    mut health: H,
 ) -> Result<()>
 where
     S: StateSource,
     P: FnMut(ObservedBlock, Vec<events::EnforcerEvent>, SnapshotMetadata) -> F,
     F: Future<Output = Result<()>>,
+    // `Some(error)` for a failed read, `None` for a successful one.
+    H: FnMut(Option<String>) -> G,
+    G: Future<Output = Result<()>>,
 {
     // The block the initial snapshot describes. It is taken as an argument
     // rather than read from the channel because a slot worker can report a newer
@@ -1584,12 +1629,15 @@ where
     // block a slot worker last published an event for, which during a reorg is
     // the disconnected block rather than a tip.
     let mut refreshed_at = snapshot_block;
+    // A failed read is recorded and retried; the official API failing for a
+    // moment must not end every other worker of the extractor.
+    let mut read_failed = false;
 
     loop {
         tokio::select! {
             biased;
             () = wait_for_shutdown(&mut shutdown_rx) => return Ok(()),
-            () = tokio::time::sleep(Duration::from_secs(30)), if tracker.needs_retry() => {},
+            () = tokio::time::sleep(Duration::from_secs(30)), if tracker.needs_retry() || read_failed => {},
             result = block_rx.changed() => {
                 if result.is_err() {
                     // Nothing holds a sender any more, so no further tip change
@@ -1604,17 +1652,26 @@ where
         let block = block_rx.borrow_and_update().clone();
         // Each configured slot reports the same mainchain block, and startup can
         // replay the snapshot tip. Only the first report of a block refreshes.
-        if block == refreshed_at && !tracker.needs_retry() {
+        if block == refreshed_at && !tracker.needs_retry() && !read_failed {
             continue;
         }
 
         for attempt in 1..=SNAPSHOT_MAX_ATTEMPTS {
-            let reading = source
+            let reading = match source
                 .collect_state(&sidechains, discover_new_slots)
                 .await
                 .with_context(|| {
                     format!("refreshing enforcer state at block {}", hex::encode(&block))
-                })?;
+                }) {
+                Ok(reading) => reading,
+                Err(error) => {
+                    read_failed = true;
+                    health(Some(format!("{error:#}"))).await?;
+                    break;
+                }
+            };
+            read_failed = false;
+            health(None).await?;
             refreshed_at = block.clone();
             let mut metadata = reading.metadata;
             metadata.attempts = attempt;
@@ -1860,10 +1917,11 @@ mod tests {
     use super::{
         BackfillRequest, BmmSource, Heartbeat, SidechainActivationSource, SourceFuture,
         StartupSource, StateSource, TipSource, active_instances_for_slots, announce_tip_changes,
-        collect_bmm_sample, current_tip_receiver, forward_stream, prepare_observation,
-        prepare_sidechain_activation, prepare_stable_observation, queue_tip_reconciliations,
-        refresh_on_new_blocks, schedule_backfill_retry, schedule_sidechain_activation_retry,
-        snapshot_tips_are_consistent, supervise_workers, validate_chain_identity,
+        bmm_consistency, collect_bmm_sample, current_tip_receiver, forward_stream,
+        prepare_observation, prepare_sidechain_activation, prepare_stable_observation,
+        queue_tip_reconciliations, refresh_on_new_blocks, schedule_backfill_retry,
+        schedule_sidechain_activation_retry, snapshot_tips_are_consistent, supervise_workers,
+        validate_chain_identity,
     };
     use crate::proto::{common, mainchain};
     use crate::snapshot::InitialSnapshot;
@@ -2117,6 +2175,24 @@ mod tests {
                 .collect(),
             )),
         }
+    }
+
+    #[test]
+    fn bmm_samples_before_readiness_are_not_complete_auctions() {
+        let start = std::time::Instant::now();
+        let ready_at = start + Duration::from_secs(120);
+        assert_eq!(
+            bmm_consistency(SnapshotConsistency::TipMatched, start, ready_at),
+            SnapshotConsistency::Unknown
+        );
+        assert_eq!(
+            bmm_consistency(SnapshotConsistency::TipMatched, ready_at, ready_at),
+            SnapshotConsistency::TipMatched
+        );
+        assert_eq!(
+            bmm_consistency(SnapshotConsistency::Changed, start, ready_at),
+            SnapshotConsistency::Changed
+        );
     }
 
     #[tokio::test]
@@ -2875,6 +2951,7 @@ mod tests {
             block_rx,
             shutdown_rx,
             |_anchor, _payloads, _metadata| async { Ok(()) },
+            |_failure| async { Ok(()) },
         ));
 
         // Both sends happen with no await between them, so the worker cannot be
@@ -2939,6 +3016,7 @@ mod tests {
                     Ok(())
                 }
             },
+            |_failure| async { Ok(()) },
         ));
 
         // A replayed snapshot tip must not refresh. The channel only keeps the
@@ -2990,6 +3068,7 @@ mod tests {
             block_rx,
             shutdown_rx,
             |_anchor, _payloads, _metadata| async { Ok(()) },
+            |_failure| async { Ok(()) },
         ));
 
         tokio::task::yield_now().await;
@@ -3003,9 +3082,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_failed_state_refresh_is_fatal() {
+    async fn a_failed_state_refresh_is_recorded_and_retried() {
         let (block_tx, block_rx) = watch::channel(vec![0x11; 32]);
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let failures = Arc::new(std::sync::Mutex::new(Vec::<Option<String>>::new()));
+        let reported = Arc::clone(&failures);
+        let notified = Arc::new(Notify::new());
+        let notify = Arc::clone(&notified);
 
         let worker = tokio::spawn(refresh_on_new_blocks(
             // No scripted collection: the fake reports a failure.
@@ -3017,17 +3100,28 @@ mod tests {
             block_rx,
             shutdown_rx,
             |_anchor, _payloads, _metadata| async { Ok(()) },
+            move |failure: Option<String>| {
+                reported.lock().expect("failures").push(failure);
+                notify.notify_one();
+                async { Ok(()) }
+            },
         ));
 
         block_tx.send(vec![0x22; 32]).expect("new block");
-
-        let error = timeout(Duration::from_secs(1), worker)
+        timeout(Duration::from_secs(1), notified.notified())
             .await
-            .expect("state worker finishes")
-            .expect("join state worker")
-            .expect_err("a failed refresh must fail the worker");
+            .expect("the failure is reported");
 
-        assert!(format!("{error:#}").contains("refreshing enforcer state at block"));
+        let recorded = failures.lock().expect("failures").clone();
+        assert_eq!(recorded.len(), 1);
+        assert!(
+            recorded[0]
+                .as_deref()
+                .is_some_and(|error| error.contains("refreshing enforcer state at block"))
+        );
+        // The worker keeps running so the rest of the extractor survives.
+        assert!(!worker.is_finished());
+        worker.abort();
     }
 
     #[tokio::test]
@@ -3234,6 +3328,7 @@ mod tests {
             block_rx,
             shutdown_rx,
             |_anchor, _payloads, _metadata| async { Ok(()) },
+            |_failure| async { Ok(()) },
         ));
 
         tokio::task::yield_now().await;

@@ -74,20 +74,26 @@ pub(crate) async fn monitor(
             )
         }
         .await;
-        match result {
-            Ok(event) => {
-                recorder.record_fee_enrichment(source_id, event).await?;
+        // A block that cannot be enriched is scheduled for a bounded retry so
+        // it neither blocks the blocks after it nor stops the extractor.
+        let outcome = match result {
+            Ok(event) => recorder.record_fee_enrichment(source_id, event).await,
+            Err(error) => Err(error),
+        };
+        match outcome {
+            Ok(()) => {
                 recorder
                     .record_worker_success(ExtractorWorker::ConfirmedBmmFees)
                     .await?;
             }
             Err(error) => {
+                let message = format!("{error:#}");
                 recorder
-                    .record_worker_failure(
-                        ExtractorWorker::ConfirmedBmmFees,
-                        &format!("{error:#}"),
-                        1,
-                    )
+                    .store()
+                    .record_fee_failure(source_id, &message)
+                    .await?;
+                recorder
+                    .record_worker_failure(ExtractorWorker::ConfirmedBmmFees, &message, 1)
                     .await?;
                 tokio::select! {_=shutdown.changed()=>return Ok(()),_=tokio::time::sleep(Duration::from_secs(30))=>{}}
             }

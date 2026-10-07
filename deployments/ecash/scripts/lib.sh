@@ -785,7 +785,7 @@ record_current_worker_status_json() {
 record_current_workers_are_healthy() {
     local result
     result="$(record_scoped_query "WITH scope AS ($(record_scope_sql))
-        SELECT count(*) FILTER (WHERE w.worker IN ('mainchain_tip','bmm_requests','mainchain_events'))=3
+        SELECT count(*) FILTER (WHERE w.worker IN ('mainchain_tip','bmm_requests','mainchain_events','enforcer_state'))=4
           AND bool_and(w.last_success_at IS NOT NULL AND w.last_error IS NULL)
           FROM scope s JOIN extractor_worker_status w USING(run_id)")" || return 1
     [[ "${result}" == t ]]

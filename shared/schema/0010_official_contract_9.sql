@@ -41,6 +41,18 @@ BEGIN
     RETURN NEW;
 END $$;
 
+-- Fee enrichment jobs end. A block is done once every active slot's official
+-- block fact exists (its bid candidates are then final); otherwise it is
+-- retried with backoff and abandoned after a bounded number of attempts,
+-- instead of being re-read every day forever.
+ALTER TABLE bmm_fee_job
+    ADD COLUMN attempts integer NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+    ADD COLUMN status text NOT NULL DEFAULT 'pending'
+        CHECK (status IN ('pending', 'done', 'abandoned')),
+    ADD COLUMN last_error text,
+    ADD CONSTRAINT bmm_fee_job_schedule
+        CHECK ((status = 'pending') = (next_retry_at IS NOT NULL));
+
 -- Certification looks up proven blocks by hash once per walked block. The
 -- unique key cannot serve that lookup: its nullable slot/instance columns are
 -- compared with IS NOT DISTINCT FROM, which a btree cannot match, so every

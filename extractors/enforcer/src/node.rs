@@ -305,7 +305,20 @@ async fn monitor(args: Args, mut shutdown: watch::Receiver<bool>) -> Result<()> 
                     continue;
                 }
             };
-            let header = client.header(&tip.hash).await?;
+            let header = match client.header(&tip.hash).await {
+                Ok(header) => header,
+                Err(error) => {
+                    recorder
+                        .record_worker_failure(
+                            ExtractorWorker::NodeHistory,
+                            &format!("reading the tip header: {error:#}"),
+                            1,
+                        )
+                        .await?;
+                    tokio::select! { _=shutdown.changed()=>return Ok(()), _=tokio::time::sleep(Duration::from_secs(5))=>{} }
+                    continue;
+                }
+            };
             recorder
                 .record(node_event(
                     node_event::Event::ChainTip(ChainTip {
@@ -330,11 +343,27 @@ async fn monitor(args: Args, mut shutdown: watch::Receiver<bool>) -> Result<()> 
             )
             .await
             {
-                Ok(_) => {
+                Ok(backfill::Outcome::UpToDate { .. } | backfill::Outcome::Completed { .. }) => {
                     recorder
                         .record_worker_success(ExtractorWorker::NodeHistory)
                         .await?
                 }
+                // A deferred page failure leaves history incomplete: not healthy.
+                Ok(backfill::Outcome::Deferred { target, .. }) => {
+                    recorder
+                        .record_worker_failure(
+                            ExtractorWorker::NodeHistory,
+                            &format!(
+                                "node history toward {} deferred after a page failure",
+                                hex::encode(&target.hash)
+                            ),
+                            1,
+                        )
+                        .await?;
+                }
+                Ok(
+                    backfill::Outcome::Interrupted { .. } | backfill::Outcome::Superseded { .. },
+                ) => {}
                 Err(error) => {
                     recorder
                         .record_worker_failure(
@@ -374,10 +403,17 @@ pub async fn run(args: Args, shutdown: watch::Receiver<bool>) -> Result<()> {
     if args.node_rpc_endpoint.is_none() {
         return crate::runtime::run(args, shutdown).await;
     }
+    // One side failing stops the other through this channel, so both runs are
+    // finished explicitly instead of one being cancelled mid-write and left
+    // `running` until the next startup closes it as orphaned.
+    let (stop_tx, stop_rx) = watch::channel(false);
     let enforcer_args = args.clone();
-    let enforcer_shutdown = shutdown.clone();
+    let enforcer_shutdown = stop_rx.clone();
     let enforcer = async move {
         loop {
+            if *enforcer_shutdown.borrow() {
+                return Ok(());
+            }
             match crate::runtime::run(enforcer_args.clone(), enforcer_shutdown.clone()).await {
                 Ok(()) => return Ok(()),
                 Err(error)
@@ -392,8 +428,28 @@ pub async fn run(args: Args, shutdown: watch::Receiver<bool>) -> Result<()> {
             }
         }
     };
-    tokio::try_join!(monitor(args, shutdown.clone()), enforcer)?;
-    Ok(())
+    let stop_on_error = |result: Result<()>| {
+        if result.is_err() {
+            stop_tx.send_replace(true);
+        }
+        result
+    };
+    let forward = async {
+        let mut shutdown = shutdown;
+        if shutdown.changed().await.is_ok() || *shutdown.borrow() {
+            stop_tx.send_replace(true);
+        }
+        std::future::pending::<()>().await;
+    };
+    let both = async {
+        tokio::join!(
+            async { stop_on_error(monitor(args, stop_rx.clone()).await) },
+            async { stop_on_error(enforcer.await) },
+        )
+    };
+    let (node, enforcer) =
+        tokio::select! { results = both => results, () = forward => unreachable!() };
+    node.and(enforcer)
 }
 
 #[cfg(test)]

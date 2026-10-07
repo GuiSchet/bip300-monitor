@@ -325,6 +325,7 @@ pub enum ExtractorWorker {
     BmmRequests,
     MainchainEvents,
     ConfirmedBmmFees,
+    EnforcerState,
 }
 
 impl ExtractorWorker {
@@ -335,6 +336,7 @@ impl ExtractorWorker {
             Self::BmmRequests => "bmm_requests",
             Self::MainchainEvents => "mainchain_events",
             Self::ConfirmedBmmFees => "confirmed_bmm_fees",
+            Self::EnforcerState => "enforcer_state",
         }
     }
 }
@@ -1250,7 +1252,8 @@ impl Store {
                     WHERE dataset_id=$1::text::uuid AND event_contract_version=$2 AND source=$3),0)
               ORDER BY id LIMIT 1), retry AS (
                 SELECT e.id,e.block_hash,e.height FROM bmm_fee_job j JOIN event e ON e.id=j.source_event_id
-                 WHERE j.dataset_id=$1::text::uuid AND j.event_contract_version=$2 AND j.source=$3 AND j.next_retry_at<=now()
+                 WHERE j.dataset_id=$1::text::uuid AND j.event_contract_version=$2 AND j.source=$3
+                   AND j.status='pending' AND j.next_retry_at<=now()
                  ORDER BY j.next_retry_at LIMIT 1)
              SELECT * FROM next UNION ALL SELECT * FROM retry WHERE NOT EXISTS(SELECT 1 FROM next)",
             &[&self.dataset_id,&self.event_contract_version,&self.source],
@@ -1284,6 +1287,8 @@ impl Store {
             FROM event e CROSS JOIN LATERAL jsonb_array_elements(e.payload #> '{monitor_event,Enforcer,event,BmmRequests,requests}') r
             WHERE e.dataset_id=$1::text::uuid AND e.event_contract_version=$2 AND e.source='enforcer'
             AND e.kind='bmm_requests' AND e.payload #>> '{monitor_event,Enforcer,event,BmmRequests,previous_mainchain_block_hash}'=encode($3::bytea,'hex')
+            AND EXISTS(SELECT 1 FROM event_observation o JOIN snapshot_group g USING(snapshot_group_id)
+                WHERE o.event_id=e.id AND g.dataset_id=e.dataset_id AND g.consistency='tip_matched')
             AND EXISTS(SELECT 1 FROM event b WHERE b.dataset_id=e.dataset_id AND b.event_contract_version=e.event_contract_version
                 AND b.source='enforcer' AND b.kind='block_connected' AND b.block_hash=$4
                 AND b.sidechain=(r->>'sidechain_number')::smallint
@@ -1360,12 +1365,30 @@ impl Store {
             &mut BTreeMap::new(),
         )
         .await?;
-        // Retry partial associations too: the official slot backfill can arrive
-        // after the node block. Never close that enrichment race permanently.
-        tx.execute("INSERT INTO bmm_fee_job(dataset_id,event_contract_version,source,source_event_id,next_retry_at)
-            VALUES($1::text::uuid,$2,$3,$4,now()+interval '24 hours') ON CONFLICT(dataset_id,event_contract_version,source,source_event_id)
-            DO UPDATE SET last_observed_at=now(),next_retry_at=excluded.next_retry_at",
-            &[&self.dataset_id,&self.event_contract_version,&self.source,&source_id]).await?;
+        // The official slot backfill can arrive after the node block, so the
+        // candidates are final only once every active slot's block fact exists.
+        let final_candidates: bool = tx
+            .query_one(
+                "SELECT NOT EXISTS(SELECT 1 FROM current_sidechain_instance i
+                WHERE i.dataset_id=$1::text::uuid AND NOT EXISTS(SELECT 1 FROM event b
+                    WHERE b.dataset_id=i.dataset_id AND b.event_contract_version=$2
+                      AND b.source='enforcer' AND b.kind='block_connected'
+                      AND b.sidechain=i.sidechain AND b.block_hash=$3))",
+                &[&self.dataset_id, &self.event_contract_version, &header.hash],
+            )
+            .await?
+            .get(0);
+        schedule_fee_job(&tx, self, source_id, final_candidates, None).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Record that enriching one block failed; it is retried with backoff and
+    /// abandoned after a bounded number of attempts.
+    pub async fn record_fee_failure(&self, source_event_id: i64, error: &str) -> Result<()> {
+        let mut client = self.client.lock().await;
+        let tx = write_tx(&mut client).await?;
+        schedule_fee_job(&tx, self, source_event_id, false, Some(error)).await?;
         tx.commit().await?;
         Ok(())
     }
@@ -1958,6 +1981,46 @@ fn block_from_parts(
         (None, None) => Ok(None),
         _ => bail!("record contains an incomplete {name}"),
     }
+}
+
+/// Attempts after which an incomplete fee enrichment is abandoned.
+const FEE_JOB_MAX_ATTEMPTS: i32 = 10;
+
+/// Close a fee job, or schedule its next attempt with exponential backoff
+/// (one hour, doubling, at most a day).
+async fn schedule_fee_job(
+    tx: &tokio_postgres::Transaction<'_>,
+    store: &Store,
+    source_event_id: i64,
+    done: bool,
+    error: Option<&str>,
+) -> Result<()> {
+    tx.execute(
+        "INSERT INTO bmm_fee_job AS j(dataset_id,event_contract_version,source,source_event_id,
+                attempts,status,next_retry_at,last_error)
+         VALUES($1::text::uuid,$2,$3,$4,1,
+                CASE WHEN $5 THEN 'done' ELSE 'pending' END,
+                CASE WHEN $5 THEN NULL ELSE now()+interval '1 hour' END,$6)
+         ON CONFLICT(dataset_id,event_contract_version,source,source_event_id) DO UPDATE SET
+            last_observed_at=now(),
+            attempts=j.attempts+1,
+            last_error=excluded.last_error,
+            status=CASE WHEN $5 THEN 'done' WHEN j.attempts+1>=$7 THEN 'abandoned' ELSE 'pending' END,
+            next_retry_at=CASE WHEN $5 OR j.attempts+1>=$7 THEN NULL
+                ELSE now()+LEAST(interval '24 hours', interval '1 hour'*power(2,j.attempts+1)) END",
+        &[
+            &store.dataset_id,
+            &store.event_contract_version,
+            &store.source,
+            &source_event_id,
+            &done,
+            &error,
+            &FEE_JOB_MAX_ATTEMPTS,
+        ],
+    )
+    .await
+    .context("scheduling a confirmed-fee job")?;
+    Ok(())
 }
 
 /// Event kind whose facts make up a history coverage stream.

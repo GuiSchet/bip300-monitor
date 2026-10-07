@@ -1744,6 +1744,14 @@ async fn an_orphan_at_the_missing_height_does_not_certify_the_target_chain() {
     );
 }
 
+async fn fee_job(client: &tokio_postgres::Client) -> (String, i32) {
+    let row = client
+        .query_one("SELECT status, attempts FROM bmm_fee_job", &[])
+        .await
+        .unwrap();
+    (row.get(0), row.get(1))
+}
+
 /// A second recorder for another source of the same dataset.
 async fn store_in(test: &str, source: &'static str) -> Store {
     let admin_url = std::env::var("BIP300_MONITOR_TEST_POSTGRES_URL")
@@ -1798,17 +1806,24 @@ async fn confirmed_fees_resume_and_never_rewrite_the_block() {
     {
         b.bmm_commitment = Some(vec![0x33; 32]);
     }
+    let parent = ObservedBlock::at_height(vec![3; 32], 3);
+    let bid = envelope(bid, Some(parent.clone()), 1_700_000_000_003);
+    let mut sample = SnapshotMetadata {
+        started_at: SystemTime::now(),
+        finished_at: SystemTime::now(),
+        tip_before: parent.clone(),
+        tip_after: parent,
+        consistency: SnapshotConsistency::Unknown,
+        attempts: 1,
+        revision_before: None,
+        revision_after: None,
+    };
+    // A sample taken while the enforcer may still be reloading its mempool.
     enforcer
-        .record(&[
-            envelope(
-                bid,
-                Some(ObservedBlock::at_height(vec![3; 32], 3)),
-                1_700_000_000_003,
-            ),
-            committed,
-        ])
+        .record_snapshot(std::slice::from_ref(&bid), CaptureMethod::Poll, &sample)
         .await
         .unwrap();
+    enforcer.record(&[committed]).await.unwrap();
     node.record(std::slice::from_ref(&block)).await.unwrap();
     let anchor = ObservedBlock::at_height(header.hash.clone(), header.height);
     let (source, next) = node.next_fee_block().await.unwrap().unwrap();
@@ -1843,6 +1858,17 @@ async fn confirmed_fees_resume_and_never_rewrite_the_block() {
             .await
             .is_err()
     );
+    // A bid seen only in an unknown-consistency sample is not evidence either.
+    assert!(
+        node.record_fee_enrichment(source, &make_fee(txid.clone(), Some(42)))
+            .await
+            .is_err()
+    );
+    sample.consistency = SnapshotConsistency::TipMatched;
+    enforcer
+        .record_snapshot(std::slice::from_ref(&bid), CaptureMethod::Poll, &sample)
+        .await
+        .unwrap();
     // Enforcer payloads are not fee enrichments.
     assert!(
         node.record_fee_enrichment(source, &envelope(chain_info(), None, 1))
@@ -1862,12 +1888,51 @@ async fn confirmed_fees_resume_and_never_rewrite_the_block() {
         .await
         .unwrap();
     assert_eq!(node.next_fee_block().await.unwrap().unwrap().0, source);
-    node.record_fee_enrichment(source, &make_fee(txid, Some(u64::MAX)))
+    node.record_fee_enrichment(source, &make_fee(txid.clone(), Some(u64::MAX)))
         .await
         .unwrap();
     let counts = client.query_one("SELECT count(*) FILTER(WHERE kind='mainchain_block'),count(*) FILTER(WHERE kind='confirmed_bmm_fees') FROM event",&[]).await.unwrap();
     assert_eq!(counts.get::<_, i64>(0), 1);
     assert_eq!(counts.get::<_, i64>(1), 2);
+    // Slot 98 has no official block fact yet, so its bids may still arrive.
+    assert_eq!(fee_job(&client).await, ("pending".to_owned(), 2));
+    let mut other_slot = block_event(4, 4, 3);
+    if let Some(MonitorEvent::Enforcer(payload)) = &mut other_slot.monitor_event
+        && let Some(events::enforcer_event::Event::BlockConnected(b)) = &mut payload.event
+    {
+        b.sidechain_number = 98;
+    }
+    enforcer.record(&[other_slot]).await.unwrap();
+    client
+        .execute(
+            "UPDATE bmm_fee_job SET next_retry_at=now()-interval '1 second'",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(node.next_fee_block().await.unwrap().unwrap().0, source);
+    node.record_fee_enrichment(source, &make_fee(txid, Some(u64::MAX)))
+        .await
+        .unwrap();
+    // Every active slot's block fact exists: the candidates are final.
+    assert_eq!(fee_job(&client).await.0, "done");
+    assert!(node.next_fee_block().await.unwrap().is_none());
+
+    // A block that keeps failing is retried with backoff, then abandoned.
+    client
+        .execute(
+            "UPDATE bmm_fee_job SET status='pending',attempts=0,next_retry_at=now()",
+            &[],
+        )
+        .await
+        .unwrap();
+    for _ in 0..10 {
+        node.record_fee_failure(source, "node RPC unavailable")
+            .await
+            .unwrap();
+    }
+    assert_eq!(fee_job(&client).await, ("abandoned".to_owned(), 10));
+    assert!(node.next_fee_block().await.unwrap().is_none());
     // Only node recorders serve fee jobs.
     assert!(enforcer.next_fee_block().await.is_err());
 }
