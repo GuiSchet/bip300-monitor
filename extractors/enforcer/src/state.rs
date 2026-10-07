@@ -105,6 +105,25 @@ pub(crate) async fn collect_payloads(
     Ok(payloads)
 }
 
+/// One state reading to publish.
+#[derive(Debug, PartialEq)]
+pub(crate) struct Publication {
+    /// Every payload read, unchanged ones included.
+    pub(crate) payloads: Vec<events::EnforcerEvent>,
+    /// The payloads whose value differs from the previous reading.
+    pub(crate) changed: Vec<events::EnforcerEvent>,
+}
+
+impl Publication {
+    /// Whether the set of active sidechains changed, which is what lifecycle
+    /// consumers react to.
+    pub(crate) fn active_sidechains_changed(&self) -> bool {
+        self.changed
+            .iter()
+            .any(|payload| active_instances(payload).is_some())
+    }
+}
+
 /// Remembers the last published value of each mutable-state payload.
 pub(crate) struct Tracker {
     last: Vec<events::EnforcerEvent>,
@@ -129,23 +148,20 @@ impl Tracker {
         self.last_consistency == SnapshotConsistency::Changed
     }
 
+    /// Every reading is published, unchanged payloads included: an unchanged
+    /// value re-read at a later tip is evidence that it still held there, and
+    /// identical facts deduplicate to one event with another occurrence.
     pub(crate) fn take_observation(
         &mut self,
         current: Vec<events::EnforcerEvent>,
         consistency: SnapshotConsistency,
-    ) -> Result<Vec<events::EnforcerEvent>> {
-        let force = self.needs_retry() || consistency == SnapshotConsistency::Changed;
+    ) -> Result<Publication> {
         self.last_consistency = consistency;
-        if force {
-            // Validate identities even when every payload must be published.
-            for payload in &current {
-                payload_key(payload)?;
-            }
-            self.last = current.clone();
-            Ok(current)
-        } else {
-            self.take_changed(current)
-        }
+        let changed = self.take_changed(current.clone())?;
+        Ok(Publication {
+            payloads: current,
+            changed,
+        })
     }
 
     /// Return the payloads that differ from the last published value, and
@@ -315,29 +331,27 @@ mod tests {
     }
 
     #[test]
-    fn a_stable_read_after_a_changed_read_is_evidence_even_when_payload_is_identical() {
+    fn every_reading_is_published_and_changes_are_reported() {
         let payload = vec![ctip(9, 100)];
         let mut tracker = Tracker::new(payload.clone());
-        assert_eq!(
-            tracker
-                .take_observation(payload.clone(), SnapshotConsistency::Changed)
-                .unwrap(),
-            payload
-        );
+        let publication = tracker
+            .take_observation(payload.clone(), SnapshotConsistency::Changed)
+            .unwrap();
+        assert_eq!(publication.payloads, payload);
+        assert!(publication.changed.is_empty());
         assert!(tracker.needs_retry());
-        assert_eq!(
-            tracker
-                .take_observation(payload.clone(), SnapshotConsistency::TipMatched)
-                .unwrap(),
-            payload
-        );
+        // An unchanged re-read is still published as a new occurrence.
+        let publication = tracker
+            .take_observation(payload.clone(), SnapshotConsistency::TipMatched)
+            .unwrap();
+        assert_eq!(publication.payloads, payload);
+        assert!(publication.changed.is_empty());
         assert!(!tracker.needs_retry());
-        assert!(
-            tracker
-                .take_observation(payload, SnapshotConsistency::TipMatched)
-                .unwrap()
-                .is_empty()
-        );
+        let publication = tracker
+            .take_observation(vec![ctip(9, 150)], SnapshotConsistency::TipMatched)
+            .unwrap();
+        assert_eq!(publication.changed, vec![ctip(9, 150)]);
+        assert!(!publication.active_sidechains_changed());
     }
 
     #[test]

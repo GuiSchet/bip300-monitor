@@ -2384,3 +2384,92 @@ async fn concurrent_sources_commit_in_identity_order() {
         "rows committed behind the cursor: {skipped:?}"
     );
 }
+
+async fn current_instance_9(client: &tokio_postgres::Client) -> (String, SystemTime) {
+    let row = client
+        .query_one(
+            "SELECT sidechain_instance_id, observed_at FROM current_sidechain_instance WHERE sidechain = 9",
+            &[],
+        )
+        .await
+        .unwrap();
+    (row.get(0), row.get(1))
+}
+
+/// A reading taken while the tip moved records the instances it saw, but it
+/// cannot make one current or tag the CTIPs of its own batch with it.
+#[tokio::test]
+async fn a_changed_reading_never_replaces_the_current_instance() {
+    let test = "changed_instance_reading";
+    let store = store_for(test, "enforcer").await;
+    let client = query_client(test).await;
+    let (original, original_since) = current_instance_9(&client).await;
+    assert_eq!(original, instance_id(9));
+
+    let replacement = replacement_sidechain(9, vec![1, 0x77], 50, 60);
+    let replacement_id = sidechain_instance_ref(&replacement)
+        .unwrap()
+        .sidechain_instance_id;
+    let batch = |sidechains: Vec<events::ActiveSidechain>, value: u64| {
+        vec![
+            envelope(
+                events::enforcer_event::Event::ActiveSidechains(events::ActiveSidechainsSnapshot {
+                    sidechains,
+                }),
+                None,
+                1_700_000_100_000 + value,
+            ),
+            envelope(ctip(9, value), None, 1_700_000_100_000 + value),
+        ]
+    };
+    let tip = ObservedBlock::at_height(vec![0x31; 32], 31);
+    let mut metadata = SnapshotMetadata {
+        started_at: SystemTime::now(),
+        finished_at: SystemTime::now(),
+        tip_before: tip.clone(),
+        tip_after: ObservedBlock::at_height(vec![0x32; 32], 32),
+        consistency: SnapshotConsistency::Changed,
+        attempts: 1,
+        revision_before: None,
+        revision_after: None,
+    };
+    store
+        .record_snapshot(
+            &batch(vec![replacement, active_sidechain(98)], 7),
+            CaptureMethod::Poll,
+            &metadata,
+        )
+        .await
+        .unwrap();
+    assert_eq!(current_instance_9(&client).await.0, original);
+    let tagged: String = client
+        .query_one(
+            "SELECT sidechain_instance_id FROM event WHERE kind='ctip'
+               AND payload #>> '{monitor_event,Enforcer,event,Ctip,ctip,value_sats}' = '7'",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(
+        tagged, original,
+        "a changed reading must not retag its CTIP"
+    );
+    assert_ne!(tagged, replacement_id);
+
+    // An unchanged, tip-matched reading rewrites nothing.
+    metadata.consistency = SnapshotConsistency::TipMatched;
+    metadata.tip_after = tip;
+    store
+        .record_snapshot(
+            &batch(vec![active_sidechain(9), active_sidechain(98)], 8),
+            CaptureMethod::Poll,
+            &metadata,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        current_instance_9(&client).await,
+        (original, original_since)
+    );
+}

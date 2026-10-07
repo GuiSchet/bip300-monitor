@@ -2243,16 +2243,9 @@ async fn update_sidechain_instances(
         return Ok(());
     };
 
-    if authoritative {
-        transaction
-            .execute(
-                "DELETE FROM current_sidechain_instance WHERE dataset_id = $1::text::uuid",
-                &[&dataset_id],
-            )
-            .await
-            .context("resetting the current sidechain-instance map")?;
-    }
-    instance_cache.clear();
+    // Instances are recorded from every reading. Only an authoritative one may
+    // change which instance is current, or tag other events of its batch.
+    let mut current = Vec::with_capacity(snapshot.sidechains.len());
     for sidechain in &snapshot.sidechains {
         let slot = i16::try_from(sidechain.sidechain_number).with_context(|| {
             format!(
@@ -2288,24 +2281,38 @@ async fn update_sidechain_instances(
             )
             .await
             .context("recording a sidechain instance")?;
-        if authoritative {
-            transaction
-                .execute(
-                    "INSERT INTO current_sidechain_instance
-                    (dataset_id, sidechain, sidechain_instance_id, observed_at)
-                 VALUES ($1::text::uuid, $2, $3, $4)",
-                    &[
-                        &dataset_id,
-                        &slot,
-                        &instance.sidechain_instance_id,
-                        &observed_at,
-                    ],
-                )
-                .await
-                .context("recording the current sidechain instance")?;
-        }
-        instance_cache.insert(slot, instance.sidechain_instance_id);
+        current.push((slot, instance.sidechain_instance_id));
     }
+    if !authoritative {
+        return Ok(());
+    }
+    let slots = current.iter().map(|(slot, _)| *slot).collect::<Vec<_>>();
+    let instances = current.iter().map(|(_, id)| id.clone()).collect::<Vec<_>>();
+    // Change only the rows that differ, so an unchanged reading rewrites
+    // nothing and `observed_at` keeps meaning "current since".
+    transaction
+        .execute(
+            "DELETE FROM current_sidechain_instance c
+              WHERE c.dataset_id = $1::text::uuid
+                AND NOT EXISTS (SELECT 1 FROM unnest($2::smallint[], $3::text[]) n(sidechain, id)
+                                 WHERE n.sidechain = c.sidechain AND n.id = c.sidechain_instance_id)",
+            &[&dataset_id, &slots, &instances],
+        )
+        .await
+        .context("retiring replaced current sidechain instances")?;
+    transaction
+        .execute(
+            "INSERT INTO current_sidechain_instance
+                (dataset_id, sidechain, sidechain_instance_id, observed_at)
+             SELECT $1::text::uuid, n.sidechain, n.id, $4
+               FROM unnest($2::smallint[], $3::text[]) n(sidechain, id)
+             ON CONFLICT (dataset_id, sidechain) DO NOTHING",
+            &[&dataset_id, &slots, &instances, &observed_at],
+        )
+        .await
+        .context("recording the current sidechain instances")?;
+    instance_cache.clear();
+    instance_cache.extend(current);
     Ok(())
 }
 

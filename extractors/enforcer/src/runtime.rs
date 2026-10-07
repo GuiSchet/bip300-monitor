@@ -1553,16 +1553,15 @@ async fn monitor_state(
         block_rx,
         shutdown_rx,
         move |anchor: ObservedBlock,
-              payloads: Vec<events::EnforcerEvent>,
+              publication: state::Publication,
               metadata: SnapshotMetadata| {
             let recorder = recorder.clone();
             let sidechain_state_tx = sidechain_state_tx.clone();
             async move {
-                let published = payloads.len();
-                let active_sidechains_changed = payloads
-                    .iter()
-                    .any(|payload| state::active_instances(payload).is_some());
-                let events = payloads
+                let published = publication.payloads.len();
+                let active_sidechains_changed = publication.active_sidechains_changed();
+                let events = publication
+                    .payloads
                     .into_iter()
                     .map(|payload| {
                         log_state_event(&payload);
@@ -1624,7 +1623,7 @@ async fn refresh_on_new_blocks<S, P, F, H, G>(
 ) -> Result<()>
 where
     S: StateSource,
-    P: FnMut(ObservedBlock, Vec<events::EnforcerEvent>, SnapshotMetadata) -> F,
+    P: FnMut(ObservedBlock, state::Publication, SnapshotMetadata) -> F,
     F: Future<Output = Result<()>>,
     // `Some(error)` for a failed read, `None` for a successful one.
     H: FnMut(Option<String>) -> G,
@@ -1683,12 +1682,10 @@ where
             refreshed_at = block.clone();
             let mut metadata = reading.metadata;
             metadata.attempts = attempt;
-            let changed = tracker.take_observation(reading.payloads, metadata.consistency)?;
-            if !changed.is_empty() {
-                publish(reading.anchor, changed, metadata)
-                    .await
-                    .context("publishing refreshed enforcer state")?;
-            }
+            let publication = tracker.take_observation(reading.payloads, metadata.consistency)?;
+            publish(reading.anchor, publication, metadata)
+                .await
+                .context("publishing refreshed enforcer state")?;
             if !tracker.needs_retry() {
                 break;
             }
@@ -2989,7 +2986,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn state_refreshes_once_per_block_and_publishes_only_changes() {
+    async fn state_refreshes_once_per_block_and_publishes_every_reading() {
         let snapshot_tip = vec![0x11; 32];
         let (block_tx, block_rx) = watch::channel(snapshot_tip.clone());
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -3011,16 +3008,16 @@ mod tests {
             block_rx,
             shutdown_rx,
             move |anchor: ObservedBlock,
-                  payloads: Vec<events::EnforcerEvent>,
+                  publication: state::Publication,
                   _metadata: SnapshotMetadata| {
                 let output = Arc::clone(&output);
                 let publish_shutdown = publish_shutdown.clone();
                 async move {
-                    output
-                        .lock()
-                        .expect("published state lock")
-                        .push((anchor, payloads));
-                    publish_shutdown.send(true).expect("send shutdown");
+                    let mut output = output.lock().expect("published state lock");
+                    output.push((anchor, publication));
+                    if output.len() == 2 {
+                        publish_shutdown.send(true).expect("send shutdown");
+                    }
                     Ok(())
                 }
             },
@@ -3047,9 +3044,14 @@ mod tests {
             .expect("clean state worker shutdown");
 
         let published = published.lock().expect("published state lock");
-        assert_eq!(published.len(), 1, "only the changed reading is published");
-        let (anchor, payloads) = &published[0];
-        assert_eq!(*payloads, vec![ctip_payload(9, 250)]);
+        assert_eq!(published.len(), 2, "every reading is published");
+        // The unchanged reading is evidence that the value still held there.
+        let (_, unchanged) = &published[0];
+        assert_eq!(unchanged.payloads, vec![ctip_payload(9, 100)]);
+        assert!(unchanged.changed.is_empty());
+        let (anchor, changed) = &published[1];
+        assert_eq!(changed.payloads, vec![ctip_payload(9, 250)]);
+        assert_eq!(changed.changed, vec![ctip_payload(9, 250)]);
         assert_eq!(
             anchor.height,
             Some(996_261),
