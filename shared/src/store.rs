@@ -241,6 +241,9 @@ pub struct Store {
     dataset_id: String,
     run_id: String,
     event_contract_version: i32,
+    /// Last tip this source recorded before the current run, if any. A new
+    /// subscription cannot replay what happened since: it starts a gap.
+    previous_run_tip: Option<ObservedBlock>,
 }
 
 /// Identity and build provenance of the record this extractor is extending.
@@ -458,6 +461,11 @@ pub struct HistoryPage<'a> {
 }
 
 impl Store {
+    /// Last tip this source recorded before the current run started.
+    pub const fn previous_run_tip(&self) -> Option<&ObservedBlock> {
+        self.previous_run_tip.as_ref()
+    }
+
     /// Connect to the record and apply any outstanding schema statements.
     ///
     /// `source` names the extractor writing the rows.
@@ -497,6 +505,7 @@ impl Store {
             dataset_id: String::new(),
             run_id: String::new(),
             event_contract_version: 0,
+            previous_run_tip: None,
         };
         // Since contract 8 every contract version owns a fresh dataset: facts of
         // different versions are never mixed under one dataset identity.
@@ -522,17 +531,21 @@ impl Store {
             }
         }
         store.migrate().await?;
-        let (dataset_id, run_id) = store.initialize_identity(&manifest).await?;
+        let (dataset_id, run_id, previous_run_tip) = store.initialize_identity(&manifest).await?;
         Ok(Self {
             dataset_id,
             run_id,
+            previous_run_tip,
             event_contract_version: i32::try_from(manifest.event_contract_version)
                 .context("event contract version does not fit in an i32")?,
             ..store
         })
     }
 
-    async fn initialize_identity(&self, manifest: &DatasetManifest) -> Result<(String, String)> {
+    async fn initialize_identity(
+        &self,
+        manifest: &DatasetManifest,
+    ) -> Result<(String, String, Option<ObservedBlock>)> {
         let activation_height = height_to_i32(manifest.activation_height)?;
         let event_contract_version = i32::try_from(manifest.event_contract_version)
             .context("event contract version does not fit in an i32")?;
@@ -624,7 +637,8 @@ impl Store {
                     "INSERT INTO observation_failure(dataset_id, run_id, worker, error)
                      SELECT $1::text::uuid, $2::text::uuid, 'mainchain_events',
                             'subscription restarted after run ' || run_id::text ||
-                            '; offline transitions are unknown (no replay continuity)'
+                            '; offline transitions are unknown (no replay continuity) until the'
+                            ' next mainchain_transition subscription boundary'
                        FROM extractor_run
                       WHERE dataset_id = $1::text::uuid AND source = $3
                         AND run_id <> $2::text::uuid
@@ -634,6 +648,23 @@ impl Store {
                 .await
                 .context("recording the subscription restart gap")?;
         }
+        // Read before the status row is claimed by the new run.
+        let previous_run_tip = transaction
+            .query_opt(
+                "SELECT last_tip_hash, last_tip_height FROM extractor_status
+                  WHERE dataset_id = $1::text::uuid AND source = $2
+                    AND last_tip_hash IS NOT NULL AND last_tip_height IS NOT NULL",
+                &[&dataset_id, &self.source],
+            )
+            .await
+            .context("reading the previous run's last tip")?
+            .map(|row| -> Result<ObservedBlock> {
+                Ok(ObservedBlock::at_height(
+                    row.get(0),
+                    u32::try_from(row.get::<_, i32>(1)).context("negative previous tip height")?,
+                ))
+            })
+            .transpose()?;
         transaction
             .execute(
                 "INSERT INTO extractor_status (dataset_id, source, run_id)
@@ -650,7 +681,7 @@ impl Store {
             .commit()
             .await
             .context("committing extractor identity")?;
-        Ok((dataset_id, run_id))
+        Ok((dataset_id, run_id, previous_run_tip))
     }
 
     async fn migrate(&self) -> Result<()> {

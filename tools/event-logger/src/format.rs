@@ -81,7 +81,7 @@ fn summarize(payload: &events::enforcer_event::Event) -> Result<String> {
                 validate_header(header)?;
             }
             if let Some(gap_start) = &event.gap_start {
-                validate_header(gap_start)?;
+                require_32_bytes(&gap_start.hash, "mainchain_transition.gap_start.hash")?;
             }
             let gap = event.gap_start.as_ref().map_or_else(String::new, |start| {
                 format!(" gap_start_height={}", start.height)

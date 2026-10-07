@@ -77,6 +77,11 @@ impl Recorder {
         })
     }
 
+    /// Last tip this source recorded before the current run started.
+    pub fn previous_run_tip(&self) -> Option<&ObservedBlock> {
+        self.store.previous_run_tip()
+    }
+
     /// Record one event and fan it out.
     pub async fn record(&self, event: Event) -> Result<()> {
         self.record_batch(vec![event]).await

@@ -13,7 +13,7 @@ const EVENT_CONTRACT_V9_ENVELOPE_SHA256: &str =
     "71c39ffdf74e64b2729adf50cf4bf06440de75bdb75543f9eb27cd4a5c2eaf14";
 #[cfg(test)]
 const EVENT_CONTRACT_V9_PAYLOAD_SHA256: &str =
-    "9d52c84437a3f9434b3c260afa4d9a0c1dc21c2e2ea919cca91efc7b36456589";
+    "26d3ca21e30fd8395618e456b0ed5a1fc98d6f83312ba1cf602a593db2c4de57";
 
 impl enforcer_event::Event {
     /// Stable name of this event variant.

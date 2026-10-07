@@ -245,7 +245,14 @@ message MainchainTransition {
   BlockHeader header = 4;
   // Boundary only: the last tip known before the gap. Absent for the very
   // first subscription of a dataset, whose evidence simply starts here.
-  optional BlockHeader gap_start = 5;
+  optional BlockRef gap_start = 5;
+}
+
+// A block named by identity only, when its full header is not evidence here.
+message BlockRef {
+  // 32-byte block hash in conventional display order.
+  bytes hash = 1;
+  uint32 height = 2;
 }
 
 // Node enrichment for a confirmed block: fees of BMM bids that the official

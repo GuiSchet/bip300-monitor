@@ -342,14 +342,23 @@ async fn invalid_publisher_configuration_does_not_create_an_extractor_run() {
 #[tokio::test]
 async fn a_new_start_closes_an_orphaned_run_before_claiming_the_dataset() {
     let test = "orphaned_run_reconciliation";
-    let _first = store_for(test, "enforcer").await;
+    let first = store_for(test, "enforcer").await;
+    assert_eq!(first.previous_run_tip(), None, "a new dataset has no gap");
+    let last_seen = ObservedBlock::at_height(vec![0x42; 32], 42);
+    first
+        .record_tip_observation(&last_seen, None, CaptureMethod::Poll, SystemTime::now())
+        .await
+        .unwrap();
     let admin_url = std::env::var("BIP300_MONITOR_TEST_POSTGRES_URL").unwrap();
-    let _replacement = Store::connect(
+    let replacement = Store::connect(
         &args_for(&admin_url, &format!("bip300_test_{test}")),
         "enforcer",
     )
     .await
     .expect("replace the orphaned run");
+    // The replacement subscription opens a gap that starts at the last tip the
+    // previous run saw; nothing between it and the new tip is evidence.
+    assert_eq!(replacement.previous_run_tip(), Some(&last_seen));
 
     let client = query_client(test).await;
     let counts = client
