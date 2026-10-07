@@ -1597,12 +1597,18 @@ impl Store {
             .await?;
         }
         let inserted_i64 = i64::try_from(inserted).context("history page insert count overflow")?;
+        // Only this page's blocks: an old conflict elsewhere in the scope is
+        // already recorded and must not fail every later page.
+        let page_hashes = events
+            .iter()
+            .filter_map(|event| event.observed_at_block.as_ref().map(|b| b.hash.clone()))
+            .collect::<Vec<_>>();
         let conflict: bool = transaction.query_one(
             "SELECT EXISTS(SELECT 1 FROM event_conflict c JOIN event e ON e.id=c.first_event_id
                 WHERE e.dataset_id=$1::text::uuid AND e.event_contract_version=$2 AND e.source=$3
-                  AND e.kind=$4
+                  AND e.kind=$4 AND e.block_hash=ANY($7)
                   AND e.sidechain IS NOT DISTINCT FROM $5 AND e.sidechain_instance_id IS NOT DISTINCT FROM $6)",
-            &[&self.dataset_id,&self.event_contract_version,&self.source,&history_kind(page.stream)?,&sidechain,&page.sidechain_instance_id],
+            &[&self.dataset_id,&self.event_contract_version,&self.source,&history_kind(page.stream)?,&sidechain,&page.sidechain_instance_id,&page_hashes],
         ).await?.get(0);
         let complete = page.next.is_none() && !conflict;
         if conflict {
@@ -1617,7 +1623,7 @@ impl Store {
                         covered_tip_hash = CASE WHEN $9 THEN target_tip_hash ELSE covered_tip_hash END,
                         covered_tip_height = CASE WHEN $9 THEN target_tip_height ELSE covered_tip_height END,
                         rows_recorded = rows_recorded + $10,
-                        last_error = CASE WHEN $13 THEN 'conflicting immutable block facts' ELSE NULL END,
+                        last_error = CASE WHEN $13 THEN $14 ELSE NULL END,
                         updated_at = now(),
                         completed_at = CASE WHEN $9 THEN now() ELSE NULL END
                   WHERE dataset_id = $1::text::uuid AND source = $2 AND stream = $3
@@ -1640,6 +1646,7 @@ impl Store {
                     &page.sidechain_instance_id,
                     &self.event_contract_version,
                     &conflict,
+                    &HISTORY_CONFLICT,
                 ],
             )
             .await
@@ -1655,7 +1662,7 @@ impl Store {
             .await
             .context("committing a historical page transaction")?;
         if conflict {
-            bail!("conflicting immutable block facts retained; history certification suspended");
+            return Err(HistoryConflict.into());
         }
         tracing::info!(
             writer_wait_ms,
@@ -1982,6 +1989,23 @@ fn block_from_parts(
         _ => bail!("record contains an incomplete {name}"),
     }
 }
+
+/// `last_error` of a history scope suspended by conflicting immutable facts.
+pub const HISTORY_CONFLICT: &str = "conflicting immutable block facts";
+
+/// A history page retained conflicting immutable block facts. The scope is
+/// suspended (status `error`, [`HISTORY_CONFLICT`]) until an operator resolves
+/// it; retrying the same cursor can only find the same conflict again.
+#[derive(Debug)]
+pub struct HistoryConflict;
+
+impl std::fmt::Display for HistoryConflict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("conflicting immutable block facts retained; history certification suspended")
+    }
+}
+
+impl std::error::Error for HistoryConflict {}
 
 /// Attempts after which an incomplete fee enrichment is abandoned.
 const FEE_JOB_MAX_ATTEMPTS: i32 = 10;

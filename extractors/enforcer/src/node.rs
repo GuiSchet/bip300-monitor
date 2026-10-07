@@ -349,6 +349,15 @@ async fn monitor(args: Args, mut shutdown: watch::Receiver<bool>) -> Result<()> 
                         .await?
                 }
                 // A deferred page failure leaves history incomplete: not healthy.
+                Ok(backfill::Outcome::Quarantined { .. }) => {
+                    recorder
+                        .record_worker_failure(
+                            ExtractorWorker::NodeHistory,
+                            shared::store::HISTORY_CONFLICT,
+                            1,
+                        )
+                        .await?;
+                }
                 Ok(backfill::Outcome::Deferred { target, .. }) => {
                     recorder
                         .record_worker_failure(

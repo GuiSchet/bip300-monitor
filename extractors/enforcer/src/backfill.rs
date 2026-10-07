@@ -54,6 +54,11 @@ pub(crate) enum Outcome {
         blocks: usize,
         pages: usize,
     },
+    /// Conflicting immutable facts suspended this scope. Retrying finds the
+    /// same conflict, so the scope waits for an operator instead of failing.
+    Quarantined {
+        target: ObservedBlock,
+    },
 }
 
 pub(crate) struct HistoryScope<'a> {
@@ -181,6 +186,11 @@ pub(crate) async fn run_history<S: HistoryStream>(
             target: tip.clone(),
             blocks: 0,
             pages: 0,
+        });
+    }
+    if is_quarantined(recorder, &scope).await? {
+        return Ok(Outcome::Quarantined {
+            target: tip.clone(),
         });
     }
     let Some(mut progress) = prepare_cycle(recorder, &scope, tip, settings.page_blocks).await?
@@ -526,6 +536,17 @@ pub(crate) async fn run_history<S: HistoryStream>(
             .await
         {
             Ok(inserted) => inserted,
+            // Committed as suspended; not a failure to settle or retry.
+            Err(error) if error.is::<shared::store::HistoryConflict>() => {
+                tracing::error!(
+                    stream = scope.stream,
+                    sidechain = ?scope.sidechain,
+                    "conflicting immutable block facts; history scope quarantined"
+                );
+                return Ok(Outcome::Quarantined {
+                    target: progress.target_tip.clone(),
+                });
+            }
             Err(error) => {
                 return settle_failure(
                     recorder,
@@ -589,6 +610,18 @@ pub(crate) async fn run_history<S: HistoryStream>(
             }
         }
     }
+}
+
+async fn is_quarantined(recorder: &Recorder, scope: &HistoryScope<'_>) -> Result<bool> {
+    let coverage = recorder
+        .store()
+        .history_coverage(scope.stream, scope.sidechain, scope.sidechain_instance_id)
+        .await
+        .with_context(|| format!("reading {} history coverage", scope.stream))?;
+    Ok(coverage.is_some_and(|c| {
+        c.status == HistoryStatus::Error
+            && c.last_error.as_deref() == Some(shared::store::HISTORY_CONFLICT)
+    }))
 }
 
 async fn prepare_cycle(

@@ -501,6 +501,14 @@ async fn backfill_sidechains(
                     activations.remove(&sidechain);
                     break;
                 }
+                backfill::Outcome::Quarantined { .. } => {
+                    tracing::error!(
+                        sidechain,
+                        "block history is quarantined by conflicting immutable facts; \
+                         live capture continues"
+                    );
+                    break;
+                }
                 backfill::Outcome::Deferred {
                     target: deferred_target,
                     ..

@@ -1668,7 +1668,8 @@ async fn conflicting_block_payloads_survive_a_failed_history_certification() {
         )
         .await
         .unwrap_err();
-    assert!(error.to_string().contains("conflicting immutable"));
+    // A typed error: the backfill quarantines the scope instead of crashing.
+    assert!(error.is::<shared::store::HistoryConflict>());
     let client = query_client("durable_conflict").await;
     assert_eq!(
         client
@@ -1695,9 +1696,54 @@ async fn conflicting_block_payloads_survive_a_failed_history_certification() {
             .await
             .unwrap()
             .unwrap()
-            .status,
-        HistoryStatus::Error
+            .last_error
+            .as_deref(),
+        Some(shared::store::HISTORY_CONFLICT)
     );
+}
+
+#[tokio::test]
+async fn an_old_conflict_does_not_fail_pages_of_other_blocks() {
+    let store = store_for("conflict_scope", "enforcer").await;
+    let id = instance_id(9);
+    // Two different live payloads for block 103 are a retained conflict.
+    let first = block_event(103, 103, 102);
+    let mut conflicting = first.clone();
+    if let Some(MonitorEvent::Enforcer(payload)) = &mut conflicting.monitor_event
+        && let Some(events::enforcer_event::Event::BlockConnected(block)) = &mut payload.event
+    {
+        block.header.as_mut().unwrap().timestamp += 1;
+    }
+    store.record(&[first, conflicting]).await.unwrap();
+    let target = ObservedBlock::at_height(vec![105; 32], 105);
+    store
+        .begin_history_cycle(
+            "block",
+            Some(9),
+            Some(&id),
+            104,
+            None,
+            &target,
+            None,
+            Some(103),
+            128,
+        )
+        .await
+        .unwrap();
+    // Pages above it are judged on their own blocks.
+    store
+        .record_history_page(
+            &[block_event(105, 105, 104)],
+            HistoryPage {
+                stream: "block",
+                sidechain: Some(9),
+                sidechain_instance_id: Some(&id),
+                expected_next: &target,
+                next: Some(&ObservedBlock::at_height(vec![104; 32], 104)),
+            },
+        )
+        .await
+        .expect("an unrelated older conflict must not suspend this page");
 }
 
 #[tokio::test]
