@@ -2204,3 +2204,72 @@ async fn certification_scales_linearly_with_history_length() {
         "certifying 4x more history took {large:?} vs {small:?}"
     );
 }
+
+fn numbered_enforcer_block(height: u32) -> Event {
+    let mut payload = connected(9, height, 0);
+    if let events::enforcer_event::Event::BlockConnected(block) = &mut payload {
+        let header = block.header.as_mut().unwrap();
+        header.hash = numbered_hash(height);
+        header.previous_hash = numbered_hash(height - 1);
+    }
+    envelope(
+        payload,
+        Some(ObservedBlock::at_height(numbered_hash(height), height)),
+        1_700_000_000_000 + u64::from(height),
+    )
+}
+
+/// A consumer paging by `id > cursor` must never skip a row that commits
+/// later than a higher id: the enforcer and node connections commit in id order.
+#[tokio::test]
+async fn concurrent_sources_commit_in_identity_order() {
+    let test = "commit_order";
+    let enforcer = store_for(test, "enforcer").await;
+    let node = store_in(test, "node").await;
+    let reader = query_client(test).await;
+    let writes = 150_u32;
+    let enforcer_task = tokio::spawn(async move {
+        for height in 1..=writes {
+            enforcer
+                .record(&[numbered_enforcer_block(height)])
+                .await
+                .unwrap();
+        }
+    });
+    let node_task = tokio::spawn(async move {
+        for height in 1..=writes {
+            node.record(&[numbered_node_block(height)]).await.unwrap();
+        }
+    });
+    let mut cursor = 0_i64;
+    let mut seen = std::collections::BTreeSet::new();
+    loop {
+        let finished = enforcer_task.is_finished() && node_task.is_finished();
+        for row in reader
+            .query("SELECT id FROM event WHERE id > $1 ORDER BY id", &[&cursor])
+            .await
+            .unwrap()
+        {
+            let id: i64 = row.get(0);
+            seen.insert(id);
+            cursor = cursor.max(id);
+        }
+        if finished {
+            break;
+        }
+    }
+    enforcer_task.await.unwrap();
+    node_task.await.unwrap();
+    let all = reader
+        .query("SELECT id FROM event ORDER BY id", &[])
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row| row.get::<_, i64>(0))
+        .collect::<std::collections::BTreeSet<_>>();
+    let skipped = all.difference(&seen).collect::<Vec<_>>();
+    assert!(
+        skipped.is_empty(),
+        "rows committed behind the cursor: {skipped:?}"
+    );
+}

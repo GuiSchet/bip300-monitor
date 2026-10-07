@@ -50,6 +50,29 @@ const MIGRATIONS: &[&str] = &[
 /// is not idempotent, so the loser would fail its startup for no real reason.
 const MIGRATION_LOCK_KEY: i64 = 0x6231_3330_305f_6d6f;
 
+/// Advisory-lock key taken first by every transaction that writes the record.
+///
+/// The enforcer and node workers write through separate connections. Identity
+/// ids are allocated when a row is inserted, not when it commits, so two
+/// concurrent writers could commit id N+1 before id N, and a consumer paging
+/// by `id > cursor` would skip N forever. Holding this lock from before the
+/// first insert until commit makes commit order equal id order.
+const WRITE_ORDER_LOCK_KEY: i64 = 0x6231_3330_305f_7772;
+
+/// Open a record write that commits in identity-id order (see
+/// [`WRITE_ORDER_LOCK_KEY`]).
+async fn write_tx(client: &mut Client) -> Result<tokio_postgres::Transaction<'_>> {
+    let transaction = client
+        .transaction()
+        .await
+        .context("opening a record write")?;
+    transaction
+        .execute("SELECT pg_advisory_xact_lock($1)", &[&WRITE_ORDER_LOCK_KEY])
+        .await
+        .context("ordering the record write")?;
+    Ok(transaction)
+}
+
 /// Reusable command-line arguments for the Postgres record.
 #[derive(ClapArgs, Clone)]
 pub struct PostgresArgs {
@@ -550,10 +573,7 @@ impl Store {
         let event_contract_version = i32::try_from(manifest.event_contract_version)
             .context("event contract version does not fit in an i32")?;
         let mut client = self.client.lock().await;
-        let transaction = client
-            .transaction()
-            .await
-            .context("opening the extractor identity transaction")?;
+        let transaction = write_tx(&mut client).await?;
         let dataset_id: String = transaction
             .query_one(
                 "INSERT INTO dataset_manifest
@@ -785,10 +805,7 @@ impl Store {
         let mut client = self.client.lock().await;
         let writer_wait_ms = queued_at.elapsed().as_millis() as u64;
         let transaction_started = std::time::Instant::now();
-        let transaction = client
-            .transaction()
-            .await
-            .context("opening a record transaction")?;
+        let transaction = write_tx(&mut client).await?;
         if let Some(instance) = instance {
             validate_sidechain_instance(
                 &transaction,
@@ -880,10 +897,7 @@ impl Store {
         }
 
         let mut client = self.client.lock().await;
-        let transaction = client
-            .transaction()
-            .await
-            .context("opening a snapshot record transaction")?;
+        let transaction = write_tx(&mut client).await?;
         let snapshot_group_id: String = transaction
             .query_one(
                 "INSERT INTO snapshot_group
@@ -961,10 +975,7 @@ impl Store {
         require_hash(&tip.hash, "observed tip")?;
         let (previous_hash, previous_height) = optional_block_parts(previous)?;
         let mut client = self.client.lock().await;
-        let transaction = client
-            .transaction()
-            .await
-            .context("opening a tip observation transaction")?;
+        let transaction = write_tx(&mut client).await?;
         let capture_seq = reserve_capture_sequences(&transaction, &self.run_id, 1).await?;
         transaction
             .execute(
@@ -1005,10 +1016,7 @@ impl Store {
     /// Create the durable rows for independently supervised workers.
     pub async fn initialize_worker_statuses(&self, workers: &[ExtractorWorker]) -> Result<()> {
         let mut client = self.client.lock().await;
-        let transaction = client
-            .transaction()
-            .await
-            .context("opening the worker-status initialization transaction")?;
+        let transaction = write_tx(&mut client).await?;
         for worker in workers {
             transaction
                 .execute(
@@ -1043,10 +1051,7 @@ impl Store {
         let threshold = i32::try_from(degraded_after)
             .context("worker degradation threshold does not fit in an i32")?;
         let mut client = self.client.lock().await;
-        let transaction = client
-            .transaction()
-            .await
-            .context("opening the worker failure transaction")?;
+        let transaction = write_tx(&mut client).await?;
         let row = transaction
             .query_opt(
                 "UPDATE extractor_worker_status
@@ -1085,10 +1090,7 @@ impl Store {
     /// Mark one worker healthy without touching any other worker's error.
     pub async fn record_worker_success(&self, worker: ExtractorWorker) -> Result<()> {
         let mut client = self.client.lock().await;
-        let transaction = client
-            .transaction()
-            .await
-            .context("opening the worker success transaction")?;
+        let transaction = write_tx(&mut client).await?;
         let updated = transaction
             .execute(
                 "UPDATE extractor_worker_status
@@ -1119,10 +1121,7 @@ impl Store {
             bail!("invalid terminal extractor run status `{status}`");
         }
         let mut client = self.client.lock().await;
-        let transaction = client
-            .transaction()
-            .await
-            .context("opening the extractor finish transaction")?;
+        let transaction = write_tx(&mut client).await?;
         transaction
             .execute(
                 "UPDATE extractor_run
@@ -1320,7 +1319,7 @@ impl Store {
             }
         }
         let mut client = self.client.lock().await;
-        let tx = client.transaction().await?;
+        let tx = write_tx(&mut client).await?;
         let row=tx.query_opt("SELECT envelope FROM event WHERE id=$1 AND dataset_id=$2::text::uuid
             AND event_contract_version=$3 AND source='node' AND kind='mainchain_block' AND block_hash=$4",
             &[&source_id,&self.dataset_id,&self.event_contract_version,&header.hash]).await?.context("missing node source block")?;
@@ -1421,8 +1420,9 @@ impl Store {
     ) -> Result<()> {
         let sidechain = sidechain.map(i16::from);
         let height = floor_height.map(height_to_i32).transpose()?;
-        let client = self.client.lock().await;
-        let rows = client.execute(
+        let mut client = self.client.lock().await;
+        let tx = write_tx(&mut client).await?;
+        let rows = tx.execute(
             "UPDATE history_coverage SET floor_hash=$8,floor_height=$9,updated_at=now()
               WHERE dataset_id=$1::text::uuid AND event_contract_version=$2 AND source=$3
                 AND stream=$4 AND sidechain IS NOT DISTINCT FROM $5
@@ -1432,6 +1432,7 @@ impl Store {
         if rows != 1 {
             bail!("history cursor changed while setting the certified floor");
         }
+        tx.commit().await?;
         Ok(())
     }
 
@@ -1459,8 +1460,9 @@ impl Store {
         let floor_height = floor_height.map(height_to_i32).transpose()?;
         let page_blocks = height_to_i32(effective_page_blocks)?;
 
-        let client = self.client.lock().await;
-        let row = client
+        let mut client = self.client.lock().await;
+        let tx = write_tx(&mut client).await?;
+        let row = tx
             .query_one(
                 "INSERT INTO history_coverage
                     (dataset_id, event_contract_version, source, stream, sidechain,
@@ -1516,6 +1518,7 @@ impl Store {
             .await
             .with_context(|| format!("starting a {stream} history cycle"))?;
 
+        tx.commit().await?;
         history_coverage_from_row(row)
     }
 
@@ -1542,10 +1545,7 @@ impl Store {
         let mut client = self.client.lock().await;
         let writer_wait_ms = queued_at.elapsed().as_millis() as u64;
         let transaction_started = std::time::Instant::now();
-        let transaction = client
-            .transaction()
-            .await
-            .context("opening a historical page transaction")?;
+        let transaction = write_tx(&mut client).await?;
         if let (Some(sidechain), Some(instance_id)) = (page.sidechain, page.sidechain_instance_id) {
             validate_sidechain_instance(&transaction, &self.dataset_id, sidechain, instance_id)
                 .await?;
@@ -1656,8 +1656,9 @@ impl Store {
         validate_history_scope(sidechain, sidechain_instance_id)?;
         let sidechain = sidechain.map(i16::from);
         let page_blocks = height_to_i32(effective_page_blocks)?;
-        let client = self.client.lock().await;
-        let updated = client
+        let mut client = self.client.lock().await;
+        let tx = write_tx(&mut client).await?;
+        let updated = tx
             .execute(
                 "UPDATE history_coverage
                     SET effective_page_blocks = $5, last_error = $6, updated_at = now()
@@ -1682,6 +1683,7 @@ impl Store {
         if updated != 1 {
             bail!("{stream} history was not running while resizing its pages");
         }
+        tx.commit().await?;
         Ok(())
     }
 
@@ -1694,8 +1696,9 @@ impl Store {
     ) -> Result<()> {
         validate_history_scope(sidechain, sidechain_instance_id)?;
         let sidechain = sidechain.map(i16::from);
-        let client = self.client.lock().await;
-        let updated = client
+        let mut client = self.client.lock().await;
+        let tx = write_tx(&mut client).await?;
+        let updated = tx
             .execute(
                 "UPDATE history_coverage
                     SET status = 'running', last_error = NULL, updated_at = now()
@@ -1718,6 +1721,7 @@ impl Store {
         if updated != 1 {
             bail!("{stream} history had no resumable cursor");
         }
+        tx.commit().await?;
         Ok(())
     }
 
@@ -1734,8 +1738,9 @@ impl Store {
     ) -> Result<HistoryStatus> {
         validate_history_scope(sidechain, sidechain_instance_id)?;
         let sidechain = sidechain.map(i16::from);
-        let client = self.client.lock().await;
-        let row = client
+        let mut client = self.client.lock().await;
+        let tx = write_tx(&mut client).await?;
+        let row = tx
             .query_opt(
                 "WITH scope AS (
                      SELECT $4::smallint IS NULL OR EXISTS (
@@ -1789,6 +1794,7 @@ impl Store {
             .await
             .with_context(|| format!("settling a failed {stream} history cursor"))?
             .with_context(|| format!("{stream} history coverage does not exist"))?;
+        tx.commit().await?;
         HistoryStatus::parse(row.get(0))
     }
 
@@ -1802,28 +1808,29 @@ impl Store {
         reason: &str,
     ) -> Result<()> {
         let sidechain = i16::from(sidechain);
-        let client = self.client.lock().await;
-        client
-            .execute(
-                "UPDATE history_coverage
+        let mut client = self.client.lock().await;
+        let tx = write_tx(&mut client).await?;
+        tx.execute(
+            "UPDATE history_coverage
                     SET status = 'superseded', last_error = $5, updated_at = now()
                   WHERE dataset_id = $1::text::uuid
                     AND event_contract_version = $6
                     AND source = $2 AND stream = $3 AND sidechain = $4
                     AND sidechain_instance_id = $7
                     AND status IN ('running', 'error')",
-                &[
-                    &self.dataset_id,
-                    &self.source,
-                    &stream,
-                    &sidechain,
-                    &reason,
-                    &self.event_contract_version,
-                    &sidechain_instance_id,
-                ],
-            )
-            .await
-            .with_context(|| format!("superseding {stream} history for sidechain {sidechain}"))?;
+            &[
+                &self.dataset_id,
+                &self.source,
+                &stream,
+                &sidechain,
+                &reason,
+                &self.event_contract_version,
+                &sidechain_instance_id,
+            ],
+        )
+        .await
+        .with_context(|| format!("superseding {stream} history for sidechain {sidechain}"))?;
+        tx.commit().await?;
         Ok(())
     }
 
