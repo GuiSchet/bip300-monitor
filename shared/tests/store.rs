@@ -146,8 +146,6 @@ fn chain_tip(hash: u8, height: u32) -> events::enforcer_event::Event {
 
 fn bmm_requests(parent: u8, bid_sats: u64) -> events::enforcer_event::Event {
     events::enforcer_event::Event::BmmRequests(events::BmmRequestsSnapshot {
-        observer_session: "test-session".into(),
-        mempool_generation: 1,
         previous_mainchain_block_hash: vec![parent; 32],
         requests: vec![events::BmmRequest {
             sidechain_number: 9,
@@ -403,8 +401,10 @@ async fn v8_refuses_to_reuse_an_older_contract_dataset() {
         .await
         .expect("create the legacy test database");
 
+    // The previous contract also had a fresh-dataset boundary: v8 facts must
+    // not share a dataset with v9 facts either.
     let legacy_manifest = DatasetManifest {
-        event_contract_version: 5,
+        event_contract_version: 8,
         ..DatasetManifest::default()
     };
     let legacy = Store::connect_with_manifest(
@@ -424,13 +424,13 @@ async fn v8_refuses_to_reuse_an_older_contract_dataset() {
         .expect("seed legacy sidechain identities");
 
     let error = match Store::connect(&args_for(&admin_url, &database), "enforcer").await {
-        Ok(_) => panic!("v8 must require a fresh dataset after legacy identities exist"),
+        Ok(_) => panic!("v9 must require a fresh dataset after legacy identities exist"),
         Err(error) => error,
     };
     assert!(
         error
             .to_string()
-            .contains("event contract v8 requires a fresh v8 dataset"),
+            .contains("event contract v9 requires a fresh v9 dataset"),
         "unexpected error: {error:#}"
     );
 }
@@ -1317,27 +1317,41 @@ async fn a_new_event_contract_cannot_alias_an_older_normalized_fact() {
     let admin_url = std::env::var("BIP300_MONITOR_TEST_POSTGRES_URL").unwrap();
     let initial_version = events::EVENT_CONTRACT_VERSION;
     let upgraded_version = initial_version + 1;
+    // A newer converter never writes into an older contract's dataset.
     let manifest = DatasetManifest {
         event_contract_version: upgraded_version,
         ..DatasetManifest::default()
     };
-    let upgraded = Store::connect_with_manifest(
+    let error = match Store::connect_with_manifest(
         &args_for(&admin_url, &format!("bip300_test_{test}")),
         "enforcer",
         manifest,
     )
     .await
-    .expect("connect an upgraded converter run");
-    assert_eq!(
-        upgraded
-            .record(&[fact])
-            .await
-            .expect("record upgraded fact"),
-        1,
-        "a new normalized contract must get its own immutable fact"
+    {
+        Ok(_) => panic!("a newer contract must not reuse an older dataset"),
+        Err(error) => error,
+    };
+    assert!(
+        error
+            .to_string()
+            .contains(&format!("requires a fresh v{upgraded_version} dataset")),
+        "unexpected error: {error:#}"
     );
 
+    // The fact identity itself keeps versions apart as a second line of defence.
     let client = query_client(test).await;
+    client
+        .execute(
+            "INSERT INTO event(dataset_id,event_contract_version,source,kind,sidechain,sidechain_instance_id,
+                block_hash,height,observed_at,envelope,envelope_sha256,payload,fact_sha256)
+             SELECT dataset_id,event_contract_version+1,source,kind,sidechain,sidechain_instance_id,
+                block_hash,height,observed_at,envelope,envelope_sha256,payload,fact_sha256
+               FROM event WHERE kind='chain_info' AND block_hash=$1",
+            &[&anchor.hash],
+        )
+        .await
+        .expect("an identical fact under another contract is a separate identity");
     let versions = client
         .query(
             "SELECT event_contract_version
@@ -1358,22 +1372,6 @@ async fn a_new_event_contract_cannot_alias_an_older_normalized_fact() {
             i32::try_from(upgraded_version).unwrap()
         ]
     );
-
-    let dataset_version: i32 = client
-        .query_one(
-            "SELECT initial_event_contract_version
-               FROM dataset_manifest
-              WHERE dataset_id = (
-                    SELECT dataset_id FROM event
-                     WHERE kind = 'chain_info' AND block_hash = $1
-                     LIMIT 1
-              )",
-            &[&anchor.hash],
-        )
-        .await
-        .expect("query immutable dataset metadata")
-        .get(0);
-    assert_eq!(dataset_version, i32::try_from(initial_version).unwrap());
 }
 
 #[tokio::test]
@@ -1737,62 +1735,116 @@ async fn an_orphan_at_the_missing_height_does_not_certify_the_target_chain() {
     );
 }
 
+/// A second recorder for another source of the same dataset.
+async fn store_in(test: &str, source: &'static str) -> Store {
+    let admin_url = std::env::var("BIP300_MONITOR_TEST_POSTGRES_URL")
+        .expect("BIP300_MONITOR_TEST_POSTGRES_URL must point at a test Postgres");
+    Store::connect(
+        &args_for(&admin_url, &format!("bip300_test_{test}")),
+        source,
+    )
+    .await
+    .expect("connect another source to the test record")
+}
+
+/// A node block whose raw bytes hold a real transaction, so fees can name it.
+fn node_block_with_transaction(height: u32, hash: u8, parent: u8) -> (Event, Vec<u8>) {
+    let block = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+    let txid = hex::decode(block.txdata[0].compute_txid().to_string()).unwrap();
+    let mut event = node_block_event(height, hash, parent);
+    if let Some(MonitorEvent::Node(node)) = &mut event.monitor_event
+        && let Some(shared::protobuf::event::node_event::Event::MainchainBlock(raw)) =
+            &mut node.event
+    {
+        raw.raw_block = bitcoin::consensus::serialize(&block);
+    }
+    (event, txid)
+}
+
 #[tokio::test]
 async fn confirmed_fees_resume_and_never_rewrite_the_block() {
-    let store = store_for("confirmed_fees", "enforcer").await;
-    let header = match chain_tip(4, 4) {
-        events::enforcer_event::Event::ChainTip(tip) => tip.header.unwrap(),
+    let test = "confirmed_fees";
+    let enforcer = store_for(test, "enforcer").await;
+    let node = store_in(test, "node").await;
+    let (block, txid) = node_block_with_transaction(4, 4, 3);
+    let header = match &block.monitor_event {
+        Some(MonitorEvent::Node(n)) => match &n.event {
+            Some(shared::protobuf::event::node_event::Event::MainchainBlock(b)) => {
+                b.header.clone().unwrap()
+            }
+            _ => unreachable!(),
+        },
         _ => unreachable!(),
     };
+    // The official API showed the bid at the parent and committed it in the block.
+    let mut bid = bmm_requests(3, 9);
+    if let events::enforcer_event::Event::BmmRequests(snapshot) = &mut bid
+        && let Some(request) = snapshot.requests.first_mut()
+    {
+        request.txid = txid.clone();
+    }
+    let mut committed = block_event(4, 4, 3);
+    if let Some(MonitorEvent::Enforcer(payload)) = &mut committed.monitor_event
+        && let Some(events::enforcer_event::Event::BlockConnected(b)) = &mut payload.event
+    {
+        b.bmm_commitment = Some(vec![0x33; 32]);
+    }
+    enforcer
+        .record(&[
+            envelope(
+                bid,
+                Some(ObservedBlock::at_height(vec![3; 32], 3)),
+                1_700_000_000_003,
+            ),
+            committed,
+        ])
+        .await
+        .unwrap();
+    node.record(std::slice::from_ref(&block)).await.unwrap();
     let anchor = ObservedBlock::at_height(header.hash.clone(), header.height);
-    let delta = envelope(
-        events::enforcer_event::Event::Bip300BlockDelta(events::Bip300BlockDelta {
-            header: Some(header.clone()),
-            confirmed_bmm_requests: vec![events::ConfirmedBmmRequest {
-                sidechain_number: 9,
-                txid: vec![7; 32],
-                ..Default::default()
-            }],
-            ..Default::default()
-        }),
-        Some(anchor.clone()),
-        1_700_000_000_004,
-    );
-    store.record(&[delta]).await.unwrap();
-    let (source, block) = store.next_fee_block().await.unwrap().unwrap();
-    assert_eq!(block, anchor);
-    let make_fee = |txid, fee_sats| {
-        envelope(
-            events::enforcer_event::Event::ConfirmedBmmFees(events::ConfirmedBmmFees {
-                header: Some(header.clone()),
-                source: "ecash-node:getblock:3".into(),
-                fees: vec![events::ConfirmedBmmFee {
-                    sidechain_number: 9,
-                    txid: vec![txid; 32],
-                    fee_sats,
-                    unavailable_reason: if fee_sats.is_some() {
-                        String::new()
-                    } else {
-                        "historical_prevouts_unavailable".into()
+    let (source, next) = node.next_fee_block().await.unwrap().unwrap();
+    assert_eq!(next, anchor);
+    let make_fee = |txid: Vec<u8>, fee_sats| Event {
+        timestamp: 1_700_000_000_005,
+        observed_at_block: Some(anchor.clone()),
+        monitor_event: Some(MonitorEvent::Node(shared::protobuf::event::NodeEvent {
+            event: Some(
+                shared::protobuf::event::node_event::Event::ConfirmedBmmFees(
+                    events::ConfirmedBmmFees {
+                        header: Some(header.clone()),
+                        source: "ecash-node:getblock:3".into(),
+                        fees: vec![events::ConfirmedBmmFee {
+                            sidechain_number: 9,
+                            txid,
+                            fee_sats,
+                            unavailable_reason: if fee_sats.is_some() {
+                                String::new()
+                            } else {
+                                "historical_prevouts_unavailable".into()
+                            },
+                        }],
                     },
-                }],
-            }),
-            Some(anchor.clone()),
-            1_700_000_000_005,
-        )
+                ),
+            ),
+        })),
     };
+    // A bid the official API never showed is not evidence.
     assert!(
-        store
-            .record_fee_enrichment(source, &make_fee(8, Some(42)))
+        node.record_fee_enrichment(source, &make_fee(vec![8; 32], Some(42)))
             .await
             .is_err()
     );
-    store
-        .record_fee_enrichment(source, &make_fee(7, None))
+    // Enforcer payloads are not fee enrichments.
+    assert!(
+        node.record_fee_enrichment(source, &envelope(chain_info(), None, 1))
+            .await
+            .is_err()
+    );
+    node.record_fee_enrichment(source, &make_fee(txid.clone(), None))
         .await
         .unwrap();
-    assert!(store.next_fee_block().await.unwrap().is_none());
-    let client = query_client("confirmed_fees").await;
+    assert!(node.next_fee_block().await.unwrap().is_none());
+    let client = query_client(test).await;
     client
         .execute(
             "UPDATE bmm_fee_job SET next_retry_at=now()-interval '1 second'",
@@ -1800,15 +1852,15 @@ async fn confirmed_fees_resume_and_never_rewrite_the_block() {
         )
         .await
         .unwrap();
-    assert_eq!(store.next_fee_block().await.unwrap().unwrap().0, source);
-    store
-        .record_fee_enrichment(source, &make_fee(7, Some(u64::MAX)))
+    assert_eq!(node.next_fee_block().await.unwrap().unwrap().0, source);
+    node.record_fee_enrichment(source, &make_fee(txid, Some(u64::MAX)))
         .await
         .unwrap();
-    assert!(store.next_fee_block().await.unwrap().is_none());
-    let counts = client.query_one("SELECT count(*) FILTER(WHERE kind='bip300_block_delta'),count(*) FILTER(WHERE kind='confirmed_bmm_fees') FROM event",&[]).await.unwrap();
+    let counts = client.query_one("SELECT count(*) FILTER(WHERE kind='mainchain_block'),count(*) FILTER(WHERE kind='confirmed_bmm_fees') FROM event",&[]).await.unwrap();
     assert_eq!(counts.get::<_, i64>(0), 1);
     assert_eq!(counts.get::<_, i64>(1), 2);
+    // Only node recorders serve fee jobs.
+    assert!(enforcer.next_fee_block().await.is_err());
 }
 
 #[tokio::test]

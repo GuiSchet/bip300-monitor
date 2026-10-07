@@ -6,8 +6,8 @@ import "enforcer_extractor.proto";
 
 // The mainchain block an observation is anchored to.
 //
-// For a block event this is the block it describes. Contract 8 state snapshots
-// are unanchored; their tip reads belong to snapshot_group's observation window.
+// For a block event this is the block it describes. State snapshots (since
+// contract 8) are unanchored; their tip reads belong to snapshot_group's observation window.
 // BMM requests retain their explicit previous-mainchain-block parent anchor.
 message ObservedBlock {
   // 32-byte block hash in conventional display order.

@@ -278,8 +278,8 @@ grep -Fq 'current_sidechain_instance i' \
     die "slot-history verification is not scoped to the active instance"
 grep -Fq 'record_has_global_block mainchain_block' \
     "${DEPLOYMENT_ROOT}/scripts/verify-live.sh" ||
-    die "verify-live.sh does not assert the live global BIP300 delta"
-for valid_kind in chain_tip bip300_block_delta; do
+    die "verify-live.sh does not assert the live global mainchain block"
+for valid_kind in chain_tip mainchain_transition; do
     valid_event_kind "${valid_kind}" ||
         die "event kind validation rejected ${valid_kind}"
 done

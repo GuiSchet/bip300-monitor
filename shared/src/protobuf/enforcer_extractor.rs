@@ -3,17 +3,17 @@
 include!(concat!(env!("OUT_DIR"), "/enforcer_extractor.rs"));
 
 /// Version of the normalized enforcer event contract stored with every fact.
-pub const EVENT_CONTRACT_VERSION: u32 = 8;
+pub const EVENT_CONTRACT_VERSION: u32 = 9;
 
 // These fingerprints deliberately live beside the version. Any edit to either
 // protobuf contract makes the test below fail until the compatibility review
 // records a new version/fingerprint pair here.
 #[cfg(test)]
-const EVENT_CONTRACT_V8_ENVELOPE_SHA256: &str =
-    "ab2367b39710427523c903ddfe8daeae226c7754b5584ae028afaa1e9bdea3f8";
+const EVENT_CONTRACT_V9_ENVELOPE_SHA256: &str =
+    "71c39ffdf74e64b2729adf50cf4bf06440de75bdb75543f9eb27cd4a5c2eaf14";
 #[cfg(test)]
-const EVENT_CONTRACT_V8_PAYLOAD_SHA256: &str =
-    "d40381cfb92ca43d7988bdd676c4c1a8be4555f93ab19ac4e2bef7e0ee7b7ca0";
+const EVENT_CONTRACT_V9_PAYLOAD_SHA256: &str =
+    "9d52c84437a3f9434b3c260afa4d9a0c1dc21c2e2ea919cca91efc7b36456589";
 
 impl enforcer_event::Event {
     /// Stable name of this event variant.
@@ -30,10 +30,8 @@ impl enforcer_event::Event {
             Self::BlockConnected(_) => "block_connected",
             Self::BlockDisconnected(_) => "block_disconnected",
             Self::WithdrawalBundleProposals(_) => "withdrawal_bundle_proposals",
-            Self::Bip300BlockDelta(_) => "bip300_block_delta",
             Self::BmmRequests(_) => "bmm_requests",
             Self::MainchainTransition(_) => "mainchain_transition",
-            Self::ConfirmedBmmFees(_) => "confirmed_bmm_fees",
         }
     }
 
@@ -42,10 +40,8 @@ impl enforcer_event::Event {
         match self {
             Self::ChainInfo(_)
             | Self::ChainTip(_)
-            | Self::Bip300BlockDelta(_)
             | Self::BmmRequests(_)
-            | Self::MainchainTransition(_)
-            | Self::ConfirmedBmmFees(_) => None,
+            | Self::MainchainTransition(_) => None,
             Self::SidechainProposals(_) | Self::ActiveSidechains(_) => None,
             Self::Ctip(snapshot) => Some(snapshot.sidechain_number),
             Self::BlockConnected(block) => Some(block.sidechain_number),
@@ -63,17 +59,17 @@ mod kind_tests {
 
     #[test]
     fn contract_version_matches_the_reviewed_proto_fingerprints() {
-        assert_eq!(super::EVENT_CONTRACT_VERSION, 8);
+        assert_eq!(super::EVENT_CONTRACT_VERSION, 9);
         assert_eq!(
             hex::encode(Sha256::digest(include_bytes!("../../../proto/event.proto"))),
-            super::EVENT_CONTRACT_V8_ENVELOPE_SHA256,
+            super::EVENT_CONTRACT_V9_ENVELOPE_SHA256,
             "event.proto changed: review compatibility and bump EVENT_CONTRACT_VERSION"
         );
         assert_eq!(
             hex::encode(Sha256::digest(include_bytes!(
                 "../../../proto/enforcer_extractor.proto"
             ))),
-            super::EVENT_CONTRACT_V8_PAYLOAD_SHA256,
+            super::EVENT_CONTRACT_V9_PAYLOAD_SHA256,
             "enforcer_extractor.proto changed: review compatibility and bump EVENT_CONTRACT_VERSION"
         );
     }
@@ -96,8 +92,9 @@ mod kind_tests {
                 super::WithdrawalBundleProposalsSnapshot::default(),
             )
             .kind(),
-            enforcer_event::Event::Bip300BlockDelta(super::Bip300BlockDelta::default()).kind(),
             enforcer_event::Event::BmmRequests(super::BmmRequestsSnapshot::default()).kind(),
+            enforcer_event::Event::MainchainTransition(super::MainchainTransition::default())
+                .kind(),
         ];
 
         let unique = kinds.iter().collect::<std::collections::BTreeSet<_>>();

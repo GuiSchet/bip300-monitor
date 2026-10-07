@@ -109,10 +109,9 @@ fn global_event(
         events::EnforcerEvent {
             event: Some(events::enforcer_event::Event::MainchainTransition(
                 events::MainchainTransition {
-                    observer_session: String::new(),
-                    sequence: 0,
                     action,
                     header,
+                    gap_start: None,
                 },
             )),
         },
@@ -156,8 +155,7 @@ mod tests {
             panic!("global event expected")
         };
         assert_eq!(t.action, 1);
-        assert_eq!(t.sequence, 0);
-        assert!(t.observer_session.is_empty());
+        assert!(t.gap_start.is_none());
         let response = mainchain::SubscribeEventsResponse {
             event: Some(Event {
                 event: Some(event::Event::DisconnectBlock(event::DisconnectBlock {

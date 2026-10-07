@@ -80,23 +80,13 @@ fn summarize(payload: &events::enforcer_event::Event) -> Result<String> {
             if let Some(header) = &event.header {
                 validate_header(header)?;
             }
-            Ok(format!(
-                "session={} sequence={} action={}",
-                event.observer_session, event.sequence, event.action
-            ))
-        }
-        events::enforcer_event::Event::ConfirmedBmmFees(event) => {
-            validate_header(
-                event
-                    .header
-                    .as_ref()
-                    .context("fee enrichment missing header")?,
-            )?;
-            Ok(format!(
-                "confirmed_bmm_fees={} source={}",
-                event.fees.len(),
-                event.source
-            ))
+            if let Some(gap_start) = &event.gap_start {
+                validate_header(gap_start)?;
+            }
+            let gap = event.gap_start.as_ref().map_or_else(String::new, |start| {
+                format!(" gap_start_height={}", start.height)
+            });
+            Ok(format!("action={}{gap}", event.action))
         }
         events::enforcer_event::Event::ChainInfo(chain_info) => {
             let network = events::Network::try_from(chain_info.network)
@@ -123,21 +113,6 @@ fn summarize(payload: &events::enforcer_event::Event) -> Result<String> {
                 "height={} block_hash={}",
                 header.height,
                 hex::encode(&header.hash)
-            ))
-        }
-        events::enforcer_event::Event::Bip300BlockDelta(delta) => {
-            validate_bip300_delta(delta)?;
-            let header = delta
-                .header
-                .as_ref()
-                .context("BIP300 block delta is missing its block header")?;
-            Ok(format!(
-                "height={} block_hash={} coinbase_messages={} treasury_transitions={} m8={}",
-                header.height,
-                hex::encode(&header.hash),
-                delta.coinbase_messages.len(),
-                delta.treasury_transitions.len(),
-                delta.confirmed_bmm_requests.len()
             ))
         }
         events::enforcer_event::Event::BmmRequests(snapshot) => {
@@ -240,79 +215,6 @@ fn summarize(payload: &events::enforcer_event::Event) -> Result<String> {
     }
 }
 
-fn validate_bip300_delta(delta: &events::Bip300BlockDelta) -> Result<()> {
-    validate_header(
-        delta
-            .header
-            .as_ref()
-            .context("BIP300 block delta is missing its block header")?,
-    )?;
-    require_32_bytes(&delta.coinbase_txid, "bip300_block_delta.coinbase_txid")?;
-    for message in &delta.coinbase_messages {
-        if message.raw_script_pubkey.is_empty() {
-            bail!("BIP300 coinbase message has an empty raw scriptPubKey");
-        }
-        match message
-            .message
-            .as_ref()
-            .context("BIP300 coinbase message is missing its typed message")?
-        {
-            events::bip300_coinbase_message::Message::M1(m1) => {
-                require_32_bytes(&m1.description_hash, "bip300_m1.description_hash")?;
-                let calculated = shared::bip300::sidechain_description_hash(&m1.description)
-                    .context("calculating bip300_m1.description_hash")?;
-                if calculated != m1.description_hash {
-                    bail!("BIP300 M1 description hash does not match its description");
-                }
-            }
-            events::bip300_coinbase_message::Message::M2(m2) => {
-                require_32_bytes(&m2.description_hash, "bip300_m2.description_hash")?;
-            }
-            events::bip300_coinbase_message::Message::M3(m3) => {
-                require_32_bytes(&m3.m6id, "bip300_m3.m6id")?;
-            }
-            events::bip300_coinbase_message::Message::M4(m4) => {
-                for effect in &m4.effects {
-                    if let Some(m6id) = effect.upvoted_m6id.as_ref() {
-                        require_32_bytes(m6id, "bip300_m4.upvoted_m6id")?;
-                    }
-                    for m6id in &effect.downvoted_m6ids {
-                        require_32_bytes(m6id, "bip300_m4.downvoted_m6id")?;
-                    }
-                }
-            }
-            events::bip300_coinbase_message::Message::M7(m7) => {
-                require_32_bytes(&m7.hstar, "bip300_m7.hstar")?;
-            }
-        }
-    }
-    for transition in &delta.treasury_transitions {
-        for (name, ctip) in [
-            ("previous_ctip", transition.previous_ctip.as_ref()),
-            ("new_ctip", transition.new_ctip.as_ref()),
-        ] {
-            if let Some(ctip) = ctip {
-                require_32_bytes(&ctip.txid, &format!("treasury_transition.{name}.txid"))?;
-            }
-        }
-        if let Some(m6id) = transition.m6id.as_ref() {
-            require_32_bytes(m6id, "treasury_transition.m6id")?;
-        }
-    }
-    for request in &delta.confirmed_bmm_requests {
-        require_32_bytes(&request.txid, "confirmed_bmm_request.txid")?;
-        require_32_bytes(&request.hstar, "confirmed_bmm_request.hstar")?;
-        require_32_bytes(
-            &request.previous_mainchain_block_hash,
-            "confirmed_bmm_request.previous_mainchain_block_hash",
-        )?;
-        if request.transaction.is_empty() {
-            bail!("confirmed BMM request has an empty transaction");
-        }
-    }
-    Ok(())
-}
-
 fn validate_bmm_requests(snapshot: &events::BmmRequestsSnapshot) -> Result<()> {
     require_32_bytes(
         &snapshot.previous_mainchain_block_hash,
@@ -378,12 +280,9 @@ fn validate_declaration(declaration: Option<&events::SidechainDeclaration>) -> R
 }
 
 fn validate_bundle_proposals(proposals: &[events::WithdrawalBundleProposal]) -> Result<()> {
-    // `m6id` is consensus-encoded rather than a display-order hash, so its
-    // length is not asserted here; an empty one would still be meaningless.
+    // `m6id` is the display-order bundle txid since contract 9.
     for proposal in proposals {
-        if proposal.m6id.is_empty() {
-            bail!("withdrawal_bundle_proposal.m6id must not be empty");
-        }
+        require_32_bytes(&proposal.m6id, "withdrawal_bundle_proposal.m6id")?;
     }
     Ok(())
 }
@@ -477,16 +376,6 @@ mod tests {
                     header: Some(header(1)),
                 }),
                 "chain_tip",
-            ),
-            (
-                events::enforcer_event::Event::Bip300BlockDelta(events::Bip300BlockDelta {
-                    header: Some(header(2)),
-                    coinbase_txid: vec![0x33; 32],
-                    coinbase_messages: Vec::new(),
-                    treasury_transitions: Vec::new(),
-                    confirmed_bmm_requests: Vec::new(),
-                }),
-                "bip300_block_delta",
             ),
             (
                 events::enforcer_event::Event::SidechainProposals(
@@ -702,32 +591,6 @@ mod tests {
                 .expect_err("missing sidechain event")
                 .to_string()
                 .contains("concrete event")
-        );
-
-        let bad_m1 = envelope(events::enforcer_event::Event::Bip300BlockDelta(
-            events::Bip300BlockDelta {
-                header: Some(header(6)),
-                coinbase_txid: vec![0x06; 32],
-                coinbase_messages: vec![events::Bip300CoinbaseMessage {
-                    vout: 1,
-                    raw_script_pubkey: vec![0x51],
-                    accepted: true,
-                    message: Some(events::bip300_coinbase_message::Message::M1(
-                        events::M1Delta {
-                            sidechain_number: 9,
-                            description: vec![1, 0x42],
-                            description_hash: vec![0x07; 32],
-                        },
-                    )),
-                }],
-                ..Default::default()
-            },
-        ));
-        assert!(
-            render(&bad_m1, false)
-                .expect_err("mismatched M1 description hash")
-                .to_string()
-                .contains("does not match")
         );
     }
 }

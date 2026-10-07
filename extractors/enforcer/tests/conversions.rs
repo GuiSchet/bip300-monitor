@@ -10,6 +10,16 @@ fn reverse_hex(byte: u8) -> Option<common::ReverseHex> {
     })
 }
 
+/// 32 distinct bytes, so a byte-order mistake cannot go unnoticed.
+fn asymmetric(first: u8) -> Vec<u8> {
+    (0..32).map(|i| first.wrapping_add(i)).collect()
+}
+
+fn reversed(mut bytes: Vec<u8>) -> Vec<u8> {
+    bytes.reverse();
+    bytes
+}
+
 fn consensus_hex(bytes: &[u8]) -> Option<common::ConsensusHex> {
     Some(common::ConsensusHex {
         hex: Some(hex::encode(bytes)),
@@ -90,7 +100,7 @@ fn withdrawal(
     mainchain::block_info::Event {
         event: Some(mainchain::block_info::event::Event::WithdrawalBundle(
             mainchain::WithdrawalBundleEvent {
-                m6id: consensus_hex(&[m6id_byte; 32]),
+                m6id: consensus_hex(&asymmetric(m6id_byte)),
                 event: Some(mainchain::withdrawal_bundle_event::Event { event: Some(event) }),
             },
         )),
@@ -260,12 +270,12 @@ fn converts_pending_withdrawal_bundle_proposals() {
         mainchain::GetWithdrawalBundleProposalsResponse {
             proposals: vec![
                 mainchain::get_withdrawal_bundle_proposals_response::ResponseItem {
-                    m6id: consensus_hex(&[0x99; 32]),
+                    m6id: consensus_hex(&asymmetric(0x99)),
                     vote_count: Some(5),
                     proposal_height: Some(1_000),
                 },
                 mainchain::get_withdrawal_bundle_proposals_response::ResponseItem {
-                    m6id: consensus_hex(&[0xaa; 32]),
+                    m6id: consensus_hex(&asymmetric(0xaa)),
                     vote_count: Some(0),
                     proposal_height: Some(1_010),
                 },
@@ -282,13 +292,14 @@ fn converts_pending_withdrawal_bundle_proposals() {
     assert_eq!(
         snapshot.proposals,
         vec![
+            // Upstream consensus bytes become the display-order bundle txid.
             events::WithdrawalBundleProposal {
-                m6id: vec![0x99; 32],
+                m6id: reversed(asymmetric(0x99)),
                 vote_count: 5,
                 proposal_height: 1_000,
             },
             events::WithdrawalBundleProposal {
-                m6id: vec![0xaa; 32],
+                m6id: reversed(asymmetric(0xaa)),
                 vote_count: 0,
                 proposal_height: 1_010,
             },
@@ -358,12 +369,15 @@ fn converts_block_connections_backfill_and_disconnections() {
     assert_eq!(deposit.outpoint.as_ref().expect("outpoint").vout, 3);
 
     let expected_states = ["submitted", "failed", "succeeded"];
-    for (event, expected) in connected.events[1..].iter().zip(expected_states) {
+    for ((event, expected), m6id_byte) in
+        connected.events[1..].iter().zip(expected_states).zip(1u8..)
+    {
         let events::sidechain_event::Event::WithdrawalBundle(withdrawal) =
             event.event.as_ref().expect("withdrawal")
         else {
             panic!("expected withdrawal");
         };
+        assert_eq!(withdrawal.m6id, reversed(asymmetric(m6id_byte)));
         let actual = match withdrawal.state.as_ref().expect("withdrawal state") {
             events::withdrawal_bundle_event::State::Submitted(_) => "submitted",
             events::withdrawal_bundle_event::State::Failed(_) => "failed",

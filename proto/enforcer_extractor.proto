@@ -4,8 +4,10 @@ package enforcer_extractor;
 
 // A normalized event produced from the enforcer's read-only validator API.
 message EnforcerEvent {
-  reserved 9;
-  reserved "mainchain_block";
+  // 9 moved to the node envelope. 10 and 13 were fork-only (contract <= 8):
+  // the official enforcer exposes neither per-block BIP300 deltas nor fees.
+  reserved 9, 10, 13;
+  reserved "mainchain_block", "bip300_block_delta", "confirmed_bmm_fees";
 
   oneof event {
     ChainInfo chain_info = 1;
@@ -16,10 +18,8 @@ message EnforcerEvent {
     BlockConnected block_connected = 6;
     BlockDisconnected block_disconnected = 7;
     WithdrawalBundleProposalsSnapshot withdrawal_bundle_proposals = 8;
-    Bip300BlockDelta bip300_block_delta = 10;
     BmmRequestsSnapshot bmm_requests = 11;
     MainchainTransition mainchain_transition = 12;
-    ConfirmedBmmFees confirmed_bmm_fees = 13;
   }
 }
 
@@ -71,148 +71,13 @@ message ChainTip {
   BlockHeader header = 1;
 }
 
-// Lossless, observer-oriented BIP300/301 facts resolved by the enforcer for a
-// canonical mainchain block. This is global: one block can affect many slots.
-message Bip300BlockDelta {
-  BlockHeader header = 1;
-  // 32-byte coinbase transaction ID in conventional display order.
-  bytes coinbase_txid = 2;
-  repeated Bip300CoinbaseMessage coinbase_messages = 3;
-  repeated TreasuryTransition treasury_transitions = 4;
-  repeated ConfirmedBmmRequest confirmed_bmm_requests = 5;
-}
-
-message Bip300CoinbaseMessage {
-  uint32 vout = 1;
-  // Exact scriptPubKey bytes, including OP_RETURN and the push opcode.
-  bytes raw_script_pubkey = 2;
-  // True when the message produced the resolved effect represented here.
-  bool accepted = 3;
-
-  oneof message {
-    M1Delta m1 = 10;
-    M2Delta m2 = 11;
-    M3Delta m3 = 12;
-    M4Delta m4 = 13;
-    M7Delta m7 = 14;
-  }
-}
-
-message M1Delta {
-  uint32 sidechain_number = 1;
-  // Consensus-encoded description bytes exactly as returned upstream.
-  bytes description = 2;
-  // 32-byte SHA256d hash in conventional display order.
-  bytes description_hash = 3;
-}
-
-enum M2Effect {
-  M2_EFFECT_UNSPECIFIED = 0;
-  M2_EFFECT_NO_ACTIVATION = 1;
-  M2_EFFECT_SLOT_ACTIVATION = 2;
-  M2_EFFECT_REPLACE_ACTIVE = 3;
-  M2_EFFECT_REJECTED_OR_NOOP = 4;
-}
-
-message M2Delta {
-  uint32 sidechain_number = 1;
-  // 32-byte SHA256d hash in conventional display order.
-  bytes description_hash = 2;
-  // Kept as the raw protobuf number by prost when a future value is unknown.
-  M2Effect effect = 3;
-}
-
-message M3Delta {
-  uint32 sidechain_number = 1;
-  // Consensus-encoded M6 identifier bytes.
-  bytes m6id = 2;
-}
-
-enum M4Mode {
-  M4_MODE_UNSPECIFIED = 0;
-  M4_MODE_REPEAT_PREVIOUS = 1;
-  M4_MODE_ONE_BYTE = 2;
-  M4_MODE_TWO_BYTES = 3;
-  M4_MODE_LEADING_BY_50 = 4;
-}
-
-enum M4Action {
-  M4_ACTION_UNSPECIFIED = 0;
-  M4_ACTION_ALARM = 1;
-  M4_ACTION_UPVOTE = 2;
-}
-
-message M4Effect {
-  uint32 sidechain_number = 1;
-  M4Action action = 2;
-  optional bytes upvoted_m6id = 3;
-  repeated bytes downvoted_m6ids = 4;
-}
-
-message M4Delta {
-  M4Mode mode = 1;
-  // Decoded unsigned wire values; alarm/abstain sentinels are not rewritten.
-  repeated uint32 raw_votes = 2;
-  repeated M4Effect effects = 3;
-}
-
-message M7Delta {
-  uint32 sidechain_number = 1;
-  // Consensus-encoded h* bytes.
-  bytes hstar = 2;
-}
-
-message TreasuryCtip {
-  // 32-byte transaction ID in conventional display order.
-  bytes txid = 1;
-  uint32 vout = 2;
-  uint64 value_sats = 3;
-}
-
-enum TreasuryTransitionKind {
-  TREASURY_TRANSITION_KIND_UNSPECIFIED = 0;
-  TREASURY_TRANSITION_KIND_DEPOSIT = 1;
-  TREASURY_TRANSITION_KIND_WITHDRAWAL_SUCCEEDED = 2;
-  TREASURY_TRANSITION_KIND_WITHDRAWAL_FAILED = 3;
-}
-
-message TreasuryTransition {
-  TreasuryTransitionKind kind = 1;
-  uint32 sidechain_number = 2;
-  optional TreasuryCtip previous_ctip = 3;
-  optional TreasuryCtip new_ctip = 4;
-  optional uint64 sequence_number = 5;
-  optional uint64 delta_sats = 6;
-  optional uint64 payout_sats = 7;
-  optional uint64 fee_sats = 8;
-  optional bytes m6id = 9;
-  optional bytes sidechain_address = 10;
-  optional bytes transaction = 11;
-  optional uint32 proposal_height = 12;
-  optional uint32 terminal_height = 13;
-}
-
-message ConfirmedBmmRequest {
-  uint32 sidechain_number = 1;
-  // 32-byte transaction ID in conventional display order.
-  bytes txid = 2;
-  // Consensus-encoded transaction bytes.
-  bytes transaction = 3;
-  // Consensus-encoded h* bytes.
-  bytes hstar = 4;
-  // 32-byte block hash in conventional display order.
-  bytes previous_mainchain_block_hash = 5;
-  optional uint64 fee_sats = 6;
-}
-
 // A point-in-time sample of the enforcer's unconfirmed BMM auction. This is
 // not a complete transaction history: requests may enter and leave between
 // polls. The envelope is anchored to the same parent block recorded here.
 message BmmRequestsSnapshot {
-  // Legacy contract 7 fields. Contract 8 always leaves these empty/zero:
-  // upstream does not expose readiness or an internal mempool generation.
-  string observer_session = 3;
-  uint64 mempool_generation = 4;
+  // Fork-only readiness fields; upstream exposes neither.
+  reserved 3, 4;
+  reserved "observer_session", "mempool_generation";
   // 32-byte parent block hash in conventional display order.
   bytes previous_mainchain_block_hash = 1;
   repeated BmmRequest requests = 2;
@@ -305,7 +170,7 @@ message Deposit {
 }
 
 message WithdrawalBundleEvent {
-  // Consensus-encoded M6 identifier bytes as returned by the enforcer.
+  // 32-byte M6 identifier (the bundle txid) in conventional display order.
   bytes m6id = 1;
 
   oneof state {
@@ -334,7 +199,7 @@ message SidechainEvent {
 
 // A withdrawal bundle that has been proposed and is still being voted on.
 message WithdrawalBundleProposal {
-  // Consensus-encoded M6 identifier bytes as returned by the enforcer.
+  // 32-byte M6 identifier (the bundle txid) in conventional display order.
   bytes m6id = 1;
   // Accumulated M4 upvotes, to be read against
   // `Bip300Constants.withdrawal_bundle_inclusion_threshold`.
@@ -364,19 +229,27 @@ message BlockDisconnected {
   uint32 sidechain_number = 2;
 }
 
-// Session/sequence describe observation order, not block height. A subscription
-// boundary records the beginning of evidence and carries no block header.
+// A global mainchain transition seen on the official event stream. Capture
+// order belongs to event_observation; upstream provides no durable sequence.
 message MainchainTransition {
-  // Legacy server sequence fields: empty/zero in contract 8. Capture order
-  // belongs to event_observation; upstream provides no durable sequence.
-  string observer_session = 1;
-  uint64 sequence = 2;
-  // 3 = subscription boundary, 1 = connected, 2 = disconnected.
+  // Fork-only server sequence fields.
+  reserved 1, 2;
+  reserved "observer_session", "sequence";
+  // 1 = connected, 2 = disconnected, 3 = subscription boundary.
+  //
+  // A boundary is written whenever the subscription (re)starts. Upstream does
+  // not replay events, so transitions between `gap_start` and `header` are
+  // unknown: they are a gap in this stream, not an absence of transitions.
   int32 action = 3;
+  // Connected/disconnected block, or the tip read when a boundary began.
   BlockHeader header = 4;
+  // Boundary only: the last tip known before the gap. Absent for the very
+  // first subscription of a dataset, whose evidence simply starts here.
+  optional BlockHeader gap_start = 5;
 }
 
-// Independent enrichment: never changes an existing Bip300BlockDelta fact.
+// Node enrichment for a confirmed block: fees of BMM bids that the official
+// API showed and that match an official commitment. Never changes the block.
 message ConfirmedBmmFees {
   BlockHeader header = 1;
   repeated ConfirmedBmmFee fees = 2;

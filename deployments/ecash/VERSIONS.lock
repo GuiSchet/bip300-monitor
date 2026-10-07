@@ -41,7 +41,7 @@ POSTGRES_USER=bip300_monitor
 # Local reviewed release candidate; OCI artifacts must be published before apply.
 # Keep contract, source commit, and both immutable image
 # digests together.
-MONITOR_EVENT_CONTRACT_VERSION=8
+MONITOR_EVENT_CONTRACT_VERSION=9
 MONITOR_IMAGE_COMMIT=2f2574d46d1bc9d888932f1161a2ab18d3b9dee6
 ENFORCER_EXTRACTOR_IMAGE=docker.io/guischet/bip300-enforcer-extractor:sha-2f2574d46d1b@sha256:e953a8bbf2280bb85fe568c5b5f4bdd0082e3055742123690a83e64a57dfd506
 EVENT_LOGGER_IMAGE=docker.io/guischet/bip300-event-logger:sha-2f2574d46d1b@sha256:b84a360bc26fd1e8ac40e12ce676d722b28f7bb176dbd2956acf5ad8ae3b701c

@@ -40,6 +40,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../schema/0007_single_active_run.sql"),
     include_str!("../schema/0008_observation_quality.sql"),
     include_str!("../schema/0009_official_sources.sql"),
+    include_str!("../schema/0010_official_contract_9.sql"),
 ];
 
 /// Advisory-lock key that serializes the migration of one record.
@@ -497,7 +498,11 @@ impl Store {
             run_id: String::new(),
             event_contract_version: 0,
         };
+        // Since contract 8 every contract version owns a fresh dataset: facts of
+        // different versions are never mixed under one dataset identity.
         if manifest.event_contract_version >= 8 {
+            let version = i32::try_from(manifest.event_contract_version)
+                .context("event contract version does not fit in an i32")?;
             let client = store.client.lock().await;
             let exists: bool = client
                 .query_one("SELECT to_regclass('dataset_manifest') IS NOT NULL", &[])
@@ -506,12 +511,12 @@ impl Store {
             if exists {
                 let incompatible: bool = client.query_one(
                     "SELECT EXISTS(SELECT 1 FROM dataset_manifest WHERE network_id=$1 AND activation_height=$2
-                        AND activation_block_hash=$3 AND initial_event_contract_version<>8)",
-                    &[&manifest.network_id,&height_to_i32(manifest.activation_height)?,&manifest.activation_block_hash],
+                        AND activation_block_hash=$3 AND initial_event_contract_version<>$4)",
+                    &[&manifest.network_id,&height_to_i32(manifest.activation_height)?,&manifest.activation_block_hash,&version],
                 ).await?.get(0);
                 if incompatible {
                     bail!(
-                        "event contract v8 requires a fresh v8 dataset; no migrations were applied"
+                        "event contract v{version} requires a fresh v{version} dataset; no migrations were applied"
                     );
                 }
             }
@@ -564,17 +569,17 @@ impl Store {
         if manifest.event_contract_version >= 8 {
             let incompatible: bool = transaction
                 .query_one(
-                    "SELECT initial_event_contract_version <> 8
+                    "SELECT initial_event_contract_version <> $2
                        FROM dataset_manifest
                       WHERE dataset_id = $1::text::uuid",
-                    &[&dataset_id],
+                    &[&dataset_id, &event_contract_version],
                 )
                 .await
-                .context("checking the v8 dataset compatibility boundary")?
+                .context("checking the dataset contract compatibility boundary")?
                 .get(0);
             if incompatible {
                 bail!(
-                    "event contract v8 requires a fresh v8 dataset; create a recoverable record backup and start an empty dataset"
+                    "event contract v{event_contract_version} requires a fresh v{event_contract_version} dataset; create a recoverable record backup and start an empty dataset"
                 );
             }
         }
@@ -1204,10 +1209,13 @@ impl Store {
 
     /// New facts have priority over daily retries of unavailable historical fees.
     pub async fn next_fee_block(&self) -> Result<Option<(i64, ObservedBlock)>> {
+        if self.source != "node" {
+            bail!("confirmed BMM fees are node enrichments");
+        }
         let client = self.client.lock().await;
         let row = client.query_opt(
             "WITH next AS (SELECT id,block_hash,height FROM event
-              WHERE dataset_id=$1::text::uuid AND event_contract_version=$2 AND source=$3 AND kind=CASE WHEN $3='node' THEN 'mainchain_block' ELSE 'bip300_block_delta' END
+              WHERE dataset_id=$1::text::uuid AND event_contract_version=$2 AND source=$3 AND kind='mainchain_block'
                 AND id>COALESCE((SELECT max(source_event_id) FROM bmm_fee_job
                     WHERE dataset_id=$1::text::uuid AND event_contract_version=$2 AND source=$3),0)
               ORDER BY id LIMIT 1), retry AS (
@@ -1227,72 +1235,10 @@ impl Store {
     }
 
     pub async fn record_fee_enrichment(&self, source_event_id: i64, event: &Event) -> Result<()> {
-        if let Some(MonitorEvent::Node(node)) = &event.monitor_event {
-            return self.record_node_fees(source_event_id, event, node).await;
-        }
-        use crate::protobuf::enforcer_extractor::enforcer_event::Event as Payload;
-        let Some(MonitorEvent::Enforcer(payload)) = &event.monitor_event else {
-            bail!("missing fee payload");
+        let Some(MonitorEvent::Node(node)) = &event.monitor_event else {
+            bail!("confirmed BMM fees are node enrichments");
         };
-        let Some(Payload::ConfirmedBmmFees(fees)) = &payload.event else {
-            bail!("expected confirmed fees");
-        };
-        let header = fees.header.as_ref().context("fee header missing")?;
-        let unavailable = fees.fees.iter().any(|f| f.fee_sats.is_none());
-        let mut client = self.client.lock().await;
-        let tx = client.transaction().await?;
-        let source = tx.query_opt(
-            "SELECT envelope FROM event WHERE id=$1 AND dataset_id=$2::text::uuid AND event_contract_version=$3
-               AND source=$4 AND kind='bip300_block_delta' AND block_hash=$5 AND height=$6",
-            &[&source_event_id,&self.dataset_id,&self.event_contract_version,&self.source,&header.hash,&height_to_i32(header.height)?],
-        ).await?.context("fee enrichment does not match its source block")?;
-        let bytes: Vec<u8> = source.get(0);
-        let source = Event::decode(bytes.as_slice())?;
-        let Some(MonitorEvent::Enforcer(source)) = source.monitor_event else {
-            bail!("invalid source envelope");
-        };
-        let Some(Payload::Bip300BlockDelta(delta)) = source.event else {
-            bail!("invalid source delta");
-        };
-        let expected: std::collections::BTreeSet<_> = delta
-            .confirmed_bmm_requests
-            .iter()
-            .map(|r| (r.sidechain_number, &r.txid))
-            .collect();
-        let actual: std::collections::BTreeSet<_> = fees
-            .fees
-            .iter()
-            .map(|r| (r.sidechain_number, &r.txid))
-            .collect();
-        if delta.header.as_ref() != Some(header)
-            || expected != actual
-            || actual.len() != fees.fees.len()
-        {
-            bail!("fee enrichment changes its source header or confirmed request identities");
-        }
-        let sequence = reserve_capture_sequences(&tx, &self.run_id, 1).await?;
-        insert(
-            &tx,
-            self.source,
-            &self.dataset_id,
-            &self.run_id,
-            self.event_contract_version,
-            CaptureMethod::Backfill,
-            None,
-            None,
-            None,
-            sequence,
-            event,
-            &mut BTreeMap::new(),
-        )
-        .await?;
-        tx.execute("INSERT INTO bmm_fee_job(dataset_id,event_contract_version,source,source_event_id,next_retry_at)
-                    VALUES($1::text::uuid,$2,$3,$4,CASE WHEN $5 THEN now()+interval '24 hours' END)
-                    ON CONFLICT(dataset_id,event_contract_version,source,source_event_id) DO UPDATE
-                    SET last_observed_at=now(),next_retry_at=excluded.next_retry_at",
-            &[&self.dataset_id,&self.event_contract_version,&self.source,&source_event_id,&unavailable]).await?;
-        tx.commit().await?;
-        Ok(())
+        self.record_node_fees(source_event_id, event, node).await
     }
 
     /// Only bids observed through the official API and a matching official
@@ -1600,9 +1546,9 @@ impl Store {
         let conflict: bool = transaction.query_one(
             "SELECT EXISTS(SELECT 1 FROM event_conflict c JOIN event e ON e.id=c.first_event_id
                 WHERE e.dataset_id=$1::text::uuid AND e.event_contract_version=$2 AND e.source=$3
-                  AND e.kind=CASE $4::text WHEN 'block' THEN 'block_connected' WHEN 'mainchain_block' THEN 'mainchain_block' ELSE 'bip300_block_delta' END
+                  AND e.kind=$4
                   AND e.sidechain IS NOT DISTINCT FROM $5 AND e.sidechain_instance_id IS NOT DISTINCT FROM $6)",
-            &[&self.dataset_id,&self.event_contract_version,&self.source,&page.stream,&sidechain,&page.sidechain_instance_id],
+            &[&self.dataset_id,&self.event_contract_version,&self.source,&history_kind(page.stream)?,&sidechain,&page.sidechain_instance_id],
         ).await?.get(0);
         let complete = page.next.is_none() && !conflict;
         if conflict {
@@ -1976,6 +1922,15 @@ fn block_from_parts(
     }
 }
 
+/// Event kind whose facts make up a history coverage stream.
+fn history_kind(stream: &str) -> Result<&'static str> {
+    match stream {
+        "block" => Ok("block_connected"),
+        "mainchain_block" => Ok("mainchain_block"),
+        other => bail!("unknown history stream `{other}`"),
+    }
+}
+
 fn height_to_i32(height: u32) -> Result<i32> {
     i32::try_from(height).with_context(|| format!("block height {height} does not fit in an i32"))
 }
@@ -2010,9 +1965,9 @@ async fn insert(
             Some(crate::protobuf::enforcer_extractor::enforcer_event::Event::BlockConnected(b)) => {
                 b.header.as_ref().map(|h| &h.previous_hash)
             }
-            Some(crate::protobuf::enforcer_extractor::enforcer_event::Event::Bip300BlockDelta(
-                b,
-            )) => b.header.as_ref().map(|h| &h.previous_hash),
+            Some(
+                crate::protobuf::enforcer_extractor::enforcer_event::Event::MainchainTransition(t),
+            ) => t.header.as_ref().map(|h| &h.previous_hash),
             _ => None,
         },
         _ => None,

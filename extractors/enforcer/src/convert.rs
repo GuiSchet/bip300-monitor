@@ -95,8 +95,6 @@ pub fn bmm_requests(
 
     Ok(enforcer_event(events::enforcer_event::Event::BmmRequests(
         events::BmmRequestsSnapshot {
-            observer_session: String::new(),
-            mempool_generation: 0,
             previous_mainchain_block_hash,
             requests,
         },
@@ -374,7 +372,7 @@ fn withdrawal_bundle_proposal(
     proposal: mainchain::get_withdrawal_bundle_proposals_response::ResponseItem,
 ) -> Result<events::WithdrawalBundleProposal> {
     Ok(events::WithdrawalBundleProposal {
-        m6id: fixed_consensus_hex(proposal.m6id, "withdrawal_bundle_proposal.m6id")?,
+        m6id: m6id_display(proposal.m6id, "withdrawal_bundle_proposal.m6id")?,
         vote_count: required(proposal.vote_count, "withdrawal_bundle_proposal.vote_count")?,
         proposal_height: required(
             proposal.proposal_height,
@@ -446,7 +444,7 @@ fn withdrawal_event(
     };
 
     Ok(events::WithdrawalBundleEvent {
-        m6id: fixed_consensus_hex(withdrawal.m6id, "withdrawal_bundle.m6id")?,
+        m6id: m6id_display(withdrawal.m6id, "withdrawal_bundle.m6id")?,
         state: Some(state),
     })
 }
@@ -487,6 +485,15 @@ fn slot(value: u32, field: &str) -> Result<u32> {
 fn fixed_consensus_hex(value: Option<common::ConsensusHex>, field: &str) -> Result<Vec<u8>> {
     let bytes = consensus_hex(value, field)?;
     require_32_bytes(bytes, field)
+}
+
+/// Upstream sends an M6 identifier as the consensus bytes of the bundle txid.
+/// Store it in display order, like every other txid in the contract, so it
+/// matches the transaction id a node or explorer shows.
+fn m6id_display(value: Option<common::ConsensusHex>, field: &str) -> Result<Vec<u8>> {
+    let mut bytes = fixed_consensus_hex(value, field)?;
+    bytes.reverse();
+    Ok(bytes)
 }
 
 fn hash_from_reverse(value: Option<common::ReverseHex>, field: &str) -> Result<Vec<u8>> {
@@ -620,7 +627,5 @@ mod tests {
         };
         assert_eq!(snapshot.previous_mainchain_block_hash, vec![0xaa; 32]);
         assert!(snapshot.requests.is_empty());
-        assert!(snapshot.observer_session.is_empty());
-        assert_eq!(snapshot.mempool_generation, 0);
     }
 }
