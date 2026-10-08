@@ -33,17 +33,19 @@ Contract 9 removed the fork-only protobuf types; their field numbers are
 reserved. M6 identifiers are display-order bundle txids. Startup verifies the
 enforcer's BIP300 thresholds against the dataset's network preset.
 
-## Release candidate
+## Release
 
-[RELEASE_OFFICIAL.json](RELEASE_OFFICIAL.json) keeps the unchanged official
-enforcer image. The contract 8 consumer images (monitor `2f2574d`, Observatory
-`026d0c7`) are superseded: the extractor, event logger and Observatory must be
-rebuilt from the merged contract 9 commits and their digests recorded before
-publishing. Keep `RELEASE_STATUS=preparing` until registry digests have been
-checked. The final reviewed promotion changes this marker to `ready` before an
-approved start.
+[RELEASE_OFFICIAL.json](RELEASE_OFFICIAL.json) records the published images,
+each pinned by a registry digest verified with an anonymous manifest fetch:
 
-## Future cutover
+- Official enforcer `1753fc0`: `docker.io/guischet/bip300-enforcer-official`,
+  pushed byte-for-byte from the locally built OCI archive (same digest).
+- Extractor and event logger: built by CI from merge commit `13dfbf7`.
+
+`RELEASE_STATUS=ready` permits an operator-approved start. The Observatory image
+is still to be rebuilt from its merged commit before a production deployment.
+
+## Cutover
 
 1. Freeze and export the old monitor record using the existing backup workflow.
    Verify a separate restore and the paired Observatory backup before finalizing.
