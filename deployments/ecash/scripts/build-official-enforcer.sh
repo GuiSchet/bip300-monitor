@@ -16,5 +16,5 @@ git -C "${checkout}" fetch --no-tags "${ENFORCER_REPO}" "${ENFORCER_COMMIT}"
 docker buildx build --platform linux/amd64 \
     --file "${root}/images/enforcer-official.Dockerfile" \
     --build-arg "ENFORCER_COMMIT=${ENFORCER_COMMIT}" \
-    --tag "ghcr.io/guischet/bip300-enforcer-official:sha-${ENFORCER_COMMIT:0:12}" \
+    --tag "docker.io/guischet/bip300-enforcer-official:sha-${ENFORCER_COMMIT:0:12}" \
     --output "type=oci,dest=${output}" "${checkout}"
