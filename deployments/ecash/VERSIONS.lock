@@ -42,9 +42,9 @@ POSTGRES_USER=bip300_monitor
 # Keep contract, source commit, and both immutable image
 # digests together.
 MONITOR_EVENT_CONTRACT_VERSION=9
-MONITOR_IMAGE_COMMIT=13dfbf7b7b4b5d68fedf2b507ae7d240db6aa60a
-ENFORCER_EXTRACTOR_IMAGE=docker.io/guischet/bip300-enforcer-extractor:sha-13dfbf7b7b4b@sha256:4bcf4f56e786a44925a544d216942e7d14bbc054d6709c2531496d2ebcd9f480
-EVENT_LOGGER_IMAGE=docker.io/guischet/bip300-event-logger:sha-13dfbf7b7b4b@sha256:5d0905397836fe5e174bb60e0c3557a8dd96920bd3a9397ea26768715489bc0e
+MONITOR_IMAGE_COMMIT=5642b877ff963eaa887779d6be102fb36a60a404
+ENFORCER_EXTRACTOR_IMAGE=docker.io/guischet/bip300-enforcer-extractor:sha-5642b877ff96@sha256:3d2f0c8558b86788955196d8b814ff8ac9fe28fef2cf4b8aaa79786fe59199be
+EVENT_LOGGER_IMAGE=docker.io/guischet/bip300-event-logger:sha-5642b877ff96@sha256:56f394d895c607c0f49077e31bf51b17617e38774eb8fd598347820682c84e54
 
 JUST_VERSION=1.57.0
 JUST_TARGET=x86_64-unknown-linux-musl

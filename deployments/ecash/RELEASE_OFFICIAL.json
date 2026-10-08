@@ -1,5 +1,5 @@
 {
-  "release_id": "observer-official-v9-20261008",
+  "release_id": "observer-official-v9-20261008b",
   "prepared_at": "2026-10-08",
   "status": "images-published-monitor-ready",
   "event_contract": 9,
@@ -8,7 +8,7 @@
   "requires_fresh_databases": true,
   "commits": {
     "enforcer_official": "1753fc0c23863bcb39c681e1cfaea2705613516f",
-    "monitor_image_source": "13dfbf7b7b4b5d68fedf2b507ae7d240db6aa60a",
+    "monitor_image_source": "5642b877ff963eaa887779d6be102fb36a60a404",
     "observatory_image_source": "pending-rebuild",
     "retired_fork_archive": "7a7b625ae5a46a085b3617fdedf37a92181ea048"
   },
@@ -29,23 +29,23 @@
     },
     {
       "artifact": "registry",
-      "destination": "docker.io/guischet/bip300-enforcer-extractor:sha-13dfbf7b7b4b",
-      "digest": "sha256:4bcf4f56e786a44925a544d216942e7d14bbc054d6709c2531496d2ebcd9f480",
-      "source_commit": "13dfbf7b7b4b5d68fedf2b507ae7d240db6aa60a",
+      "destination": "docker.io/guischet/bip300-enforcer-extractor:sha-5642b877ff96",
+      "digest": "sha256:3d2f0c8558b86788955196d8b814ff8ac9fe28fef2cf4b8aaa79786fe59199be",
+      "source_commit": "5642b877ff963eaa887779d6be102fb36a60a404",
       "platform": "linux/amd64",
       "published": true
     },
     {
       "artifact": "registry",
-      "destination": "docker.io/guischet/bip300-event-logger:sha-13dfbf7b7b4b",
-      "digest": "sha256:5d0905397836fe5e174bb60e0c3557a8dd96920bd3a9397ea26768715489bc0e",
-      "source_commit": "13dfbf7b7b4b5d68fedf2b507ae7d240db6aa60a",
+      "destination": "docker.io/guischet/bip300-event-logger:sha-5642b877ff96",
+      "digest": "sha256:56f394d895c607c0f49077e31bf51b17617e38774eb8fd598347820682c84e54",
+      "source_commit": "5642b877ff963eaa887779d6be102fb36a60a404",
       "platform": "linux/amd64",
       "published": true
     }
   ],
   "validation": {
-    "monitor_ci_main": "passed (run 37810240753: Rust quality with PostgreSQL/NATS, deployment checks, proto vendor, container smoke tests)",
+    "monitor_ci_main": "passed (run 37828597847 on merge 5642b87)",
     "observatory_ci": "passed on pull request #1; main browser assertion race fixed separately",
     "registry_digests_verified": "anonymous manifest fetch matches every pinned digest"
   },
