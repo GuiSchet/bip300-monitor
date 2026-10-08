@@ -1744,6 +1744,21 @@ async fn an_old_conflict_does_not_fail_pages_of_other_blocks() {
         )
         .await
         .expect("an unrelated older conflict must not suspend this page");
+    // Completing would certify the scope, so the final page sees the conflict.
+    let error = store
+        .record_history_page(
+            &[block_event(104, 104, 103)],
+            HistoryPage {
+                stream: "block",
+                sidechain: Some(9),
+                sidechain_instance_id: Some(&id),
+                expected_next: &ObservedBlock::at_height(vec![104; 32], 104),
+                next: None,
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(error.is::<shared::store::HistoryConflict>());
 }
 
 #[tokio::test]

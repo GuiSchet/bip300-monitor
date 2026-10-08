@@ -172,8 +172,14 @@ if ((MONITOR_EVENT_CONTRACT_VERSION >= 6)); then
         and index("orphan_run_reconciliation") != null
     ' <<<"${run_capabilities}" >/dev/null ||
         die "the current extractor run does not declare the contract-v6 correctness capabilities"
-    record_current_run_has_tip_matched_bmm_observation ||
-        die "the current extractor run has no tip-matched BMM observation"
+    # Samples in the readiness grace after start are recorded as unknown.
+    bmm_wait_seconds="${BMM_READINESS_WAIT_SECONDS:-180}"
+    bmm_deadline="$((SECONDS + bmm_wait_seconds))"
+    until record_current_run_has_tip_matched_bmm_observation; do
+        ((SECONDS < bmm_deadline)) ||
+            die "the current extractor run has no tip-matched BMM observation after ${bmm_wait_seconds}s"
+        sleep 2
+    done
 fi
 record_has_single_running_enforcer ||
     die "the current dataset does not have exactly one running enforcer extractor"

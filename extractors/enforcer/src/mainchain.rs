@@ -26,12 +26,14 @@ pub(crate) async fn monitor(
     // replacement. Each (re)subscription records that gap as a boundary.
     let mut gap_start = recorder.previous_run_tip().cloned();
     loop {
+        let mut bounded = false;
         let failure = match subscription_boundary(&mut client, gap_start.as_ref()).await {
             Err(error) => format!("subscription boundary: {error:#}"),
             Ok((payload, anchor)) => {
                 recorder
                     .record(Event::new(MonitorEvent::Enforcer(payload), Some(anchor))?)
                     .await?;
+                bounded = true;
                 loop {
                     let item = tokio::select! { _=shutdown.changed()=>return Ok(()), item=stream.message()=>item };
                     let response = match item {
@@ -50,7 +52,10 @@ pub(crate) async fn monitor(
             }
         };
         // Captured now: the tip poll keeps advancing while the stream is down.
-        gap_start = Some(tip_tx.borrow().clone());
+        // A gap whose boundary was never recorded keeps its original start.
+        if bounded {
+            gap_start = Some(tip_tx.borrow().clone());
+        }
         recorder
             .record_worker_failure(ExtractorWorker::MainchainEvents, &failure, 1)
             .await?;

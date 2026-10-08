@@ -507,6 +507,13 @@ async fn backfill_sidechains(
                         "block history is quarantined by conflicting immutable facts; \
                          live capture continues"
                     );
+                    recorder
+                        .record_worker_failure(
+                            ExtractorWorker::BlockHistory,
+                            &format!("slot {sidechain}: {}", shared::store::HISTORY_CONFLICT),
+                            1,
+                        )
+                        .await?;
                     break;
                 }
                 backfill::Outcome::Deferred {
@@ -1610,6 +1617,10 @@ async fn monitor_state(
 ) -> Result<()> {
     tracing::info!("started enforcer state worker");
     let health_recorder = recorder.clone();
+    // The startup snapshot this worker continues from was a successful read.
+    recorder
+        .record_worker_success(ExtractorWorker::EnforcerState)
+        .await?;
 
     refresh_on_new_blocks(
         client,

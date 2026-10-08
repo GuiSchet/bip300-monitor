@@ -157,7 +157,17 @@ impl Tracker {
         consistency: SnapshotConsistency,
     ) -> Result<Publication> {
         self.last_consistency = consistency;
-        let changed = self.take_changed(current.clone())?;
+        // Changes are measured against the last tip-matched reading: a reading
+        // taken while the tip moved is published but is not a baseline, so the
+        // stable retry still reports what changed (e.g. a new activation).
+        let changed = if consistency == SnapshotConsistency::TipMatched {
+            self.take_changed(current.clone())?
+        } else {
+            let previous = self.last.clone();
+            let changed = self.take_changed(current.clone())?;
+            self.last = previous;
+            changed
+        };
         Ok(Publication {
             payloads: current,
             changed,
@@ -352,6 +362,20 @@ mod tests {
             .unwrap();
         assert_eq!(publication.changed, vec![ctip(9, 150)]);
         assert!(!publication.active_sidechains_changed());
+    }
+
+    #[test]
+    fn a_change_first_read_while_the_tip_moved_is_reported_when_stable() {
+        let mut tracker = Tracker::new(vec![ctip(9, 100)]);
+        let moving = tracker
+            .take_observation(vec![ctip(9, 150)], SnapshotConsistency::Changed)
+            .unwrap();
+        assert_eq!(moving.changed, vec![ctip(9, 150)]);
+        // The moving read is no baseline: the stable retry reports it again.
+        let stable = tracker
+            .take_observation(vec![ctip(9, 150)], SnapshotConsistency::TipMatched)
+            .unwrap();
+        assert_eq!(stable.changed, vec![ctip(9, 150)]);
     }
 
     #[test]

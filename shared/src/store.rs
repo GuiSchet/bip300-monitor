@@ -327,6 +327,8 @@ pub enum ExtractorWorker {
     MainchainEvents,
     ConfirmedBmmFees,
     EnforcerState,
+    /// Per-slot block history; reported only when a scope is quarantined.
+    BlockHistory,
 }
 
 impl ExtractorWorker {
@@ -338,6 +340,7 @@ impl ExtractorWorker {
             Self::MainchainEvents => "mainchain_events",
             Self::ConfirmedBmmFees => "confirmed_bmm_fees",
             Self::EnforcerState => "enforcer_state",
+            Self::BlockHistory => "block_history",
         }
     }
 }
@@ -1381,11 +1384,18 @@ impl Store {
         let final_candidates: bool = tx
             .query_one(
                 "SELECT NOT EXISTS(SELECT 1 FROM current_sidechain_instance i
-                WHERE i.dataset_id=$1::text::uuid AND NOT EXISTS(SELECT 1 FROM event b
+                JOIN sidechain_instance s USING(dataset_id, sidechain_instance_id)
+                WHERE i.dataset_id=$1::text::uuid AND s.activation_height<=$4
+                  AND NOT EXISTS(SELECT 1 FROM event b
                     WHERE b.dataset_id=i.dataset_id AND b.event_contract_version=$2
                       AND b.source='enforcer' AND b.kind='block_connected'
                       AND b.sidechain=i.sidechain AND b.block_hash=$3))",
-                &[&self.dataset_id, &self.event_contract_version, &header.hash],
+                &[
+                    &self.dataset_id,
+                    &self.event_contract_version,
+                    &header.hash,
+                    &height_to_i32(header.height)?,
+                ],
             )
             .await?
             .get(0);
@@ -1621,6 +1631,18 @@ impl Store {
                   AND e.sidechain IS NOT DISTINCT FROM $5 AND e.sidechain_instance_id IS NOT DISTINCT FROM $6)",
             &[&self.dataset_id,&self.event_contract_version,&self.source,&history_kind(page.stream)?,&sidechain,&page.sidechain_instance_id,&page_hashes],
         ).await?.get(0);
+        // Completing certifies the whole scope, so the final page also checks
+        // conflicts retained anywhere in it (an operator may have resumed a
+        // quarantined cursor without resolving them).
+        let conflict = conflict
+            || (page.next.is_none()
+                && transaction.query_one(
+                    "SELECT EXISTS(SELECT 1 FROM event_conflict c JOIN event e ON e.id=c.first_event_id
+                        WHERE e.dataset_id=$1::text::uuid AND e.event_contract_version=$2 AND e.source=$3
+                          AND e.kind=$4
+                          AND e.sidechain IS NOT DISTINCT FROM $5 AND e.sidechain_instance_id IS NOT DISTINCT FROM $6)",
+                    &[&self.dataset_id,&self.event_contract_version,&self.source,&history_kind(page.stream)?,&sidechain,&page.sidechain_instance_id],
+                ).await?.get::<_, bool>(0));
         let complete = page.next.is_none() && !conflict;
         if conflict {
             (next_hash, next_height) = optional_block_parts(Some(page.expected_next))?;
@@ -2042,7 +2064,7 @@ async fn schedule_fee_job(
             last_error=excluded.last_error,
             status=CASE WHEN $5 THEN 'done' WHEN j.attempts+1>=$7 THEN 'abandoned' ELSE 'pending' END,
             next_retry_at=CASE WHEN $5 OR j.attempts+1>=$7 THEN NULL
-                ELSE now()+LEAST(interval '24 hours', interval '1 hour'*power(2,j.attempts+1)) END",
+                ELSE now()+LEAST(interval '24 hours', interval '1 hour'*power(2,j.attempts)) END",
         &[
             &store.dataset_id,
             &store.event_contract_version,

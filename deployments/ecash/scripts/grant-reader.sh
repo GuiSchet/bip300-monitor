@@ -17,6 +17,8 @@ if [[ ! -s "$secret" ]]; then
     info "generated the reader password in ${secret}"
 fi
 password="$(<"$secret")"
+# Passed to psql on stdin, never on its command line (visible in ps).
+[[ "$password" =~ ^[0-9a-f]{32,}$ ]] || die 'the reader password must be hexadecimal'
 
 # Every relation the Observatory importer reads, including its compatibility
 # probe. Keep in step with drivechain-observatory SOURCE_CONTRACT.md.
@@ -31,7 +33,7 @@ table_list="$(
     echo "${tables[*]}"
 )"
 
-postgres_query "
+postgres_query "\\set password '${password}'
 SELECT format('CREATE ROLE %I LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS CONNECTION LIMIT 4', :'role')
  WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = :'role') \\gexec
 SELECT format('ALTER ROLE %I PASSWORD %L', :'role', :'password') \\gexec
@@ -42,7 +44,7 @@ SELECT format('GRANT USAGE ON SCHEMA public TO %I', :'role') \\gexec
 SELECT format('GRANT SELECT ON %s TO %I',
               (SELECT string_agg(format('public.%I', t), ',') FROM unnest(string_to_array(:'tables', ',')) t),
               :'role') \\gexec
-" --set=role="$role" --set=password="$password" --set=tables="$table_list" >/dev/null
+" --set=role="$role" --set=tables="$table_list" >/dev/null
 
 missing="$(postgres_query "
 SELECT string_agg(t, ' ') FROM unnest(string_to_array(:'tables', ',')) t
