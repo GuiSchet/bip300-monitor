@@ -34,6 +34,11 @@ pub(crate) async fn monitor(
                     .record(Event::new(MonitorEvent::Enforcer(payload), Some(anchor))?)
                     .await?;
                 bounded = true;
+                // A live subscription with its boundary recorded is healthy even
+                // before the first block, which can take long on Betanet.
+                recorder
+                    .record_worker_success(ExtractorWorker::MainchainEvents)
+                    .await?;
                 loop {
                     let item = tokio::select! { _=shutdown.changed()=>return Ok(()), item=stream.message()=>item };
                     let response = match item {
