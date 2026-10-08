@@ -40,6 +40,11 @@ for directory in \
         require_command sudo
         sudo install -d -o "${PUID}" -g "${PGID}" "${directory}"
     fi
+    # Run as root, mkdir leaves the directory root-owned and the containers
+    # (PUID:PGID) cannot write it; the first official enforcer start hit this.
+    if [[ "${EUID}" -eq 0 ]]; then
+        chown -- "${PUID}:${PGID}" "${directory}"
+    fi
     [[ -w "${directory}" ]] ||
         die "${directory} is not writable by the current user"
 done
