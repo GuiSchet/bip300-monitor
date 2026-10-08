@@ -15,6 +15,14 @@ use crate::proto::mainchain;
 #[derive(Clone, Parser)]
 #[command(version, about, long_about = None)]
 pub struct Args {
+    /// Official node HTTP RPC, reachable only on the private network.
+    #[arg(long, env = "BIP300_MONITOR_NODE_RPC_ENDPOINT")]
+    pub node_rpc_endpoint: Option<String>,
+
+    /// File containing user:password. Deployment uses a dedicated read-only RPC identity;
+    /// reread for each request to support credential rotation.
+    #[arg(long, env = "BIP300_MONITOR_NODE_RPC_COOKIE_FILE")]
+    pub node_rpc_cookie_file: Option<std::path::PathBuf>,
     /// Core NATS connection settings, used for best-effort live fan-out.
     #[command(flatten)]
     pub nats: NatsArgs,
@@ -38,6 +46,19 @@ pub struct Args {
         default_value = "unknown"
     )]
     pub activation_block_hash: String,
+
+    /// Accept a production `network_id` that has no known enforcer preset.
+    ///
+    /// Known presets have their BIP300 thresholds and activation height
+    /// checked at startup, which is the only way to notice an enforcer running
+    /// with the wrong preset: the official API never reports the OP_DRIVECHAIN
+    /// opcode, and a wrong one silently produces no deposits or treasury.
+    #[arg(
+        long,
+        env = "BIP300_MONITOR_ALLOW_UNKNOWN_NETWORK_PRESET",
+        default_value_t = false
+    )]
+    pub allow_unknown_network_preset: bool,
 
     /// Exact protobuf network name expected from `GetChainInfo`.
     #[arg(long, env = "BIP300_MONITOR_EXPECTED_ENFORCER_NETWORK")]
@@ -139,6 +160,25 @@ pub struct Args {
     )]
     pub bmm_request_poll_interval_seconds: u64,
 
+    /// Seconds after the extractor starts during which BMM samples are
+    /// recorded with unknown consistency. The official API exposes no mempool
+    /// readiness, and an enforcer that just restarted reports a partial or
+    /// empty auction that would otherwise look like a healthy observation.
+    #[arg(
+        long,
+        env = "BIP300_MONITOR_BMM_READINESS_GRACE_SECONDS",
+        default_value_t = 120
+    )]
+    pub bmm_readiness_grace_seconds: u64,
+
+    /// Enable independent, resumable confirmed-fee enrichment (phase 2).
+    #[arg(
+        long,
+        env = "BIP300_MONITOR_CONFIRMED_BMM_FEES",
+        default_value_t = false
+    )]
+    pub confirmed_bmm_fees: bool,
+
     /// Maximum time a live event stream may remain silent after the tip moves.
     ///
     /// This is deliberately separate from the unary RPC timeout: historical
@@ -182,6 +222,9 @@ pub struct Args {
 impl Args {
     /// Validate invariants that are not expressible directly through clap.
     pub fn validate(&self) -> Result<()> {
+        if self.node_rpc_endpoint.is_some() != self.node_rpc_cookie_file.is_some() {
+            bail!("node RPC endpoint and cookie file must be configured together");
+        }
         if std::env::var_os("BIP300_MONITOR_BACKFILL_MAX_BLOCKS").is_some() {
             bail!(
                 "BIP300_MONITOR_BACKFILL_MAX_BLOCKS was removed: use \
@@ -243,6 +286,11 @@ impl Args {
         Duration::from_secs(self.bmm_request_poll_interval_seconds)
     }
 
+    /// Return the window during which BMM samples are not trusted as complete.
+    pub const fn bmm_readiness_grace(&self) -> Duration {
+        Duration::from_secs(self.bmm_readiness_grace_seconds)
+    }
+
     /// Return the live event-stream stall timeout.
     pub const fn stream_stall_timeout(&self) -> Duration {
         Duration::from_secs(self.stream_stall_timeout_seconds)
@@ -260,7 +308,7 @@ impl Args {
 
     /// Build the durable dataset/run manifest stored with observations.
     pub fn dataset_manifest(&self) -> DatasetManifest {
-        DatasetManifest {
+        let mut manifest = DatasetManifest {
             network_id: self.network_id.clone(),
             activation_height: self.activation_height,
             activation_block_hash: self.activation_block_hash.clone(),
@@ -276,19 +324,38 @@ impl Args {
                 "extractor_status",
                 "per_worker_health",
                 "resumable_sidechain_history",
-                "resumable_global_bip300_history",
-                "raw_bip300_coinbase_scripts",
-                "resolved_m1_m8_deltas",
-                "treasury_transitions",
                 "live_bmm_bid_snapshots",
-                "mempool_backed_bmm_bid_snapshots",
                 "bip300_description_hash_identity",
-                "stable_parent_bmm_snapshots",
                 "validated_chain_identity",
-                "orphan_run_reconciliation"
+                "orphan_run_reconciliation",
+                "global_mainchain_transitions",
+                "certified_hash_history",
+                "immutable_fact_conflicts",
+                "official_enforcer_api",
+                "tip_matched_snapshots",
+                "bmm_readiness_unknown",
             ]),
-            creation_reason: "pre-Drivechain Pulse L1 observation dataset".to_owned(),
+            creation_reason: "Drivechain Observatory official-source contract 8 dataset".to_owned(),
+        };
+        if self.node_rpc_endpoint.is_some() {
+            manifest
+                .capabilities
+                .as_array_mut()
+                .expect("array")
+                .extend([
+                    serde_json::json!("node_block_evidence"),
+                    serde_json::json!("absolute_chain_work"),
+                    serde_json::json!("resumable_node_history"),
+                ]);
         }
+        if self.confirmed_bmm_fees && self.node_rpc_endpoint.is_some() {
+            manifest
+                .capabilities
+                .as_array_mut()
+                .expect("capability array")
+                .push(serde_json::json!("observed_bmm_confirmed_fees"));
+        }
+        manifest
     }
 }
 
@@ -361,6 +428,7 @@ mod tests {
         assert_eq!(args.log_level, LogLevel::Info);
         assert_eq!(args.request_timeout_seconds, 10);
         assert_eq!(args.bmm_request_poll_interval_seconds, 5);
+        assert_eq!(args.bmm_readiness_grace_seconds, 120);
         assert_eq!(args.stream_stall_timeout_seconds, 60);
         assert_eq!(args.backfill_page_blocks, 128);
         assert_eq!(args.backfill_page_pause_ms, 100);

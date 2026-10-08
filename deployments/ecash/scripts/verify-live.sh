@@ -60,9 +60,20 @@ while :; do
         compose logs --no-color --since "${started_at}" event-logger 2>/dev/null || true
     )"
     all_delivered=true
-    if ! record_has_global_block bip300_block_delta "${live_hash}"; then
+    if ! record_has_global_block mainchain_block "${live_hash}"; then
         all_delivered=false
     fi
+    if ! record_has_live_mainchain_connect "${live_hash}" "${started_at}"; then
+        all_delivered=false
+    fi
+    global_delivered=false
+    while IFS= read -r line; do
+        if [[ "${line}" == *"received enforcer event"* &&
+            "${line}" == *"mainchain_transition"* && "${line}" == *"${live_hash}"* ]]; then
+            global_delivered=true
+        fi
+    done <<<"${logger_logs}"
+    [[ "${global_delivered}" == true ]] || all_delivered=false
     for sidechain in "${sidechains[@]}"; do
         # The record is what has to hold the block. The two log assertions
         # additionally prove the live fan-out path still reaches a consumer.

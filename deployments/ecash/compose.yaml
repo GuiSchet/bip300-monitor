@@ -75,7 +75,7 @@ services:
       - --log-level=INFO
     volumes:
       - type: bind
-        source: ${ECASH_DATA_ROOT:?ECASH_DATA_ROOT must be derived from NETWORK_ID}/enforcer
+        source: ${ECASH_DATA_ROOT:?ECASH_DATA_ROOT must be derived from NETWORK_ID}/enforcer-official-v8
         target: /data
       - type: bind
         source: ${ECASH_DATA_ROOT:?ECASH_DATA_ROOT must be derived from NETWORK_ID}/rpc-cookie
@@ -253,6 +253,10 @@ services:
     user: 10001:${PGID:-1000}
     volumes:
       - type: bind
+        source: ${ECASH_DATA_ROOT:?ECASH_DATA_ROOT must be derived from NETWORK_ID}/secrets/node-observer-auth
+        target: /run/secrets/node-observer-auth
+        read_only: true
+      - type: bind
         source: ${ECASH_DATA_ROOT:?ECASH_DATA_ROOT must be derived from NETWORK_ID}/secrets/postgres-password
         target: /run/secrets/postgres-password
         read_only: true
@@ -263,6 +267,8 @@ services:
       BIP300_MONITOR_POSTGRES_USER: ${POSTGRES_USER:?POSTGRES_USER must be set by VERSIONS.lock}
       BIP300_MONITOR_POSTGRES_PASSWORD_FILE: /run/secrets/postgres-password
       BIP300_MONITOR_ENFORCER_ENDPOINT: http://enforcer:50051
+      BIP300_MONITOR_NODE_RPC_ENDPOINT: http://ecash-node:${ECASH_NODE_RPC_PORT}
+      BIP300_MONITOR_NODE_RPC_COOKIE_FILE: /run/secrets/node-observer-auth
       BIP300_MONITOR_NETWORK_ID: ${NETWORK_ID:?NETWORK_ID must be set by VERSIONS.lock}
       BIP300_MONITOR_ACTIVATION_HEIGHT: ${ECASH_ACTIVATION_HEIGHT:?ECASH_ACTIVATION_HEIGHT must be set by VERSIONS.lock}
       BIP300_MONITOR_ACTIVATION_BLOCK_HASH: ${ECASH_ACTIVATION_BLOCK_HASH:?ECASH_ACTIVATION_BLOCK_HASH must be set by VERSIONS.lock}
@@ -279,6 +285,7 @@ services:
       BIP300_MONITOR_BACKFILL_PAGE_BLOCKS: ${BIP300_MONITOR_BACKFILL_PAGE_BLOCKS:-128}
       BIP300_MONITOR_BACKFILL_PAGE_PAUSE_MS: ${BIP300_MONITOR_BACKFILL_PAGE_PAUSE_MS:-100}
       BIP300_MONITOR_TIP_POLL_INTERVAL_SECONDS: ${BIP300_MONITOR_TIP_POLL_INTERVAL_SECONDS:-30}
+      BIP300_MONITOR_CONFIRMED_BMM_FEES: ${BIP300_MONITOR_CONFIRMED_BMM_FEES:-false}
       BIP300_MONITOR_BMM_REQUEST_POLL_INTERVAL_SECONDS: ${BIP300_MONITOR_BMM_REQUEST_POLL_INTERVAL_SECONDS:-5}
       BIP300_MONITOR_STREAM_STALL_TIMEOUT_SECONDS: ${BIP300_MONITOR_STREAM_STALL_TIMEOUT_SECONDS:-60}
       BIP300_MONITOR_LIVENESS_FILE: /tmp/liveness

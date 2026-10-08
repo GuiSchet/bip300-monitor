@@ -7,7 +7,9 @@ pub mod client;
 pub mod config;
 pub mod convert;
 mod event;
-mod header_backfill;
+mod fees;
+mod mainchain;
+pub mod node;
 pub mod proto;
 pub mod runtime;
 mod snapshot;
@@ -15,6 +17,6 @@ mod state;
 
 pub use client::EnforcerClient;
 pub use config::Args;
-pub use runtime::run;
+pub use node::run;
 pub use shared::logging;
 pub use shared::logging::LogLevel;

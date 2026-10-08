@@ -1,0 +1,10 @@
+[Unit]
+Description=Pull verified HOSTKEY backups while this computer is online
+
+[Timer]
+OnCalendar=hourly
+Persistent=true
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target

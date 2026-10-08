@@ -35,7 +35,7 @@ for directory in \
     "${resolved_data_root}/rpc-cookie" \
     "${resolved_data_root}/secrets" \
     "${resolved_data_root}/postgres" \
-    "${resolved_data_root}/enforcer"; do
+    "${resolved_data_root}/enforcer-official-v8"; do
     if ! mkdir -p -- "${directory}" 2>/dev/null; then
         require_command sudo
         sudo install -d -o "${PUID}" -g "${PGID}" "${directory}"
@@ -70,6 +70,18 @@ if ! chgrp "${PGID}" "${postgres_password_file}" 2>/dev/null; then
     sudo chgrp "${PGID}" "${postgres_password_file}"
 fi
 chmod 0640 "${postgres_password_file}"
+
+# A dedicated RPC user is restricted by the node to observer reads. Never
+# grant the extractor access to the enforcer's unrestricted cookie.
+require_command python3
+python3 "${DEPLOYMENT_ROOT}/scripts/node-observer-auth.py" "${resolved_data_root}/secrets"
+for secret in node-observer-auth node-observer-rpcauth; do
+    if ! chgrp "${PGID}" "${resolved_data_root}/secrets/${secret}" 2>/dev/null; then
+        require_command sudo
+        sudo chgrp "${PGID}" "${resolved_data_root}/secrets/${secret}"
+    fi
+    chmod 0640 "${resolved_data_root}/secrets/${secret}"
+done
 
 # bitcoind reads its configuration once, at startup. Rendering a changed file
 # under a running node would leave the container on the previous settings while

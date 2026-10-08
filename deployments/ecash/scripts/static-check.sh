@@ -9,7 +9,7 @@ load_versions
 export COMPOSE_ENV_FILE="${DEPLOYMENT_ROOT}/.env.example"
 load_deployment_env
 
-for command_name in cmp cp dd diff docker git jq just mktemp od rm shellcheck shfmt stat tr yamllint; do
+for command_name in cmp cp dd diff docker git jq just mktemp od python3 rm shellcheck shfmt stat tr yamllint; do
     require_command "${command_name}"
 done
 
@@ -234,34 +234,29 @@ fi
 if grep -nE 'psql[^|]*--command' "${DEPLOYMENT_ROOT}/scripts/lib.sh"; then
     die "record helpers must pass SQL on stdin so psql interpolates its variables"
 fi
-grep -Fq 'record_event_count_at' "${DEPLOYMENT_ROOT}/scripts/verify.sh" ||
+grep -Fq 'record_current_state_is_usable' "${DEPLOYMENT_ROOT}/scripts/verify.sh" ||
     die "verify.sh does not assert the record; log lines only show live fan-out"
-# An `observed_at` window would read a republished snapshot -- which inserts
-# nothing, by design -- as a missing one.
-if grep -nE '^[^#]*observed_at' "${DEPLOYMENT_ROOT}/scripts/lib.sh"; then
-    die "record assertions must be scoped by block, not by an observed_at window"
-fi
 grep -Fq 'record_has_block' "${DEPLOYMENT_ROOT}/scripts/verify-live.sh" ||
     die "verify-live.sh does not assert that the live block reached the record"
 grep -Fq 'record_block_history_is_complete' "${DEPLOYMENT_ROOT}/scripts/verify.sh" ||
     die "verify.sh does not assert complete block history"
-grep -Fq 'record_bip300_history_is_complete' "${DEPLOYMENT_ROOT}/scripts/verify.sh" ||
+grep -Fq 'record_node_history_is_complete' "${DEPLOYMENT_ROOT}/scripts/verify.sh" ||
     die "verify.sh does not assert complete global BIP300 history"
 grep -Fq 'record_current_run_has_bmm_observation' "${DEPLOYMENT_ROOT}/scripts/verify.sh" ||
     die "verify.sh does not assert a successful BMM request poll"
-grep -Fq 'record_current_run_has_stable_bmm_observation' "${DEPLOYMENT_ROOT}/scripts/verify.sh" ||
-    die "verify.sh does not assert a stable-parent BMM request poll"
+grep -Fq 'record_current_run_has_tip_matched_bmm_observation' "${DEPLOYMENT_ROOT}/scripts/verify.sh" ||
+    die "verify.sh does not assert a tip-matched BMM request poll"
 grep -Fq 'record_has_single_running_enforcer' "${DEPLOYMENT_ROOT}/scripts/verify.sh" ||
     die "verify.sh does not assert a single active extractor run"
 grep -Fq 'record_current_workers_are_healthy' "${DEPLOYMENT_ROOT}/scripts/verify.sh" ||
     die "verify.sh does not assert per-worker extractor health"
-grep -Fq 'mempool_backed_bmm_bid_snapshots' "${DEPLOYMENT_ROOT}/scripts/accept.sh" ||
+grep -Fq 'live_bmm_bid_snapshots' "${DEPLOYMENT_ROOT}/scripts/accept.sh" ||
     die "accept.sh does not require mempool-backed BMM capability"
 grep -Fq 'bmm_mempool_tracking_enabled=true' "${DEPLOYMENT_ROOT}/scripts/accept.sh" ||
     die "accept.sh does not record the verified BMM mempool mode"
-grep -Fq 'bmm_stable_parent_verified=true' "${DEPLOYMENT_ROOT}/scripts/accept.sh" ||
-    die "accept.sh does not record stable-parent BMM verification"
-grep -Fq 'confirmed_bmm_fee_available=false' "${DEPLOYMENT_ROOT}/scripts/accept.sh" ||
+grep -Fq 'bmm_tip_matched_verified=true' "${DEPLOYMENT_ROOT}/scripts/accept.sh" ||
+    die "accept.sh does not record tip-matched BMM verification"
+grep -Fq 'confirmed_bmm_fee_coverage=observed_bids_only' "${DEPLOYMENT_ROOT}/scripts/accept.sh" ||
     die "accept.sh does not record the confirmed M8 fee limitation"
 grep -Fq 'enforcer_upstream_reviewed_commit=' "${DEPLOYMENT_ROOT}/scripts/accept.sh" ||
     die "accept.sh does not preserve the reviewed upstream enforcer provenance"
@@ -273,18 +268,18 @@ grep -Fq 'history_fully_validated' "${DEPLOYMENT_ROOT}/scripts/accept.sh" ||
     die "accept.sh does not distinguish snapshot readiness from full historical validation"
 grep -Fq 'snapshot_transform' "${DEPLOYMENT_ROOT}/scripts/accept.sh" ||
     die "accept.sh does not record snapshot provenance"
-grep -Fq 'event.dataset_id = coverage.dataset_id' "${DEPLOYMENT_ROOT}/scripts/lib.sh" ||
+grep -Fq '(e.dataset_id,e.event_contract_version,e.source)=(c.dataset_id,c.event_contract_version,c.source)' "${DEPLOYMENT_ROOT}/scripts/lib.sh" ||
     die "history verification can alias facts from another dataset"
-grep -Fq 'event.event_contract_version = coverage.event_contract_version' \
+grep -Fq 'r.event_contract_version=:' \
     "${DEPLOYMENT_ROOT}/scripts/lib.sh" ||
     die "history verification can alias facts from another event contract"
-grep -Fq 'current_sidechain_instance current_instance' \
+grep -Fq 'current_sidechain_instance i' \
     "${DEPLOYMENT_ROOT}/scripts/lib.sh" ||
     die "slot-history verification is not scoped to the active instance"
-grep -Fq 'record_has_global_block bip300_block_delta' \
+grep -Fq 'record_has_global_block mainchain_block' \
     "${DEPLOYMENT_ROOT}/scripts/verify-live.sh" ||
-    die "verify-live.sh does not assert the live global BIP300 delta"
-for valid_kind in chain_tip bip300_block_delta; do
+    die "verify-live.sh does not assert the live global mainchain block"
+for valid_kind in chain_tip mainchain_transition; do
     valid_event_kind "${valid_kind}" ||
         die "event kind validation rejected ${valid_kind}"
 done
@@ -293,13 +288,15 @@ for invalid_kind in '' 3bip300_delta BIP300_delta bip300-delta 'bip300 delta'; d
         die "event kind validation accepted invalid value: ${invalid_kind}"
     fi
 done
-grep -Fq 'compose stop enforcer-extractor postgres' \
-    "${DEPLOYMENT_ROOT}/scripts/reset-record.sh" ||
+grep -Fq 'compose stop enforcer-extractor' \
+    "${DEPLOYMENT_ROOT}/scripts/backup-record.sh" ||
     die "reset-record.sh no longer preserves the node and enforcer services"
 if grep -nE 'rm .*(node|enforcer|postgres)' \
     "${DEPLOYMENT_ROOT}/scripts/reset-record.sh"; then
     die "reset-record.sh must move recoverable data rather than delete it"
 fi
+
+python3 "${DEPLOYMENT_ROOT}/scripts/test-backup-cutover.py"
 
 sidechain_fixture='{"sidechains":[]}'
 enforcer_rpc() {
@@ -623,7 +620,10 @@ for expected_arg in \
         <<<"${config_json}" >/dev/null
 done
 
+BIP300_NODE_OBSERVER_AUTH_CONFIG_FILE="${rendered_node_config}.observer-auth"
+printf 'rpcauth=bip300_observer:test$%064d\n' 0 >"${BIP300_NODE_OBSERVER_AUTH_CONFIG_FILE}"
 render_node_config "${rendered_node_config}"
+rm -- "${BIP300_NODE_OBSERVER_AUTH_CONFIG_FILE}"
 grep -Fxq '# Locked network values. Generated by scripts/init.sh.' \
     "${rendered_node_config}"
 grep -Fxq "# network_id=${NETWORK_ID} magic=${ECASH_NETWORK_MAGIC}" \
@@ -637,6 +637,8 @@ fi
 grep -Fxq "port=${ECASH_NODE_P2P_PORT}" "${rendered_node_config}"
 grep -Fxq "rpcport=${ECASH_NODE_RPC_PORT}" "${rendered_node_config}"
 grep -Fxq 'rpcallowip=172.30.0.0/24' "${rendered_node_config}"
+grep -Fxq 'rpcwhitelist=bip300_observer:getblockchaininfo,getblockhash,getblockheader,getblock' "${rendered_node_config}"
+grep -Fxq 'rpcwhitelistdefault=0' "${rendered_node_config}"
 grep -Fxq 'rpccookiefile=/rpc-cookie/.cookie' "${rendered_node_config}"
 grep -Fxq "zmqpubsequence=tcp://0.0.0.0:${ECASH_NODE_ZMQ_PORT}" \
     "${rendered_node_config}"
@@ -660,7 +662,7 @@ actual_peer_count="$(grep -c '^addnode=' "${rendered_node_config}")"
 [[ "${ECASH_NODE_COMMIT}" =~ ^[[:xdigit:]]{40}$ ]]
 [[ "${ENFORCER_COMMIT}" =~ ^[[:xdigit:]]{40}$ ]]
 [[ "${ENFORCER_UPSTREAM_REVIEWED_COMMIT}" =~ ^[[:xdigit:]]{40}$ ]]
-[[ "${ENFORCER_COMMIT}" == "${ENFORCER_OBSERVER_COMMIT}" ]]
+[[ "${ENFORCER_COMMIT}" == "${ENFORCER_UPSTREAM_REVIEWED_COMMIT}" ]]
 [[ "${MONITOR_EVENT_CONTRACT_VERSION}" =~ ^[0-9]+$ ]]
 [[ "${MONITOR_IMAGE_COMMIT}" =~ ^[[:xdigit:]]{40}$ ]]
 [[ "${ECASH_NODE_IMAGE}" == *":${ECASH_NODE_BRANCH}@sha256:"* ]]

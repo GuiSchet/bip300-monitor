@@ -65,26 +65,17 @@ while :; do
 
     snapshot_complete=true
 
-    # The record is the authoritative check, asked about the block the snapshot
-    # is anchored to rather than about a time window. Recording is idempotent, so
-    # a restart at an unchanged tip inserts nothing, and a window would read that
-    # healthy state as a missing snapshot. The block is the stricter scope
-    # anyway, because a previous run's rows are at a previous block. Which
-    # instance published is a separate question, already answered above by the
-    # log window.
-    snapshot_anchor=''
+    # Verify the current run observation group rather than event.height.
+    snapshot_group=''
     if [[ "${snapshot_complete}" == true ]]; then
-        snapshot_anchor="$(record_snapshot_anchor)" || snapshot_anchor=''
-        if [[ ! "${snapshot_anchor}" =~ ^[[:xdigit:]]{64}$ ]]; then
+        snapshot_group="$(record_snapshot_group)" || snapshot_group=''
+        if [[ ! "${snapshot_group}" =~ ^[[:xdigit:]-]{36}$ ]]; then
             snapshot_complete=false
         fi
     fi
-    # Exactly one, not at least one: a second row at the same block would mean
-    # the identity constraint stopped collapsing a republished snapshot, which is
-    # the shape of unbounded growth rather than of a missing event.
     if [[ "${snapshot_complete}" == true ]]; then
-        for event_kind in chain_info chain_tip sidechain_proposals active_sidechains; do
-            if [[ "$(record_event_count_at "${event_kind}" "${snapshot_anchor}")" != 1 ]]; then
+        for event_kind in sidechain_proposals active_sidechains; do
+            if ! record_current_state_is_usable "${event_kind}"; then
                 snapshot_complete=false
                 break
             fi
@@ -93,7 +84,7 @@ while :; do
     declare -a snapshot_sidechains=()
     if [[ "${snapshot_complete}" == true ]]; then
         snapshot_activations="$(
-            record_snapshot_sidechain_activations "${snapshot_anchor}"
+            record_snapshot_sidechain_activations "${snapshot_group}"
         )" || snapshot_complete=false
         if [[ "${snapshot_complete}" == true ]]; then
             while read -r sidechain activation_height; do
@@ -115,9 +106,8 @@ while :; do
     fi
     if [[ "${snapshot_complete}" == true ]]; then
         for sidechain in "${snapshot_sidechains[@]}"; do
-            if [[ "$(record_event_count_at ctip "${snapshot_anchor}" "${sidechain}")" != 1 ]] ||
-                [[ "$(record_event_count_at withdrawal_bundle_proposals \
-                    "${snapshot_anchor}" "${sidechain}")" != 1 ]]; then
+            if ! record_current_state_is_usable ctip "${sidechain}" ||
+                ! record_current_state_is_usable withdrawal_bundle_proposals "${sidechain}"; then
                 snapshot_complete=false
                 break
             fi
@@ -150,7 +140,7 @@ while :; do
             "${logger_started_before}" != "${extractor_started_before}" ]]; then
             die "event-logger started after enforcer-extractor, so it never received the initial snapshot and Core NATS cannot replay it; restart the enforcer-extractor container to republish, then run 'just verify' again"
         fi
-        die "current monitor instances did not record one complete semantic snapshot after ${wait_seconds}s"
+        die "current monitor instances did not record one complete observation window after ${wait_seconds}s"
     fi
     sleep 2
 done
@@ -168,26 +158,34 @@ event_contract_version="$(record_current_event_contract_version)"
 run_capabilities="$(record_current_run_capabilities)"
 jq -e '
     index("live_bmm_bid_snapshots") != null
-    and index("mempool_backed_bmm_bid_snapshots") != null
+    and index("bmm_readiness_unknown") != null
+    and index("official_enforcer_api") != null
+    and index("node_block_evidence") != null
     and index("per_worker_health") != null
 ' <<<"${run_capabilities}" >/dev/null ||
-    die "the current extractor run does not declare mempool-backed BMM and per-worker health"
+    die "the current extractor run does not declare observed BMM and per-worker health"
 if ((MONITOR_EVENT_CONTRACT_VERSION >= 6)); then
     jq -e '
         index("bip300_description_hash_identity") != null
-        and index("stable_parent_bmm_snapshots") != null
+        and index("tip_matched_snapshots") != null
         and index("validated_chain_identity") != null
         and index("orphan_run_reconciliation") != null
     ' <<<"${run_capabilities}" >/dev/null ||
         die "the current extractor run does not declare the contract-v6 correctness capabilities"
-    record_current_run_has_stable_bmm_observation ||
-        die "the current extractor run has no stable-parent BMM observation"
+    # Samples in the readiness grace after start are recorded as unknown.
+    bmm_wait_seconds="${BMM_READINESS_WAIT_SECONDS:-180}"
+    bmm_deadline="$((SECONDS + bmm_wait_seconds))"
+    until record_current_run_has_tip_matched_bmm_observation; do
+        ((SECONDS < bmm_deadline)) ||
+            die "the current extractor run has no tip-matched BMM observation after ${bmm_wait_seconds}s"
+        sleep 2
+    done
 fi
 record_has_single_running_enforcer ||
     die "the current dataset does not have exactly one running enforcer extractor"
 worker_wait_seconds="${WORKER_HEALTH_WAIT_SECONDS:-60}"
 worker_deadline="$((SECONDS + worker_wait_seconds))"
-until record_current_workers_are_healthy; do
+until record_current_workers_are_healthy && record_node_worker_is_healthy; do
     ((SECONDS < worker_deadline)) || {
         worker_status="$(record_current_worker_status_json 2>/dev/null || printf 'unavailable')"
         die "extractor workers were not healthy after ${worker_wait_seconds}s; status=${worker_status}"
@@ -195,14 +193,14 @@ until record_current_workers_are_healthy; do
     sleep 1
 done
 
-snapshot_height="$(record_snapshot_height)"
+snapshot_height="$(record_snapshot_height "${snapshot_group}")"
 [[ "${snapshot_height}" =~ ^[0-9]+$ ]] ||
-    die "the recorded semantic snapshot has no valid height"
+    die "the recorded observation window has no valid height"
 history_wait_seconds="${HISTORY_WAIT_SECONDS:-43200}"
 history_deadline="$((SECONDS + history_wait_seconds))"
 while :; do
     history_complete=true
-    if ! record_bip300_history_is_complete \
+    if ! record_node_history_is_complete \
         "${ECASH_ACTIVATION_HEIGHT}" "${snapshot_height}"; then
         history_complete=false
     fi
@@ -227,4 +225,4 @@ final_active_activations="$(active_sidechain_activations)"
 [[ "${final_active_activations}" == "${active_activations}" ]] ||
     die "the active sidechain set changed during verification; run 'just verify' again so the new slot is included"
 
-info "${NETWORK_ID} observation pipeline verification passed (contract=v${event_contract_version}, mempool-backed BMM polling live, workers healthy, snapshot live, global BIP300 and slot histories complete, slots=${observed_sidechains:-none})"
+info "${NETWORK_ID} observation pipeline verification passed (contract=v${event_contract_version}, observed BMM polling live, workers healthy, snapshot live, node block and official slot histories complete, slots=${observed_sidechains:-none})"

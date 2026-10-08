@@ -6,6 +6,7 @@ set -euo pipefail
 source "$(dirname -- "${BASH_SOURCE[0]}")/lib.sh"
 
 load_versions
+require_ready_release
 load_deployment_env
 require_command docker
 require_command jq

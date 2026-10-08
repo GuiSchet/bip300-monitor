@@ -26,7 +26,6 @@ use tonic::{Status, Streaming};
 use crate::backfill;
 use crate::config::Args;
 use crate::event::envelope;
-use crate::header_backfill;
 use crate::proto::mainchain;
 use crate::snapshot::{self, InitialSnapshot, record_snapshot};
 use crate::state;
@@ -107,6 +106,10 @@ trait TipSource: Send {
 
 /// Source used to bracket one BMM auction response with exact tip reads.
 trait BmmSource: Send {
+    fn revision(&mut self) -> SourceFuture<'_, Option<String>> {
+        Box::pin(async { Ok(None) })
+    }
+
     fn current_tip(&mut self) -> SourceFuture<'_, ObservedBlock>;
     fn bmm_requests(
         &mut self,
@@ -115,6 +118,10 @@ trait BmmSource: Send {
 }
 
 impl BmmSource for EnforcerClient {
+    fn revision(&mut self) -> SourceFuture<'_, Option<String>> {
+        Box::pin(async { Ok(None) })
+    }
+
     fn current_tip(&mut self) -> SourceFuture<'_, ObservedBlock> {
         Box::pin(snapshot::current_tip(self))
     }
@@ -153,6 +160,7 @@ impl StateSource for EnforcerClient {
 }
 
 struct PreparedStartup {
+    mainchain_stream: EventStream,
     recorder: Recorder,
     client: EnforcerClient,
     /// Desired slots: either explicitly configured (including currently inactive
@@ -179,7 +187,6 @@ struct BackfillRequest {
 pub async fn run(args: Args, mut shutdown_rx: watch::Receiver<bool>) -> Result<()> {
     args.validate()
         .context("validating extractor configuration")?;
-    let activation_block_hash = args.activation_block_hash_bytes()?;
 
     let startup = prepare_startup(&args);
     tokio::pin!(startup);
@@ -193,6 +200,7 @@ pub async fn run(args: Args, mut shutdown_rx: watch::Receiver<bool>) -> Result<(
     };
 
     let PreparedStartup {
+        mainchain_stream,
         recorder,
         client,
         sidechains,
@@ -262,9 +270,18 @@ pub async fn run(args: Args, mut shutdown_rx: watch::Receiver<bool>) -> Result<(
                 })
                 .expect("at most 256 sidechain slots fit in the initial backfill queue");
         }
-        let tracker = state::Tracker::new(snapshot.state);
+        let tracker =
+            state::Tracker::new(snapshot.state).with_consistency(snapshot_metadata.consistency);
 
         let mut workers = JoinSet::new();
+        workers.spawn(crate::mainchain::monitor(
+            client.clone(),
+            mainchain_stream,
+            recorder.clone(),
+            block_tx.clone(),
+            tip_tx.clone(),
+            shutdown_rx.clone(),
+        ));
         workers.spawn(monitor_sidechains(
             streams,
             instances,
@@ -293,6 +310,7 @@ pub async fn run(args: Args, mut shutdown_rx: watch::Receiver<bool>) -> Result<(
             client.clone(),
             recorder.clone(),
             args.bmm_request_poll_interval(),
+            args.bmm_readiness_grace(),
             tip_rx.clone(),
             shutdown_rx.clone(),
         ));
@@ -305,20 +323,6 @@ pub async fn run(args: Args, mut shutdown_rx: watch::Receiver<bool>) -> Result<(
             snapshot_block,
             block_rx,
             sidechain_state_tx,
-            shutdown_rx.clone(),
-        ));
-        workers.spawn(backfill_bip300_history(
-            client.clone(),
-            recorder.clone(),
-            args.activation_height,
-            activation_block_hash,
-            snapshot.anchor.clone(),
-            backfill::Settings {
-                page_blocks: args.backfill_page_blocks,
-                page_pause: args.backfill_page_pause(),
-            },
-            args.tip_poll_interval(),
-            tip_rx.clone(),
             shutdown_rx.clone(),
         ));
         // Live workers are installed before this task. Historical pages are small,
@@ -361,101 +365,6 @@ pub async fn run(args: Args, mut shutdown_rx: watch::Receiver<bool>) -> Result<(
                 );
             }
             Err(error)
-        }
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn backfill_bip300_history(
-    mut client: EnforcerClient,
-    recorder: Recorder,
-    activation_height: u32,
-    activation_block_hash: Option<Vec<u8>>,
-    mut target: ObservedBlock,
-    settings: backfill::Settings,
-    retry_interval: Duration,
-    mut tip_rx: watch::Receiver<ObservedBlock>,
-    mut shutdown_rx: watch::Receiver<bool>,
-) -> Result<()> {
-    tracing::info!(activation_height, "started global BIP300 history worker");
-    loop {
-        let requested_target = target.clone();
-        match header_backfill::run(
-            &mut client,
-            &recorder,
-            activation_height,
-            activation_block_hash.as_deref(),
-            &target,
-            settings,
-            shutdown_rx.clone(),
-        )
-        .await?
-        {
-            header_backfill::Outcome::Interrupted { .. } => return Ok(()),
-            header_backfill::Outcome::Superseded { .. } => {
-                bail!("global BIP300 history was unexpectedly superseded")
-            }
-            header_backfill::Outcome::Deferred {
-                target: deferred_target,
-                ..
-            } => {
-                target = deferred_target;
-                tokio::select! {
-                    biased;
-                    () = wait_for_shutdown(&mut shutdown_rx) => return Ok(()),
-                    () = tokio::time::sleep(retry_interval) => {}
-                }
-            }
-            header_backfill::Outcome::UpToDate {
-                target: reached_target,
-            }
-            | header_backfill::Outcome::Completed {
-                target: reached_target,
-                ..
-            } => {
-                if reached_target.hash != requested_target.hash {
-                    tracing::info!(
-                        reached_target = %hex::encode(&reached_target.hash),
-                        requested_target = %hex::encode(&requested_target.hash),
-                        "completed the persisted global-history target; reconciling from the reached branch"
-                    );
-                }
-                target = reached_target;
-                let current_tip = match snapshot::current_tip(&mut client).await {
-                    Ok(current_tip) => current_tip,
-                    Err(error) if backfill::retryable_rpc_error(&error) => {
-                        tracing::warn!(
-                            retry_seconds = retry_interval.as_secs(),
-                            error = %format!("{error:#}"),
-                            "could not reconcile global BIP300 history with the tip; retrying"
-                        );
-                        tokio::select! {
-                            biased;
-                            () = wait_for_shutdown(&mut shutdown_rx) => return Ok(()),
-                            () = tokio::time::sleep(retry_interval) => {}
-                        }
-                        continue;
-                    }
-                    Err(error) => {
-                        return Err(error)
-                            .context("reconciling global BIP300 history with the tip");
-                    }
-                };
-                if current_tip.hash != target.hash {
-                    target = current_tip;
-                    continue;
-                }
-                tokio::select! {
-                    biased;
-                    () = wait_for_shutdown(&mut shutdown_rx) => return Ok(()),
-                    changed = tip_rx.changed() => {
-                        if changed.is_err() {
-                            return Ok(());
-                        }
-                        target = tip_rx.borrow_and_update().clone();
-                    }
-                }
-            }
         }
     }
 }
@@ -590,6 +499,21 @@ async fn backfill_sidechains(
                 }
                 backfill::Outcome::Superseded { .. } => {
                     activations.remove(&sidechain);
+                    break;
+                }
+                backfill::Outcome::Quarantined { .. } => {
+                    tracing::error!(
+                        sidechain,
+                        "block history is quarantined by conflicting immutable facts; \
+                         live capture continues"
+                    );
+                    recorder
+                        .record_worker_failure(
+                            ExtractorWorker::BlockHistory,
+                            &format!("slot {sidechain}: {}", shared::store::HISTORY_CONFLICT),
+                            1,
+                        )
+                        .await?;
                     break;
                 }
                 backfill::Outcome::Deferred {
@@ -788,14 +712,21 @@ async fn prepare_startup(args: &Args) -> Result<PreparedStartup> {
         .await
         .context("connecting the enforcer client")?;
 
+    let mainchain_stream = client.subscribe_events(0).await?;
+    let revision_before = None;
     let (sidechains, observation) = prepare_stable_observation(&mut client, &args.sidechains)
         .await
         .context("preparing enforcer subscriptions and initial snapshot")?;
     let PreparedObservation {
         streams,
         snapshot,
-        snapshot_metadata,
+        mut snapshot_metadata,
     } = observation;
+    snapshot_metadata.revision_before = revision_before;
+    snapshot_metadata.revision_after = None;
+    if snapshot_metadata.revision_before != snapshot_metadata.revision_after {
+        snapshot_metadata.consistency = SnapshotConsistency::Changed;
+    }
     validate_chain_identity(args, &snapshot).context("validating the enforcer chain identity")?;
     // Opening the recorder creates an extractor_run. Do it only after every
     // fallible, read-only startup probe has succeeded so a failed connection or
@@ -811,11 +742,17 @@ async fn prepare_startup(args: &Args) -> Result<PreparedStartup> {
     .await
     .context("connecting the event recorder")?;
     recorder
-        .initialize_worker_statuses(&[ExtractorWorker::MainchainTip, ExtractorWorker::BmmRequests])
+        .initialize_worker_statuses(&[
+            ExtractorWorker::MainchainTip,
+            ExtractorWorker::BmmRequests,
+            ExtractorWorker::MainchainEvents,
+            ExtractorWorker::EnforcerState,
+        ])
         .await
         .context("initializing extractor worker status")?;
 
     Ok(PreparedStartup {
+        mainchain_stream,
         recorder,
         client,
         sidechains,
@@ -823,6 +760,40 @@ async fn prepare_startup(args: &Args) -> Result<PreparedStartup> {
         snapshot,
         snapshot_metadata,
     })
+}
+
+/// BIP300 parameters the official enforcer reports for one network preset
+/// (`lib/types.rs` at the pinned enforcer commit), keyed by `network_id`.
+struct NetworkPreset {
+    network_id: &'static str,
+    activation_height: u32,
+    /// Withdrawal max age and inclusion threshold, then used-slot and
+    /// unused-slot proposal max age and activation threshold.
+    thresholds: [u32; 6],
+}
+
+const NETWORK_PRESETS: &[NetworkPreset] = &[
+    NetworkPreset {
+        network_id: "betanet",
+        activation_height: 967_680,
+        thresholds: [26_300, 13_150, 26_300, 13_150, 2_016, 1_008],
+    },
+    NetworkPreset {
+        network_id: "alphanet",
+        activation_height: 963_648,
+        thresholds: [144, 72, 144, 72, 36, 30],
+    },
+];
+
+fn reported_thresholds(constants: &events::Bip300Constants) -> [u32; 6] {
+    [
+        constants.withdrawal_bundle_max_age,
+        constants.withdrawal_bundle_inclusion_threshold,
+        constants.used_sidechain_slot_proposal_max_age,
+        constants.used_sidechain_slot_activation_threshold,
+        constants.unused_sidechain_slot_proposal_max_age,
+        constants.unused_sidechain_slot_activation_threshold,
+    ]
 }
 
 fn validate_chain_identity(args: &Args, snapshot: &InitialSnapshot) -> Result<()> {
@@ -855,6 +826,39 @@ fn validate_chain_identity(args: &Args, snapshot: &InitialSnapshot) -> Result<()
             );
             bail!("enforcer network is {actual}, expected {expected_name}");
         }
+    }
+    match NETWORK_PRESETS
+        .iter()
+        .find(|preset| preset.network_id == args.network_id)
+    {
+        Some(preset) => {
+            if preset.activation_height != args.activation_height {
+                bail!(
+                    "network {} activates at {}, but this dataset is locked to {}",
+                    preset.network_id,
+                    preset.activation_height,
+                    args.activation_height
+                );
+            }
+            let reported = reported_thresholds(constants);
+            if reported != preset.thresholds {
+                bail!(
+                    "enforcer BIP300 thresholds {reported:?} are not the {} preset {:?}; \
+                     the enforcer is probably running another network preset",
+                    preset.network_id,
+                    preset.thresholds
+                );
+            }
+        }
+        // Production datasets name their network explicitly (`validate_identity`).
+        None if args.expected_enforcer_network.is_some() && !args.allow_unknown_network_preset => {
+            bail!(
+                "network {} has no known enforcer preset to verify; \
+                 set BIP300_MONITOR_ALLOW_UNKNOWN_NETWORK_PRESET to accept it unverified",
+                args.network_id
+            );
+        }
+        None => {}
     }
     Ok(())
 }
@@ -919,14 +923,16 @@ where
             &snapshot.anchor.hash,
             &tip_after.hash,
         ) {
-            SnapshotConsistency::Stable
+            SnapshotConsistency::TipMatched
         } else {
             SnapshotConsistency::Changed
         };
-        if consistency == SnapshotConsistency::Stable || attempts == SNAPSHOT_MAX_ATTEMPTS {
+        if consistency == SnapshotConsistency::TipMatched || attempts == SNAPSHOT_MAX_ATTEMPTS {
             return Ok((
                 snapshot,
                 SnapshotMetadata {
+                    revision_before: None,
+                    revision_after: None,
                     started_at,
                     finished_at: SystemTime::now(),
                     tip_before,
@@ -1384,6 +1390,7 @@ async fn monitor_bmm_requests(
     mut client: EnforcerClient,
     recorder: Recorder,
     interval: Duration,
+    readiness_grace: Duration,
     mut tip_rx: watch::Receiver<ObservedBlock>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> Result<()> {
@@ -1394,9 +1401,12 @@ async fn monitor_bmm_requests(
         "started live BMM request worker"
     );
     let mut consecutive_failures = 0_u32;
+    let ready_at = std::time::Instant::now() + readiness_grace;
     loop {
         match collect_bmm_sample(&mut client, SNAPSHOT_MAX_ATTEMPTS).await {
-            Ok((payload, metadata)) => {
+            Ok((payload, mut metadata)) => {
+                metadata.consistency =
+                    bmm_consistency(metadata.consistency, std::time::Instant::now(), ready_at);
                 let event = envelope(payload, metadata.tip_before.clone())?;
                 recorder
                     .record_snapshot_batch(vec![event], CaptureMethod::Poll, &metadata)
@@ -1458,12 +1468,28 @@ async fn monitor_bmm_requests(
     }
 }
 
+/// A sample taken before the readiness window ends may describe a mempool the
+/// enforcer is still reloading. It is kept as evidence, but never as a complete
+/// auction.
+fn bmm_consistency(
+    sampled: SnapshotConsistency,
+    now: std::time::Instant,
+    ready_at: std::time::Instant,
+) -> SnapshotConsistency {
+    if now < ready_at && sampled == SnapshotConsistency::TipMatched {
+        SnapshotConsistency::Unknown
+    } else {
+        sampled
+    }
+}
+
 async fn collect_bmm_sample<S: BmmSource>(
     source: &mut S,
     max_attempts: u32,
 ) -> Result<(events::EnforcerEvent, SnapshotMetadata)> {
     let started_at = SystemTime::now();
     for attempts in 1..=max_attempts {
+        let revision_before = source.revision().await?;
         let tip_before = source
             .current_tip()
             .await
@@ -1476,17 +1502,20 @@ async fn collect_bmm_sample<S: BmmSource>(
             .current_tip()
             .await
             .context("reading the mainchain tip after sampling BMM requests")?;
-        if tip_before.hash == tip_after.hash {
+        let revision_after = source.revision().await?;
+        if tip_before.hash == tip_after.hash && revision_before == revision_after {
             let payload = convert::bmm_requests(tip_before.hash.clone(), response)
                 .context("converting live BMM requests")?;
             return Ok((
                 payload,
                 SnapshotMetadata {
+                    revision_before,
+                    revision_after,
                     started_at,
                     finished_at: SystemTime::now(),
                     tip_before,
                     tip_after,
-                    consistency: SnapshotConsistency::Stable,
+                    consistency: SnapshotConsistency::TipMatched,
                     attempts,
                 },
             ));
@@ -1587,6 +1616,11 @@ async fn monitor_state(
     shutdown_rx: watch::Receiver<bool>,
 ) -> Result<()> {
     tracing::info!("started enforcer state worker");
+    let health_recorder = recorder.clone();
+    // The startup snapshot this worker continues from was a successful read.
+    recorder
+        .record_worker_success(ExtractorWorker::EnforcerState)
+        .await?;
 
     refresh_on_new_blocks(
         client,
@@ -1597,16 +1631,15 @@ async fn monitor_state(
         block_rx,
         shutdown_rx,
         move |anchor: ObservedBlock,
-              payloads: Vec<events::EnforcerEvent>,
+              publication: state::Publication,
               metadata: SnapshotMetadata| {
             let recorder = recorder.clone();
             let sidechain_state_tx = sidechain_state_tx.clone();
             async move {
-                let published = payloads.len();
-                let active_sidechains_changed = payloads
-                    .iter()
-                    .any(|payload| state::active_instances(payload).is_some());
-                let events = payloads
+                let published = publication.payloads.len();
+                let active_sidechains_changed = publication.active_sidechains_changed();
+                let events = publication
+                    .payloads
                     .into_iter()
                     .map(|payload| {
                         log_state_event(&payload);
@@ -1617,13 +1650,34 @@ async fn monitor_state(
                     .record_snapshot_batch(events, CaptureMethod::Poll, &metadata)
                     .await
                     .context("recording refreshed enforcer state")?;
-                if active_sidechains_changed {
+                if active_sidechains_changed
+                    && metadata.consistency == SnapshotConsistency::TipMatched
+                {
                     sidechain_state_tx.send_modify(|version| {
                         *version = version.wrapping_add(1);
                     });
                 }
                 tracing::info!(published, "published refreshed enforcer state");
                 Ok(())
+            }
+        },
+        |failure: Option<String>| {
+            let recorder = health_recorder.clone();
+            async move {
+                match failure {
+                    Some(error) => {
+                        tracing::warn!(%error, "enforcer state read failed; retrying");
+                        recorder
+                            .record_worker_failure(ExtractorWorker::EnforcerState, &error, 1)
+                            .await
+                            .map(|_| ())
+                    }
+                    None => {
+                        recorder
+                            .record_worker_success(ExtractorWorker::EnforcerState)
+                            .await
+                    }
+                }
             }
         },
     )
@@ -1634,7 +1688,7 @@ async fn monitor_state(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn refresh_on_new_blocks<S, P, F>(
+async fn refresh_on_new_blocks<S, P, F, H, G>(
     mut source: S,
     sidechains: Vec<u8>,
     discover_new_slots: bool,
@@ -1643,11 +1697,15 @@ async fn refresh_on_new_blocks<S, P, F>(
     mut block_rx: watch::Receiver<Vec<u8>>,
     mut shutdown_rx: watch::Receiver<bool>,
     mut publish: P,
+    mut health: H,
 ) -> Result<()>
 where
     S: StateSource,
-    P: FnMut(ObservedBlock, Vec<events::EnforcerEvent>, SnapshotMetadata) -> F,
+    P: FnMut(ObservedBlock, state::Publication, SnapshotMetadata) -> F,
     F: Future<Output = Result<()>>,
+    // `Some(error)` for a failed read, `None` for a successful one.
+    H: FnMut(Option<String>) -> G,
+    G: Future<Output = Result<()>>,
 {
     // The block the initial snapshot describes. It is taken as an argument
     // rather than read from the channel because a slot worker can report a newer
@@ -1656,11 +1714,15 @@ where
     // block a slot worker last published an event for, which during a reorg is
     // the disconnected block rather than a tip.
     let mut refreshed_at = snapshot_block;
+    // A failed read is recorded and retried; the official API failing for a
+    // moment must not end every other worker of the extractor.
+    let mut read_failed = false;
 
     loop {
         tokio::select! {
             biased;
             () = wait_for_shutdown(&mut shutdown_rx) => return Ok(()),
+            () = tokio::time::sleep(Duration::from_secs(30)), if tracker.needs_retry() || read_failed => {},
             result = block_rx.changed() => {
                 if result.is_err() {
                     // Nothing holds a sender any more, so no further tip change
@@ -1675,31 +1737,37 @@ where
         let block = block_rx.borrow_and_update().clone();
         // Each configured slot reports the same mainchain block, and startup can
         // replay the snapshot tip. Only the first report of a block refreshes.
-        if block == refreshed_at {
+        if block == refreshed_at && !tracker.needs_retry() && !read_failed {
             continue;
         }
 
-        // A failed refresh is fatal for the same reason a failed publication is:
-        // silently skipping it would leave a gap that looks like "nothing
-        // changed". The deployment restarts the extractor, which republishes the
-        // whole snapshot.
-        let reading = source
-            .collect_state(&sidechains, discover_new_slots)
-            .await
-            .with_context(|| {
-                format!("refreshing enforcer state at block {}", hex::encode(&block))
-            })?;
-        refreshed_at = block;
-
-        let metadata = reading.metadata;
-        let anchor = reading.anchor;
-        let changed = tracker.take_changed(reading.payloads)?;
-        if changed.is_empty() {
-            continue;
+        for attempt in 1..=SNAPSHOT_MAX_ATTEMPTS {
+            let reading = match source
+                .collect_state(&sidechains, discover_new_slots)
+                .await
+                .with_context(|| {
+                    format!("refreshing enforcer state at block {}", hex::encode(&block))
+                }) {
+                Ok(reading) => reading,
+                Err(error) => {
+                    read_failed = true;
+                    health(Some(format!("{error:#}"))).await?;
+                    break;
+                }
+            };
+            read_failed = false;
+            health(None).await?;
+            refreshed_at = block.clone();
+            let mut metadata = reading.metadata;
+            metadata.attempts = attempt;
+            let publication = tracker.take_observation(reading.payloads, metadata.consistency)?;
+            publish(reading.anchor, publication, metadata)
+                .await
+                .context("publishing refreshed enforcer state")?;
+            if !tracker.needs_retry() {
+                break;
+            }
         }
-        publish(anchor, changed, metadata)
-            .await
-            .context("publishing refreshed enforcer state")?;
     }
 }
 
@@ -1827,7 +1895,7 @@ async fn abort_and_drain<T: 'static>(workers: &mut JoinSet<T>) {
 fn enforcer_payload(event: &Event) -> Result<&events::EnforcerEvent> {
     match event.monitor_event.as_ref() {
         Some(MonitorEvent::Enforcer(payload)) => Ok(payload),
-        None => bail!("event envelope does not contain a monitor event"),
+        _ => bail!("event envelope does not contain an enforcer event"),
     }
 }
 
@@ -1932,10 +2000,11 @@ mod tests {
     use super::{
         BackfillRequest, BmmSource, Heartbeat, SidechainActivationSource, SourceFuture,
         StartupSource, StateSource, TipSource, active_instances_for_slots, announce_tip_changes,
-        collect_bmm_sample, current_tip_receiver, forward_stream, prepare_observation,
-        prepare_sidechain_activation, prepare_stable_observation, queue_tip_reconciliations,
-        refresh_on_new_blocks, schedule_backfill_retry, schedule_sidechain_activation_retry,
-        snapshot_tips_are_consistent, supervise_workers, validate_chain_identity,
+        bmm_consistency, collect_bmm_sample, current_tip_receiver, forward_stream,
+        prepare_observation, prepare_sidechain_activation, prepare_stable_observation,
+        queue_tip_reconciliations, refresh_on_new_blocks, schedule_backfill_retry,
+        schedule_sidechain_activation_retry, snapshot_tips_are_consistent, supervise_workers,
+        validate_chain_identity,
     };
     use crate::proto::{common, mainchain};
     use crate::snapshot::InitialSnapshot;
@@ -1962,14 +2031,39 @@ mod tests {
         network: mainchain::Network,
         activation_height: u32,
     ) -> InitialSnapshot {
+        thresholds_snapshot(
+            network,
+            activation_height,
+            [26_300, 13_150, 26_300, 13_150, 2_016, 1_008],
+        )
+    }
+
+    fn thresholds_snapshot(
+        network: mainchain::Network,
+        activation_height: u32,
+        thresholds: [u32; 6],
+    ) -> InitialSnapshot {
+        let [
+            withdrawal_bundle_max_age,
+            withdrawal_bundle_inclusion_threshold,
+            used_sidechain_slot_proposal_max_age,
+            used_sidechain_slot_activation_threshold,
+            unused_sidechain_slot_proposal_max_age,
+            unused_sidechain_slot_activation_threshold,
+        ] = thresholds;
         InitialSnapshot {
             constants: vec![events::EnforcerEvent {
                 event: Some(events::enforcer_event::Event::ChainInfo(
                     events::ChainInfo {
                         network: events::Network::Mainnet as i32,
                         bip300_constants: Some(events::Bip300Constants {
+                            withdrawal_bundle_max_age,
+                            withdrawal_bundle_inclusion_threshold,
+                            used_sidechain_slot_proposal_max_age,
+                            used_sidechain_slot_activation_threshold,
+                            unused_sidechain_slot_proposal_max_age,
+                            unused_sidechain_slot_activation_threshold,
                             activation_height,
-                            ..Default::default()
                         }),
                         raw_network: network as i32,
                     },
@@ -1983,6 +2077,7 @@ mod tests {
     #[test]
     fn startup_chain_identity_must_match_the_locked_network_and_activation() {
         let mut args = crate::config::Args::try_parse_from(["enforcer-extractor"]).unwrap();
+        args.network_id = "betanet".to_owned();
         args.activation_height = 967_680;
         args.expected_enforcer_network = Some("NETWORK_MAINNET".to_owned());
         validate_chain_identity(
@@ -2004,6 +2099,33 @@ mod tests {
         )
         .expect_err("network mismatch");
         assert!(wrong_network.to_string().contains("NETWORK_REGTEST"));
+
+        // Both forks report NETWORK_MAINNET: only the thresholds tell an
+        // alphanet-preset enforcer apart at a betanet activation height.
+        let wrong_preset = validate_chain_identity(
+            &args,
+            &thresholds_snapshot(
+                mainchain::Network::Mainnet,
+                967_680,
+                [144, 72, 144, 72, 36, 30],
+            ),
+        )
+        .expect_err("preset mismatch");
+        assert!(wrong_preset.to_string().contains("betanet preset"));
+
+        args.network_id = "gammanet".to_owned();
+        let unknown = validate_chain_identity(
+            &args,
+            &chain_identity_snapshot(mainchain::Network::Mainnet, 967_680),
+        )
+        .expect_err("an unverifiable production network");
+        assert!(unknown.to_string().contains("no known enforcer preset"));
+        args.allow_unknown_network_preset = true;
+        validate_chain_identity(
+            &args,
+            &chain_identity_snapshot(mainchain::Network::Mainnet, 967_680),
+        )
+        .expect("explicitly accepted unknown preset");
     }
 
     #[test]
@@ -2182,11 +2304,31 @@ mod tests {
             tips: Arc::new(Mutex::new(tips.iter().copied().map(observed_tip).collect())),
             parents: Arc::new(Mutex::new(Vec::new())),
             responses: Arc::new(Mutex::new(
-                std::iter::repeat_with(mainchain::GetSeenBmmRequestsResponse::default)
-                    .take(response_count)
-                    .collect(),
+                std::iter::repeat_with(|| mainchain::GetSeenBmmRequestsResponse {
+                    requests: vec![],
+                })
+                .take(response_count)
+                .collect(),
             )),
         }
+    }
+
+    #[test]
+    fn bmm_samples_before_readiness_are_not_complete_auctions() {
+        let start = std::time::Instant::now();
+        let ready_at = start + Duration::from_secs(120);
+        assert_eq!(
+            bmm_consistency(SnapshotConsistency::TipMatched, start, ready_at),
+            SnapshotConsistency::Unknown
+        );
+        assert_eq!(
+            bmm_consistency(SnapshotConsistency::TipMatched, ready_at, ready_at),
+            SnapshotConsistency::TipMatched
+        );
+        assert_eq!(
+            bmm_consistency(SnapshotConsistency::Changed, start, ready_at),
+            SnapshotConsistency::Changed
+        );
     }
 
     #[tokio::test]
@@ -2195,7 +2337,7 @@ mod tests {
         let (payload, metadata) = collect_bmm_sample(&mut source, 3)
             .await
             .expect("stable BMM sample");
-        assert_eq!(metadata.consistency, SnapshotConsistency::Stable);
+        assert_eq!(metadata.consistency, SnapshotConsistency::TipMatched);
         assert_eq!(metadata.attempts, 1);
         assert_eq!(metadata.tip_before.hash, vec![0x11; 32]);
         let events::enforcer_event::Event::BmmRequests(snapshot) =
@@ -2535,11 +2677,13 @@ mod tests {
                     anchor: anchor.clone(),
                     payloads: collection.context("configured fake state collection")?,
                     metadata: SnapshotMetadata {
+                        revision_before: None,
+                        revision_after: None,
                         started_at: SystemTime::now(),
                         finished_at: SystemTime::now(),
                         tip_before: anchor.clone(),
                         tip_after: anchor,
-                        consistency: SnapshotConsistency::Stable,
+                        consistency: SnapshotConsistency::TipMatched,
                         attempts: 1,
                     },
                 })
@@ -2943,6 +3087,7 @@ mod tests {
             block_rx,
             shutdown_rx,
             |_anchor, _payloads, _metadata| async { Ok(()) },
+            |_failure| async { Ok(()) },
         ));
 
         // Both sends happen with no await between them, so the worker cannot be
@@ -2972,7 +3117,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn state_refreshes_once_per_block_and_publishes_only_changes() {
+    async fn state_refreshes_once_per_block_and_publishes_every_reading() {
         let snapshot_tip = vec![0x11; 32];
         let (block_tx, block_rx) = watch::channel(snapshot_tip.clone());
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -2994,19 +3139,20 @@ mod tests {
             block_rx,
             shutdown_rx,
             move |anchor: ObservedBlock,
-                  payloads: Vec<events::EnforcerEvent>,
+                  publication: state::Publication,
                   _metadata: SnapshotMetadata| {
                 let output = Arc::clone(&output);
                 let publish_shutdown = publish_shutdown.clone();
                 async move {
-                    output
-                        .lock()
-                        .expect("published state lock")
-                        .push((anchor, payloads));
-                    publish_shutdown.send(true).expect("send shutdown");
+                    let mut output = output.lock().expect("published state lock");
+                    output.push((anchor, publication));
+                    if output.len() == 2 {
+                        publish_shutdown.send(true).expect("send shutdown");
+                    }
                     Ok(())
                 }
             },
+            |_failure| async { Ok(()) },
         ));
 
         // A replayed snapshot tip must not refresh. The channel only keeps the
@@ -3029,9 +3175,14 @@ mod tests {
             .expect("clean state worker shutdown");
 
         let published = published.lock().expect("published state lock");
-        assert_eq!(published.len(), 1, "only the changed reading is published");
-        let (anchor, payloads) = &published[0];
-        assert_eq!(*payloads, vec![ctip_payload(9, 250)]);
+        assert_eq!(published.len(), 2, "every reading is published");
+        // The unchanged reading is evidence that the value still held there.
+        let (_, unchanged) = &published[0];
+        assert_eq!(unchanged.payloads, vec![ctip_payload(9, 100)]);
+        assert!(unchanged.changed.is_empty());
+        let (anchor, changed) = &published[1];
+        assert_eq!(changed.payloads, vec![ctip_payload(9, 250)]);
+        assert_eq!(changed.changed, vec![ctip_payload(9, 250)]);
         assert_eq!(
             anchor.height,
             Some(996_261),
@@ -3058,6 +3209,7 @@ mod tests {
             block_rx,
             shutdown_rx,
             |_anchor, _payloads, _metadata| async { Ok(()) },
+            |_failure| async { Ok(()) },
         ));
 
         tokio::task::yield_now().await;
@@ -3071,9 +3223,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_failed_state_refresh_is_fatal() {
+    async fn a_failed_state_refresh_is_recorded_and_retried() {
         let (block_tx, block_rx) = watch::channel(vec![0x11; 32]);
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let failures = Arc::new(std::sync::Mutex::new(Vec::<Option<String>>::new()));
+        let reported = Arc::clone(&failures);
+        let notified = Arc::new(Notify::new());
+        let notify = Arc::clone(&notified);
 
         let worker = tokio::spawn(refresh_on_new_blocks(
             // No scripted collection: the fake reports a failure.
@@ -3085,17 +3241,28 @@ mod tests {
             block_rx,
             shutdown_rx,
             |_anchor, _payloads, _metadata| async { Ok(()) },
+            move |failure: Option<String>| {
+                reported.lock().expect("failures").push(failure);
+                notify.notify_one();
+                async { Ok(()) }
+            },
         ));
 
         block_tx.send(vec![0x22; 32]).expect("new block");
-
-        let error = timeout(Duration::from_secs(1), worker)
+        timeout(Duration::from_secs(1), notified.notified())
             .await
-            .expect("state worker finishes")
-            .expect("join state worker")
-            .expect_err("a failed refresh must fail the worker");
+            .expect("the failure is reported");
 
-        assert!(format!("{error:#}").contains("refreshing enforcer state at block"));
+        let recorded = failures.lock().expect("failures").clone();
+        assert_eq!(recorded.len(), 1);
+        assert!(
+            recorded[0]
+                .as_deref()
+                .is_some_and(|error| error.contains("refreshing enforcer state at block"))
+        );
+        // The worker keeps running so the rest of the extractor survives.
+        assert!(!worker.is_finished());
+        worker.abort();
     }
 
     #[tokio::test]
@@ -3302,6 +3469,7 @@ mod tests {
             block_rx,
             shutdown_rx,
             |_anchor, _payloads, _metadata| async { Ok(()) },
+            |_failure| async { Ok(()) },
         ));
 
         tokio::task::yield_now().await;

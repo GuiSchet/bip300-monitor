@@ -6,11 +6,9 @@ import "enforcer_extractor.proto";
 
 // The mainchain block an observation is anchored to.
 //
-// For a block event this is the block the event is about. For a state snapshot
-// it is the enforcer's tip when the state was read, which is what makes the
-// snapshot joinable to a height. It is an anchor, not a proof that the state is
-// exactly as of that height: reading state is a poll, and the enforcer can
-// advance between the read of one field and the next.
+// For a block event this is the block it describes. State snapshots (since
+// contract 8) are unanchored; their tip reads belong to snapshot_group's observation window.
+// BMM requests retain their explicit previous-mainchain-block parent anchor.
 message ObservedBlock {
   // 32-byte block hash in conventional display order.
   bytes hash = 1;
@@ -30,5 +28,21 @@ message Event {
 
   oneof monitor_event {
     enforcer_extractor.EnforcerEvent enforcer = 1;
+    NodeEvent node = 2;
   }
+}
+
+// Evidence from the official node RPC. No BIP300 acceptance is inferred.
+message NodeEvent {
+  oneof event {
+    MainchainBlock mainchain_block = 1;
+    enforcer_extractor.ChainTip chain_tip = 2;
+    enforcer_extractor.ConfirmedBmmFees confirmed_bmm_fees = 3;
+  }
+}
+
+message MainchainBlock {
+  enforcer_extractor.BlockHeader header = 1;
+  // Exact getblock(hash, 0) bytes. Mutable confirmations are not part of a fact.
+  bytes raw_block = 2;
 }

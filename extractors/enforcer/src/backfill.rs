@@ -54,6 +54,11 @@ pub(crate) enum Outcome {
         blocks: usize,
         pages: usize,
     },
+    /// Conflicting immutable facts suspended this scope. Retrying finds the
+    /// same conflict, so the scope waits for an operator instead of failing.
+    Quarantined {
+        target: ObservedBlock,
+    },
 }
 
 pub(crate) struct HistoryScope<'a> {
@@ -64,21 +69,27 @@ pub(crate) struct HistoryScope<'a> {
     pub(crate) expected_start_hash: Option<&'a [u8]>,
 }
 
-type FetchFuture<'a> =
-    Pin<Box<dyn Future<Output = Result<Vec<events::EnforcerEvent>>> + Send + 'a>>;
+type FetchFuture<'a, T> = Pin<Box<dyn Future<Output = Result<Vec<T>>> + Send + 'a>>;
 
 /// The two operations that differ between historical streams.
 pub(crate) trait HistoryStream {
+    type Client;
+    type Payload;
+    fn envelope(&self, payload: Self::Payload, anchor: ObservedBlock) -> Result<Event>;
+    fn current_tip<'a>(
+        &self,
+        client: &'a mut Self::Client,
+    ) -> Pin<Box<dyn Future<Output = Result<ObservedBlock>> + Send + 'a>>;
     fn scope(&self) -> HistoryScope<'_>;
 
     fn fetch<'a>(
         &'a self,
-        client: &'a mut EnforcerClient,
+        client: &'a mut Self::Client,
         cursor: &'a ObservedBlock,
         requested: u32,
-    ) -> FetchFuture<'a>;
+    ) -> FetchFuture<'a, Self::Payload>;
 
-    fn header<'a>(&self, payload: &'a events::EnforcerEvent) -> Result<&'a events::BlockHeader>;
+    fn header<'a>(&self, payload: &'a Self::Payload) -> Result<&'a events::BlockHeader>;
 
     fn unavailable_error(&self, error: &Error) -> bool {
         error_has_code(error, Code::NotFound)
@@ -94,6 +105,18 @@ struct BlockHistory<'a> {
 }
 
 impl HistoryStream for BlockHistory<'_> {
+    type Client = EnforcerClient;
+    type Payload = events::EnforcerEvent;
+    fn envelope(&self, payload: Self::Payload, anchor: ObservedBlock) -> Result<Event> {
+        envelope(payload, anchor)
+    }
+    fn current_tip<'a>(
+        &self,
+        client: &'a mut Self::Client,
+    ) -> Pin<Box<dyn Future<Output = Result<ObservedBlock>> + Send + 'a>> {
+        Box::pin(snapshot::current_tip(client))
+    }
+
     fn scope(&self) -> HistoryScope<'_> {
         HistoryScope {
             stream: HISTORY_STREAM,
@@ -106,10 +129,10 @@ impl HistoryStream for BlockHistory<'_> {
 
     fn fetch<'a>(
         &'a self,
-        client: &'a mut EnforcerClient,
+        client: &'a mut Self::Client,
         cursor: &'a ObservedBlock,
         requested: u32,
-    ) -> FetchFuture<'a> {
+    ) -> FetchFuture<'a, Self::Payload> {
         Box::pin(async move {
             let response = client
                 .get_block_info(
@@ -122,7 +145,7 @@ impl HistoryStream for BlockHistory<'_> {
         })
     }
 
-    fn header<'a>(&self, payload: &'a events::EnforcerEvent) -> Result<&'a events::BlockHeader> {
+    fn header<'a>(&self, payload: &'a Self::Payload) -> Result<&'a events::BlockHeader> {
         connected_header(payload)
     }
 }
@@ -149,7 +172,7 @@ pub(crate) async fn run(
 
 /// Run the common newest-first historical cursor for one stream adapter.
 pub(crate) async fn run_history<S: HistoryStream>(
-    client: &mut EnforcerClient,
+    client: &mut S::Client,
     recorder: &Recorder,
     stream: &S,
     tip: &ObservedBlock,
@@ -163,6 +186,11 @@ pub(crate) async fn run_history<S: HistoryStream>(
             target: tip.clone(),
             blocks: 0,
             pages: 0,
+        });
+    }
+    if is_quarantined(recorder, &scope).await? {
+        return Ok(Outcome::Quarantined {
+            target: tip.clone(),
         });
     }
     let Some(mut progress) = prepare_cycle(recorder, &scope, tip, settings.page_blocks).await?
@@ -202,8 +230,8 @@ pub(crate) async fn run_history<S: HistoryStream>(
         let requested = u32::try_from(remaining.min(u64::from(progress.effective_page_blocks)))
             .expect("a page size fits in a u32");
 
-        enum Page {
-            Found(Vec<events::EnforcerEvent>),
+        enum Page<T> {
+            Found(Vec<T>),
             Unavailable(Error),
         }
         let page = match stream.fetch(client, &cursor, requested).await {
@@ -276,10 +304,10 @@ pub(crate) async fn run_history<S: HistoryStream>(
             }
         };
 
-        let payloads = match page {
+        let mut payloads = match page {
             Page::Found(payloads) => payloads,
             Page::Unavailable(error) => {
-                let current_tip = match snapshot::current_tip(client).await {
+                let current_tip = match stream.current_tip(client).await {
                     Ok(current_tip) => current_tip,
                     Err(tip_error) if retryable_rpc_error(&tip_error) => {
                         return settle_failure(
@@ -335,7 +363,7 @@ pub(crate) async fn run_history<S: HistoryStream>(
                         unavailable_cursor = %hex::encode(&cursor.hash),
                         previous_target = %hex::encode(&progress.target_tip.hash),
                         current_target = %hex::encode(&current_tip.hash),
-                        "historical target left the available branch; restarting from activation"
+                        "historical target left the available branch; repairing toward a certified ancestor"
                     );
                     progress = begin_full_cycle(
                         recorder,
@@ -383,13 +411,49 @@ pub(crate) async fn run_history<S: HistoryStream>(
             )
             .await;
         }
+        // A recorded fact is insufficient: only a certified contiguous prefix
+        // permits truncating the requested page on a new branch.
+        let hashes = payloads
+            .iter()
+            .map(|p| stream.header(p).map(|h| h.hash.clone()))
+            .collect::<Result<Vec<_>>>()?;
+        let certified = recorder
+            .store()
+            .certified_history_floor(
+                scope.stream,
+                scope.sidechain,
+                scope.sidechain_instance_id,
+                &hashes,
+            )
+            .await?;
+        if let Some(certified) = &certified {
+            let index = hashes
+                .iter()
+                .position(|hash| *hash == certified.hash)
+                .context("certified block was not in the requested page")?;
+            let header = stream.header(&payloads[index])?;
+            progress.floor_height = header.height.checked_sub(1);
+            progress.floor_hash = progress.floor_height.map(|_| header.previous_hash.clone());
+            recorder
+                .store()
+                .set_history_floor(
+                    scope.stream,
+                    scope.sidechain,
+                    scope.sidechain_instance_id,
+                    &cursor,
+                    progress.floor_hash.as_deref(),
+                    progress.floor_height,
+                )
+                .await?;
+            payloads.truncate(index + 1);
+        }
         let oldest = stream.header(
             payloads
                 .last()
                 .context("a verified historical page is not empty")?,
         )?;
         let returned = u32::try_from(payloads.len()).expect("a page length fits in a u32");
-        let completes_cycle = u64::from(returned) == remaining;
+        let completes_cycle = certified.is_some() || u64::from(returned) == remaining;
 
         if let Err(error) = validate_expected_start_hash(
             &scope,
@@ -418,7 +482,7 @@ pub(crate) async fn run_history<S: HistoryStream>(
                     recorder,
                     &scope,
                     anyhow::anyhow!(
-                        "history branch still failed to reach its floor after restarting from activation"
+                        "history branch still failed to reach its floor after repairing toward a certified ancestor"
                     ),
                     &progress.target_tip,
                     blocks,
@@ -432,7 +496,7 @@ pub(crate) async fn run_history<S: HistoryStream>(
                 sidechain = ?scope.sidechain,
                 expected_floor_hash = %hex::encode(floor_hash),
                 actual_floor_hash = %hex::encode(&oldest.previous_hash),
-                "covered tip is not an ancestor of the target; restarting from activation"
+                "covered tip is not an ancestor of the target; repairing toward a certified ancestor"
             );
             progress = begin_full_cycle(
                 recorder,
@@ -472,6 +536,17 @@ pub(crate) async fn run_history<S: HistoryStream>(
             .await
         {
             Ok(inserted) => inserted,
+            // Committed as suspended; not a failure to settle or retry.
+            Err(error) if error.is::<shared::store::HistoryConflict>() => {
+                tracing::error!(
+                    stream = scope.stream,
+                    sidechain = ?scope.sidechain,
+                    "conflicting immutable block facts; history scope quarantined"
+                );
+                return Ok(Outcome::Quarantined {
+                    target: progress.target_tip.clone(),
+                });
+            }
             Err(error) => {
                 return settle_failure(
                     recorder,
@@ -535,6 +610,18 @@ pub(crate) async fn run_history<S: HistoryStream>(
             }
         }
     }
+}
+
+async fn is_quarantined(recorder: &Recorder, scope: &HistoryScope<'_>) -> Result<bool> {
+    let coverage = recorder
+        .store()
+        .history_coverage(scope.stream, scope.sidechain, scope.sidechain_instance_id)
+        .await
+        .with_context(|| format!("reading {} history coverage", scope.stream))?;
+    Ok(coverage.is_some_and(|c| {
+        c.status == HistoryStatus::Error
+            && c.last_error.as_deref() == Some(shared::store::HISTORY_CONFLICT)
+    }))
 }
 
 async fn prepare_cycle(
@@ -643,7 +730,7 @@ async fn begin_full_cycle(
 
 async fn target_is_available<S: HistoryStream>(
     stream: &S,
-    client: &mut EnforcerClient,
+    client: &mut S::Client,
     target: &ObservedBlock,
 ) -> Result<Option<bool>> {
     match stream.fetch(client, target, 1).await {
@@ -694,7 +781,7 @@ async fn mark_superseded(recorder: &Recorder, scope: &HistoryScope<'_>) -> Resul
 
 fn historical_events<S: HistoryStream>(
     stream: &S,
-    mut payloads: Vec<events::EnforcerEvent>,
+    mut payloads: Vec<S::Payload>,
 ) -> Result<Vec<Event>> {
     payloads.reverse();
     payloads
@@ -702,7 +789,7 @@ fn historical_events<S: HistoryStream>(
         .map(|payload| {
             let header = stream.header(&payload)?;
             let anchor = ObservedBlock::at_height(header.hash.clone(), header.height);
-            envelope(payload, anchor)
+            stream.envelope(payload, anchor)
         })
         .collect()
 }
@@ -751,7 +838,7 @@ fn validate_expected_start_hash(
 
 pub(crate) fn verify_page_with<S: HistoryStream>(
     stream: &S,
-    payloads: &[events::EnforcerEvent],
+    payloads: &[S::Payload],
     cursor: &ObservedBlock,
     requested: u32,
 ) -> Result<()> {
@@ -918,7 +1005,8 @@ mod tests {
                         hash: vec![hash; 32],
                         previous_hash: vec![previous_hash; 32],
                         height,
-                        chain_work: vec![0x44; 32],
+                        block_work: vec![1; 32],
+                        cumulative_work: vec![0x44; 32],
                         timestamp: 1_750_000_000,
                     }),
                     sidechain_number: 9,

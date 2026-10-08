@@ -1,0 +1,48 @@
+{
+  "release_id": "observer-official-v9-20261007",
+  "prepared_at": "2026-10-07",
+  "status": "source-updated-images-pending",
+  "event_contract": 9,
+  "record_schema": 10,
+  "observatory_projection": 8,
+  "requires_fresh_databases": true,
+  "commits": {
+    "enforcer_official": "1753fc0c23863bcb39c681e1cfaea2705613516f",
+    "monitor_image_source": "pending-rebuild",
+    "observatory_image_source": "pending-rebuild",
+    "retired_fork_archive": "7a7b625ae5a46a085b3617fdedf37a92181ea048"
+  },
+  "images": [
+    {
+      "artifact": "enforcer.oci.tar",
+      "destination": "ghcr.io/guischet/bip300-enforcer-official:sha-1753fc0c2386",
+      "digest": "sha256:20ee50366ee941731d26a47580481fd88ec2747014bc6cd18628a8844f4154dc",
+      "config_digest": "sha256:9e15b7d1dad53d373bf725998faa2937790ef9b1e61a49b43803b3cf15fd2e8b",
+      "source_commit": "1753fc0c23863bcb39c681e1cfaea2705613516f",
+      "platform": "linux/amd64",
+      "rootfs": [
+        "sha256:1d69a5fd31932841d7825ef4780c06f008eea65aaa9f3110fe09d5832ed5c7d8",
+        "sha256:e8cfe20cbdcc249662081748ab6ba2d19bc6292793787ac0b04592df9e2f4b65",
+        "sha256:68cf3f7e4b5cf33cc84f41f0b04f845af35270a4be4010d120423ff3284f2c3e"
+      ]
+    }
+  ],
+  "validation": {
+    "monitor_tests_passed": null,
+    "observatory_unit_tests_passed": null,
+    "note": "rerun after the contract 9 images are rebuilt; the source-level results are recorded in the pull requests"
+  },
+  "remaining_release_steps": [
+    "review and merge the paired monitor and Observatory pull requests",
+    "rebuild the extractor, event-logger and Observatory OCI archives from the merged commits",
+    "record their digests here, publish exact OCI bytes and verify registry digests",
+    "mark RELEASE_STATUS=ready in a reviewed deployment commit",
+    "HOSTKEY read-only preflight and operator-approved cutover",
+    "freeze writers, verify paired production backups off-host, use fresh databases and the official enforcer directory",
+    "run grant-reader.sh, then verify and verify-live including zero-slot global stream; retain 24-hour production observation"
+  ],
+  "superseded_candidate": {
+    "release_id": "observer-official-v8-20261005",
+    "reason": "contract 8 / schema 9 consumer images; superseded by contract 9 / schema 10 / projection 8"
+  }
+}

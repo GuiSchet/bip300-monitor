@@ -15,6 +15,9 @@ disablewallet=1
 rpcbind=0.0.0.0
 rpcallowip=172.30.0.0/24
 rpccookiefile=/rpc-cookie/.cookie
+# Preserve existing cookie permissions. Restrict the separate observer identity.
+rpcwhitelistdefault=0
+rpcwhitelist=bip300_observer:getblockchaininfo,getblockhash,getblockheader,getblock
 rpcthreads=8
 
 printtoconsole=1

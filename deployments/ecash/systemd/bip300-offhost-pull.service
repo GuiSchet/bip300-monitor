@@ -1,0 +1,8 @@
+[Unit]
+Description=Copy and restore HOSTKEY backups on the operator computer
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 %h/.local/lib/bip300-monitor/offhost-backup.py --host root@162.141.78.240 --identity %h/.ssh/bip300-alpha --local-root %h/.local/share/bip300-monitor/backups/betanet
+UMask=0077
+Nice=10

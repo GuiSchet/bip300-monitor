@@ -33,6 +33,12 @@ require_boolean() {
         die "${name} must be true or false"
 }
 
+require_ready_release() {
+    [[ "${RELEASE_STATUS:-}" == ready ]] || die "release is not marked ready; this candidate cannot be started"
+    [[ "${ENFORCER_REPO}" == https://github.com/LayerTwo-Labs/bip300301_enforcer.git ]] || die "enforcer must use official upstream"
+    [[ "${ENFORCER_COMMIT}" == "${ENFORCER_UPSTREAM_REVIEWED_COMMIT}" ]] || die "official enforcer commit mismatch"
+}
+
 load_versions() {
     [[ -f "${VERSIONS_FILE}" ]] || die "missing ${VERSIONS_FILE}"
     if grep -qE '^[A-Z][A-Z0-9_]*=REPLACE_WITH_' "${VERSIONS_FILE}"; then
@@ -158,6 +164,7 @@ render_node_config() {
     local destination="$1"
     local peer
     local temporary_config
+    local auth_config="${BIP300_NODE_OBSERVER_AUTH_CONFIG_FILE:-$(data_root)/secrets/node-observer-rpcauth}"
     local template="${DEPLOYMENT_ROOT}/config/ecash.conf.template"
 
     [[ -f "${template}" ]] || die "missing node configuration template: ${template}"
@@ -175,6 +182,8 @@ render_node_config() {
         # cursor. Make the non-pruned requirement explicit instead of relying
         # on the node default, which could change or be overridden unnoticed.
         printf 'prune=0\n'
+        [[ -f "${auth_config}" ]] || die "missing dedicated observer rpcauth; run just init"
+        cat -- "${auth_config}"
         printf 'zmqpubsequence=tcp://0.0.0.0:%s\n' "${ECASH_NODE_ZMQ_PORT}"
         while IFS= read -r peer; do
             printf 'addnode=%s\n' "${peer}"
@@ -435,7 +444,7 @@ nats_has_enforcer_subscription() {
     local subscriptions
     subscriptions="$(nats_monitor '/subsz?subs=true' 2>/dev/null)" &&
         jq -e \
-            '.subscriptions_list | any(.account == "$G" and .subject == "bip300.enforcer")' \
+            '.subscriptions_list | any(.account == "$G" and .subject == "bip300.*")' \
             <<<"${subscriptions}" >/dev/null
 }
 
@@ -469,7 +478,7 @@ postgres_query() {
 
     compose exec -T postgres \
         psql --username="${POSTGRES_USER}" --dbname="${POSTGRES_DB}" \
-        --no-align --tuples-only --quiet "$@" <<<"${statement}"
+        --no-align --tuples-only --quiet --set=ON_ERROR_STOP=1 "$@" <<<"${statement}"
 }
 
 postgres_is_healthy() {
@@ -577,85 +586,48 @@ count_snapshot_events() {
     printf '%s\n' "${count}"
 }
 
-# The block the newest recorded snapshot is anchored to, as a hex hash.
-#
-# `chain_tip` is recorded once per snapshot and nowhere else, so its newest row
-# names the block the current snapshot describes.
-record_snapshot_anchor() {
-    postgres_query \
-        "SELECT encode(block_hash, 'hex') FROM event
-          WHERE kind = 'chain_tip' AND block_hash IS NOT NULL
-          ORDER BY id DESC LIMIT 1"
+# State facts have no block anchor. Verify their occurrences in one read window
+# of the scoped current run. Deduplication never erases a fresh observation.
+record_snapshot_group() {
+    record_scoped_query "WITH scope AS ($(record_scope_sql))
+        SELECT o.snapshot_group_id FROM event_observation o JOIN scope s USING(dataset_id,run_id)
+        JOIN event e ON e.id=o.event_id AND e.event_contract_version=s.event_contract_version
+        WHERE e.source='enforcer' AND e.kind='active_sidechains' AND o.snapshot_group_id IS NOT NULL
+        ORDER BY o.capture_seq DESC LIMIT 1"
 }
-
 record_snapshot_height() {
-    postgres_query \
-        "SELECT height FROM event
-          WHERE kind = 'chain_tip' AND block_hash IS NOT NULL AND height IS NOT NULL
-          ORDER BY id DESC LIMIT 1"
+    local group="$1"
+    record_scoped_query "WITH scope AS ($(record_scope_sql))
+        SELECT g.tip_before_height FROM snapshot_group g JOIN scope s USING(dataset_id,run_id)
+        WHERE g.snapshot_group_id=:'group'::uuid" --set=group="${group}"
 }
-
-# Slots and activation heights encoded in the active-sidechains payload at one
-# semantic-snapshot anchor. This is deliberately distinct from asking the
-# enforcer for its current active set: a new slot may activate while the same
-# extractor instance is still running.
 record_snapshot_sidechain_activations() {
-    local block_hash="$1"
-
-    [[ "${block_hash}" =~ ^[[:xdigit:]]{64}$ ]] || return 1
-    postgres_query \
-        "SELECT (snapshot_sidechain.value->>'sidechain_number') || ' ' ||
-                       (snapshot_sidechain.value->>'activation_height')
-           FROM event
-          CROSS JOIN LATERAL jsonb_array_elements(
-              payload #> '{monitor_event,Enforcer,event,ActiveSidechains,sidechains}'
-          ) AS snapshot_sidechain(value)
-          WHERE source = 'enforcer'
-            AND kind = 'active_sidechains'
-            AND block_hash = decode(:'block_hash', 'hex')
-            AND event_contract_version = (
-                SELECT max(latest.event_contract_version)
-                  FROM event latest
-                 WHERE latest.source = 'enforcer'
-                   AND latest.kind = 'active_sidechains'
-                   AND latest.block_hash = decode(:'block_hash', 'hex')
-            )
-          ORDER BY (snapshot_sidechain.value->>'sidechain_number')::integer" \
-        --set=block_hash="${block_hash}"
+    local group="$1"
+    record_scoped_query "WITH scope AS ($(record_scope_sql))
+        SELECT (x->>'sidechain_number') || ' ' || (x->>'activation_height')
+        FROM event_observation o JOIN scope s USING(dataset_id,run_id)
+        JOIN event e ON e.id=o.event_id AND e.event_contract_version=s.event_contract_version
+        CROSS JOIN LATERAL jsonb_array_elements(e.payload #> '{monitor_event,Enforcer,event,ActiveSidechains,sidechains}') x
+        WHERE e.source='enforcer' AND e.kind='active_sidechains' AND o.snapshot_group_id=:'group'::uuid
+        ORDER BY (x->>'sidechain_number')::integer" --set=group="${group}"
 }
-
-# Rows of one kind the record holds at one block, for one slot when given.
-#
-# The record itself is the authoritative check: the log lines only show what
-# reached a live consumer. It is scoped by block rather than by `observed_at`,
-# and that is the whole point. A republished snapshot is idempotent, so a restart
-# at an unchanged tip inserts nothing, and a time window would read that healthy
-# state as a missing snapshot. The block is also the stricter scope, because a
-# previous run's rows are at a previous block -- which is what a time window was
-# there to guard against. Which instance published is a separate question,
-# answered by the log window before this is asked.
-record_event_count_at() {
-    local kind="$1"
-    local block_hash="$2"
-    local sidechain="${3:-}"
-    local -a filters=(--set=kind="${kind}" --set=block_hash="${block_hash}")
-    local predicate="kind = :'kind' AND block_hash = decode(:'block_hash', 'hex')
-        AND event_contract_version = (
-            SELECT max(latest.event_contract_version)
-              FROM event latest
-             WHERE latest.kind = :'kind'
-               AND latest.block_hash = decode(:'block_hash', 'hex')
-        )"
-
+record_current_state_is_usable() {
+    local kind="$1" sidechain="${2:-}" result
     valid_event_kind "${kind}" || return 1
-    [[ "${block_hash}" =~ ^[[:xdigit:]]{64}$ ]] || return 1
-    if [[ -n "${sidechain}" ]]; then
-        [[ "${sidechain}" =~ ^[0-9]+$ ]] || return 1
-        filters+=(--set=sidechain="${sidechain}")
-        predicate+=" AND sidechain = :'sidechain'::smallint"
-    fi
-
-    postgres_query "SELECT count(*) FROM event WHERE ${predicate}" "${filters[@]}"
+    result="$(record_scoped_query "WITH scope AS ($(record_scope_sql)), latest AS (
+        SELECT g.* FROM event_observation o JOIN scope s USING(dataset_id,run_id)
+        JOIN event e ON e.id=o.event_id AND e.dataset_id=s.dataset_id AND e.event_contract_version=s.event_contract_version
+        JOIN snapshot_group g ON g.snapshot_group_id=o.snapshot_group_id AND g.dataset_id=s.dataset_id AND g.run_id=s.run_id
+        WHERE e.source='enforcer' AND e.kind=:'kind'
+        AND e.sidechain IS NOT DISTINCT FROM NULLIF(:'slot','')::smallint
+        AND (e.sidechain IS NULL OR EXISTS(SELECT 1 FROM current_sidechain_instance i
+            WHERE i.dataset_id=e.dataset_id AND i.sidechain=e.sidechain AND i.sidechain_instance_id=e.sidechain_instance_id))
+        ORDER BY o.capture_seq DESC LIMIT 1)
+        SELECT EXISTS(SELECT 1 FROM latest WHERE consistency='tip_matched'
+        AND revision_before IS NULL AND revision_after IS NULL
+        AND tip_before_hash=tip_after_hash AND tip_before_height=tip_after_height)" \
+        --set=kind="${kind}" --set=slot="${sidechain}")" || return 1
+    [[ "${result}" == t ]]
 }
 
 # Whether the newest running enforcer extractor has completed at least one
@@ -691,10 +663,8 @@ record_current_run_has_bmm_observation() {
     [[ "${result}" == t ]]
 }
 
-# Contract v6 brackets every BMM response with two identical tip reads and
-# stores that proof in snapshot_group. The event anchor and payload parent must
-# name that same block.
-record_current_run_has_stable_bmm_observation() {
+# Matching tips describe a read window, not atomic state or mempool readiness.
+record_current_run_has_tip_matched_bmm_observation() {
     local result
 
     result="$(
@@ -722,7 +692,10 @@ record_current_run_has_stable_bmm_observation() {
                   WHERE observation.capture_method = 'poll'
                     AND event.source = 'enforcer'
                     AND event.kind = 'bmm_requests'
-                    AND snapshot.consistency = 'stable'
+                    AND snapshot.consistency = 'tip_matched'
+                    AND snapshot.revision_before IS NULL AND snapshot.revision_after IS NULL
+                    AND snapshot.tip_before_height = snapshot.tip_after_height
+                    AND snapshot.tip_before_height = event.height
                     AND snapshot.tip_before_hash = snapshot.tip_after_hash
                     AND snapshot.tip_before_hash = event.block_hash
                     AND decode(
@@ -811,174 +784,144 @@ record_current_worker_status_json() {
 
 record_current_workers_are_healthy() {
     local result
-
-    result="$(
-        postgres_query \
-            "WITH current_run AS (
-                 SELECT run_id
-                   FROM extractor_run
-                  WHERE source = 'enforcer' AND status = 'running'
-                  ORDER BY started_at DESC, run_id DESC
-                  LIMIT 1
-             )
-             SELECT count(*) = 2
-                    AND count(*) FILTER (
-                        WHERE worker.worker IN ('mainchain_tip', 'bmm_requests')
-                          AND worker.last_success_at IS NOT NULL
-                          AND worker.last_error IS NULL
-                    ) = 2
-               FROM current_run
-               JOIN extractor_worker_status worker USING (run_id)"
-    )" || return 1
+    result="$(record_scoped_query "WITH scope AS ($(record_scope_sql))
+        SELECT count(*) FILTER (WHERE w.worker IN ('mainchain_tip','bmm_requests','mainchain_events','enforcer_state'))=4
+          AND bool_and(w.last_success_at IS NOT NULL AND w.last_error IS NULL)
+          FROM scope s JOIN extractor_worker_status w USING(run_id)")" || return 1
     [[ "${result}" == t ]]
 }
 
-# Whether the record holds one specific block for one slot, by hash.
+record_node_worker_is_healthy() {
+    local RECORD_SOURCE=node result
+    result="$(record_scoped_query "WITH scope AS ($(record_scope_sql))
+        SELECT count(*)=1 AND bool_and(w.last_success_at IS NOT NULL AND w.last_error IS NULL)
+        FROM scope s JOIN extractor_worker_status w USING(run_id) WHERE w.worker='node_history'")" || return 1
+    [[ "${result}" == t ]]
+}
+
+# All verification uses the locked deployment identity and its current run.
+record_scope_sql() {
+    cat <<'SQL'
+SELECT d.dataset_id, r.event_contract_version, r.run_id
+  FROM dataset_manifest d JOIN extractor_status x USING(dataset_id)
+  JOIN extractor_run r ON r.run_id=x.run_id
+ WHERE d.network_id=:'network' AND d.activation_height=:'network_activation'::integer
+   AND d.activation_block_hash=:'network_activation_hash'
+   AND d.initial_event_contract_version=:'contract'::integer
+   AND r.event_contract_version=:'contract'::integer
+   AND x.source=:'source' AND r.source=:'source' AND r.status='running'
+SQL
+}
+
+record_scoped_query() {
+    postgres_query "$@" \
+        --set=network="${NETWORK_ID}" \
+        --set=network_activation="${ECASH_ACTIVATION_HEIGHT}" \
+        --set=network_activation_hash="${ECASH_ACTIVATION_BLOCK_HASH}" \
+        --set=contract="${MONITOR_EVENT_CONTRACT_VERSION}" \
+        --set=source="${RECORD_SOURCE:-enforcer}"
+}
+
 record_has_block() {
-    local kind="$1"
-    local sidechain="$2"
-    local block_hash="$3"
-    local count
-
+    local kind="$1" sidechain="$2" block_hash="$3" result
     valid_event_kind "${kind}" || return 1
-    [[ "${sidechain}" =~ ^[0-9]+$ ]] || return 1
-    [[ "${block_hash}" =~ ^[[:xdigit:]]{64}$ ]] || return 1
-
-    count="$(
-        postgres_query \
-            "SELECT count(*) FROM event
-             WHERE kind = :'kind'
-               AND sidechain = :'sidechain'::smallint
-               AND block_hash = decode(:'block_hash', 'hex')" \
-            --set=kind="${kind}" \
-            --set=sidechain="${sidechain}" \
-            --set=block_hash="${block_hash}"
-    )" || return 1
-    [[ "${count}" =~ ^[0-9]+$ ]] || return 1
-    ((count >= 1))
+    [[ "${sidechain}" =~ ^[0-9]+$ && "${block_hash}" =~ ^[[:xdigit:]]{64}$ ]] || return 1
+    result="$(record_scoped_query "WITH scope AS ($(record_scope_sql))
+        SELECT count(*)=1 FROM event e JOIN scope s USING(dataset_id,event_contract_version)
+        JOIN current_sidechain_instance i USING(dataset_id,sidechain,sidechain_instance_id)
+        WHERE e.source='enforcer' AND e.kind=:'kind' AND e.sidechain=:'slot'::smallint
+          AND e.block_hash=decode(:'hash','hex')" \
+        --set=kind="${kind}" --set=slot="${sidechain}" --set=hash="${block_hash}")" || return 1
+    [[ "${result}" == t ]]
 }
 
-# Whether the record holds one global (slot-less) event for a block hash.
 record_has_global_block() {
-    local kind="$1"
-    local block_hash="$2"
-    local count
-
+    local kind="$1" block_hash="$2" result
+    local RECORD_SOURCE=enforcer
+    [[ "${kind}" != mainchain_block ]] || RECORD_SOURCE=node
     valid_event_kind "${kind}" || return 1
     [[ "${block_hash}" =~ ^[[:xdigit:]]{64}$ ]] || return 1
-    count="$(
-        postgres_query \
-            "SELECT count(*) FROM event
-             WHERE kind = :'kind'
-               AND sidechain IS NULL
-               AND block_hash = decode(:'block_hash', 'hex')" \
-            --set=kind="${kind}" \
-            --set=block_hash="${block_hash}"
-    )" || return 1
-    [[ "${count}" =~ ^[0-9]+$ ]] || return 1
-    ((count >= 1))
+    result="$(record_scoped_query "WITH scope AS ($(record_scope_sql))
+        SELECT count(*)=1 FROM event e JOIN scope s USING(dataset_id,event_contract_version)
+        WHERE e.source=:'source' AND e.kind=:'kind' AND e.sidechain IS NULL
+          AND e.sidechain_instance_id IS NULL AND e.block_hash=decode(:'hash','hex')" \
+        --set=kind="${kind}" --set=hash="${block_hash}")" || return 1
+    [[ "${result}" == t ]]
 }
 
-# Whether the observer RPC has supplied a gap-free global BIP300/301 range
-# from network activation through at least the requested target height.
-record_bip300_history_is_complete() {
-    local activation_height="$1"
-    local minimum_target_height="$2"
-    local complete
-
-    [[ "${activation_height}" =~ ^[0-9]+$ ]] || return 1
-    [[ "${minimum_target_height}" =~ ^[0-9]+$ ]] || return 1
-    complete="$(
-        postgres_query \
-            "SELECT CASE WHEN EXISTS (
-                 SELECT 1
-                   FROM history_coverage coverage
-                   JOIN extractor_status extractor
-                     ON extractor.dataset_id = coverage.dataset_id
-                    AND extractor.source = coverage.source
-                   JOIN extractor_run run
-                     ON run.run_id = extractor.run_id
-                  WHERE coverage.source = 'enforcer'
-                    AND coverage.stream = 'bip300_delta'
-                    AND coverage.sidechain IS NULL
-                    AND coverage.sidechain_instance_id IS NULL
-                    AND coverage.event_contract_version = run.event_contract_version
-                    AND coverage.status = 'complete'
-                    AND coverage.coverage_start_height = :'activation'::integer
-                    AND coverage.covered_tip_height = coverage.target_tip_height
-                    AND coverage.covered_tip_height >= :'minimum_target'::integer
-                    AND coverage.next_hash IS NULL
-                    AND (
-                        SELECT count(DISTINCT event.height)
-                          FROM event
-                         WHERE event.source = coverage.source
-                           AND event.dataset_id = coverage.dataset_id
-                           AND event.event_contract_version = coverage.event_contract_version
-                           AND event.kind = 'bip300_block_delta'
-                           AND event.sidechain IS NULL
-                           AND event.sidechain_instance_id IS NULL
-                           AND event.height BETWEEN coverage.coverage_start_height
-                                                AND coverage.covered_tip_height
-                    ) = coverage.covered_tip_height - coverage.coverage_start_height + 1
-             ) THEN 1 ELSE 0 END" \
-            --set=activation="${activation_height}" \
-            --set=minimum_target="${minimum_target_height}"
-    )" || return 1
-    [[ "${complete}" == 1 ]]
+# Prove an actual live global connect in this verification window, including
+# deployments with zero active sidechain slots.
+record_has_live_mainchain_connect() {
+    local block_hash="$1" since="$2" result
+    [[ "${block_hash}" =~ ^[[:xdigit:]]{64}$ ]] || return 1
+    result="$(record_scoped_query "WITH scope AS ($(record_scope_sql))
+        SELECT EXISTS(SELECT 1 FROM event e JOIN scope s USING(dataset_id,event_contract_version)
+        JOIN event_observation o ON o.event_id=e.id AND o.dataset_id=s.dataset_id AND o.run_id=s.run_id
+        WHERE e.source='enforcer' AND e.kind='mainchain_transition'
+          AND e.payload #>> '{monitor_event,Enforcer,event,MainchainTransition,action}'='1'
+          AND e.block_hash=decode(:'hash','hex') AND o.capture_method='live'
+          AND o.observed_at>=:'since'::timestamptz)" \
+        --set=hash="${block_hash}" --set=since="${since}")" || return 1
+    [[ "${result}" == t ]]
 }
 
-# Whether one slot has a proven, gap-free range from its activation through at
-# least the requested target height.
+record_history_is_complete() {
+    local stream="$1" sidechain="$2" activation="$3" minimum="$4"
+    local height canonical_hash activation_hash result
+    local RECORD_SOURCE=enforcer
+    [[ "${stream}" != mainchain_block ]] || RECORD_SOURCE=node
+    [[ "${activation}" =~ ^[0-9]+$ && "${minimum}" =~ ^[0-9]+$ ]] || return 1
+    [[ "${stream}" == block || "${stream}" == mainchain_block ]] || return 1
+    [[ -z "${sidechain}" || "${sidechain}" =~ ^[0-9]+$ ]] || return 1
+    local coverage_sql="SELECT c.* FROM history_coverage c
+        JOIN scope s USING(dataset_id,event_contract_version)
+        WHERE c.source=:'source' AND c.stream=:'stream'
+          AND c.sidechain IS NOT DISTINCT FROM NULLIF(:'slot','')::smallint
+          AND (c.sidechain IS NULL OR EXISTS(SELECT 1 FROM current_sidechain_instance i
+              WHERE (i.dataset_id,i.sidechain,i.sidechain_instance_id)=
+                    (c.dataset_id,c.sidechain,c.sidechain_instance_id)))
+          AND c.status='complete' AND c.next_hash IS NULL
+          AND c.covered_tip_hash=c.target_tip_hash AND c.covered_tip_height=c.target_tip_height
+          AND c.coverage_start_height=:'activation'::integer
+          AND c.covered_tip_height>=:'minimum'::integer"
+    height="$(record_scoped_query "WITH scope AS ($(record_scope_sql)), coverage AS (${coverage_sql})
+        SELECT covered_tip_height FROM coverage" \
+        --set=stream="${stream}" --set=slot="${sidechain}" --set=activation="${activation}" --set=minimum="${minimum}")" || return 1
+    [[ "${height}" =~ ^[0-9]+$ ]] || return 1
+    canonical_hash="$(node_cli getblockhash "${height}")" || return 1
+    activation_hash="$(node_cli getblockhash "${activation}")" || return 1
+    result="$(record_scoped_query "WITH RECURSIVE scope AS ($(record_scope_sql)),
+        coverage AS (${coverage_sql}), facts AS NOT MATERIALIZED (
+            SELECT e.* FROM event e JOIN coverage c ON
+                (e.dataset_id,e.event_contract_version,e.source)=(c.dataset_id,c.event_contract_version,c.source)
+                AND e.sidechain IS NOT DISTINCT FROM c.sidechain
+                AND e.sidechain_instance_id IS NOT DISTINCT FROM c.sidechain_instance_id
+            WHERE e.kind=CASE :'stream' WHEN 'block' THEN 'block_connected' ELSE 'mainchain_block' END
+        ), path AS (
+            SELECT e.id,e.block_hash,e.previous_hash,e.height FROM facts e JOIN coverage c
+                ON e.block_hash=c.covered_tip_hash AND e.height=c.covered_tip_height
+                AND e.block_hash=decode(:'canonical','hex')
+            UNION ALL
+            SELECT e.id,e.block_hash,e.previous_hash,e.height FROM path p JOIN facts e
+                ON e.block_hash=p.previous_hash AND e.height=p.height-1
+                WHERE p.height>:'activation'::integer
+        ) SELECT count(*)=:'height'::bigint-:'activation'::bigint+1
+            AND count(*)=count(DISTINCT height)
+            AND bool_or(height=:'activation'::integer AND block_hash=decode(:'activation_hash','hex'))
+            AND NOT EXISTS(SELECT 1 FROM event_conflict c JOIN path p
+                ON p.id=c.first_event_id OR p.id=c.conflicting_event_id)
+            FROM path" \
+        --set=stream="${stream}" --set=slot="${sidechain}" --set=activation="${activation}" --set=minimum="${minimum}" \
+        --set=height="${height}" --set=canonical="${canonical_hash}" --set=activation_hash="${activation_hash}")" || return 1
+    [[ "${result}" == t ]]
+}
+
+record_node_history_is_complete() {
+    record_history_is_complete mainchain_block '' "$1" "$2"
+}
+
 record_block_history_is_complete() {
-    local sidechain="$1"
-    local activation_height="$2"
-    local minimum_target_height="$3"
-    local complete
-
-    [[ "${sidechain}" =~ ^[0-9]+$ ]] || return 1
-    [[ "${activation_height}" =~ ^[0-9]+$ ]] || return 1
-    [[ "${minimum_target_height}" =~ ^[0-9]+$ ]] || return 1
-    complete="$(
-        postgres_query \
-            "SELECT CASE WHEN EXISTS (
-                 SELECT 1
-                   FROM history_coverage coverage
-                   JOIN extractor_status extractor
-                     ON extractor.dataset_id = coverage.dataset_id
-                    AND extractor.source = coverage.source
-                   JOIN extractor_run run
-                     ON run.run_id = extractor.run_id
-                   JOIN current_sidechain_instance current_instance
-                     ON current_instance.dataset_id = coverage.dataset_id
-                    AND current_instance.sidechain = coverage.sidechain
-                    AND current_instance.sidechain_instance_id = coverage.sidechain_instance_id
-                  WHERE coverage.source = 'enforcer'
-                    AND coverage.stream = 'block'
-                    AND coverage.sidechain = :'sidechain'::smallint
-                    AND coverage.event_contract_version = run.event_contract_version
-                    AND coverage.status = 'complete'
-                    AND coverage.coverage_start_height = :'activation'::integer
-                    AND coverage.covered_tip_height = coverage.target_tip_height
-                    AND coverage.covered_tip_height >= :'minimum_target'::integer
-                    AND coverage.next_hash IS NULL
-                    AND (
-                        SELECT count(DISTINCT event.height)
-                          FROM event
-                         WHERE event.source = coverage.source
-                           AND event.dataset_id = coverage.dataset_id
-                           AND event.event_contract_version = coverage.event_contract_version
-                           AND event.kind = 'block_connected'
-                           AND event.sidechain = coverage.sidechain
-                           AND event.sidechain_instance_id = coverage.sidechain_instance_id
-                           AND event.height BETWEEN coverage.coverage_start_height
-                                                AND coverage.covered_tip_height
-                    ) = coverage.covered_tip_height - coverage.coverage_start_height + 1
-             ) THEN 1 ELSE 0 END" \
-            --set=sidechain="${sidechain}" \
-            --set=activation="${activation_height}" \
-            --set=minimum_target="${minimum_target_height}"
-    )" || return 1
-    [[ "${complete}" == 1 ]]
+    record_history_is_complete block "$1" "$2" "$3"
 }
 
 history_coverage_json() {
@@ -986,6 +929,7 @@ history_coverage_json() {
         "SELECT COALESCE(jsonb_agg(row ORDER BY (row->>'sidechain')::integer), '[]'::jsonb)
            FROM (
              SELECT jsonb_build_object(
+                 'source', coverage.source,
                  'stream', coverage.stream,
                  'sidechain', coverage.sidechain,
                  'sidechain_instance_id', coverage.sidechain_instance_id,
@@ -1017,7 +961,7 @@ history_coverage_json() {
                 AND extractor.source = coverage.source
                JOIN extractor_run run
                  ON run.run_id = extractor.run_id
-              WHERE coverage.source = 'enforcer'
+              WHERE coverage.source IN ('enforcer','node')
                 AND coverage.event_contract_version = run.event_contract_version
            ) coverage_rows"
 }
@@ -1375,4 +1319,16 @@ require_node_monitoring_ready() {
     historical_blocks="$(jq -r '.chainstates[0].blocks // "unavailable"' <<<"${chainstates}")"
     active_blocks="$(jq -r '.chainstates[-1].blocks // "unavailable"' <<<"${chainstates}")"
     die "ecash-node is not ready for monitoring (chainstates=${chainstate_count}, historical_blocks=${historical_blocks}, active_blocks=${active_blocks}); require one fully validated chainstate or set TRUST_ASSUMEUTXO_SNAPSHOT=true and load the pinned snapshot at ${ECASH_SNAPSHOT_BLOCK_HASH}"
+}
+
+# A cutover archive is valid only while this exact writer remains stopped.
+# Preserve Docker's full timestamp; second-resolution file mtimes can miss a
+# stop/start/stop within the same second.
+frozen_writer_identity() {
+    local container identity
+    container="$(compose ps -a -q enforcer-extractor)"
+    [[ "$container" =~ ^[a-f0-9]{12,64}$ ]] || die 'expected exactly one stopped extractor container'
+    identity="$(docker inspect --format '{{.Id}} {{.State.StartedAt}} {{.State.Running}}' "$container")"
+    [[ "$identity" == *' false' ]] || die 'extractor must be stopped before freezing its identity'
+    printf '%s\n' "$identity"
 }

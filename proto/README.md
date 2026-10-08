@@ -1,120 +1,78 @@
-# Monitor event schema
+# Monitor event contract 9
 
-The files in this directory define the stable protobuf contract published by
-`bip300-monitor`. They are deliberately separate from `proto/upstream`, which
-contains the pinned enforcer API used as an input.
+`event.proto` is the normalized monitor envelope; `enforcer_extractor.proto`
+contains its payloads. `upstream/` is a verbatim pinned official API input,
+checked by `.github/scripts/check-proto-vendor.sh`. Contract 9 removed the
+fork-only payload types; their field numbers and names are reserved. A fresh
+dataset and SQL schema 10 are required.
 
-`event.proto` defines the top-level envelope. Like `peer-observer`, every
-payload carries the time at which the monitor constructed it and a `oneof`
-identifying the extractor. `enforcer_extractor.proto` contains normalized
-events derived from the enforcer's read-only validator API.
+## Sources and identity
 
-All envelopes are published to the stable Core NATS subject
-`bip300.enforcer`. Consumers select the concrete payload through the protobuf
-`oneof`; the subject is intentionally not split by sidechain slot or event
-variant in the first pilot.
+Enforcer events use NATS `bip300.enforcer`; node events use `bip300.node`.
+Core NATS is at-most-once, non-durable fan-out. PostgreSQL is authoritative;
+historical pages bypass NATS. Normalized protobuf envelopes are not original
+RPC wire messages. Fields never exposed by upstream cannot be reconstructed.
 
-## Semantics
+Hashes and txids, including the M6 identifier, are exactly 32 bytes in display
+order. Work is a 32-byte little-endian
+integer: `block_work` is per-block work, `cumulative_work` is absolute chainwork.
+Only node headers supply cumulative work; official enforcer headers leave it
+empty. Raw node bytes are verified against their hash, header, Merkle root and
+witness commitment. Description identity hashes the decoded description vector,
+excluding its CompactSize prefix. Unknown enum numbers remain raw integers.
+JSON u64 values require lossless parsing; Observatory emits decimal strings.
 
-- `Event.timestamp` is the observation time in Unix milliseconds. It is not a
-  Bitcoin block timestamp.
-- `Event.observed_at_block` is the mainchain block the observation is anchored
-  to, and it is what makes an event joinable to a height. For a block event it
-  is the block the event is about. For a state snapshot it is the enforcer's
-  tip when the state was read — an anchor, **not** a claim that the state is
-  exactly as of that height, because reading state is a poll and the enforcer
-  can advance between one field and the next.
-- `ObservedBlock.height` is absent when the source did not report one. A
-  disconnect names only the block being disconnected, so its height has to be
-  recovered from the connect that preceded it. An absent height is never
-  published as zero.
-- Hashes and transaction IDs are decoded from the enforcer's `ReverseHex`
-  values and stored as 32 bytes in conventional display order.
-- Fields documented as consensus-encoded preserve the byte order and any
-  length prefix supplied by the enforcer's `ConsensusHex` value.
-- A sidechain description is stored with that consensus `CompactSize` length
-  prefix, but its BIP300 identity is SHA256d of the decoded description bytes
-  only. `description_hash` is stored in conventional display order and is
-  verified against every M1 and proposal response that already carries the
-  upstream hash. Active-sidechain responses do not carry it, so the monitor
-  calculates and includes it in contract v6.
-- `Bip300BlockDelta` is global, one fact per mainchain block. It preserves each
-  exact matching coinbase `scriptPubKey`, its `vout`, parsed fields and whether
-  the enforcer accepted it. Resolved effects and treasury transitions come
-  from the enforcer's persisted block diff, not from monitor-side inference.
-- Unknown protobuf enum numbers remain their raw `i32` values in the normalized
-  event. Consumers must not collapse a future number into today's
-  `UNSPECIFIED` meaning.
-- Proposal, active-sidechain, CTIP, and withdrawal-bundle-proposal messages are
-  snapshots, not deltas. They are published once at startup and then again
-  whenever a connected or disconnected block changed their value, so a consumer
-  sees the latest state without diffing. An unchanged snapshot is not
-  republished, and `ChainInfo` and `ChainTip` are published only at startup.
-- Because a refresh is a poll rather than a per-block query, a snapshot
-  describes the state at the moment it was read. Under fast blocks two heights
-  can coalesce into one refresh, so consecutive snapshots are consecutive
-  observations, not consecutive blocks. This is a property of the enforcer API,
-  not of the monitor: `GetCtip`, `GetSidechains`, `GetSidechainProposals` and
-  `GetWithdrawalBundleProposals` only answer for the current tip, and no RPC
-  answers "the state at block X", so a value that changed and reverted inside one
-  coalesced window leaves no observation behind.
-- A snapshot's `observed_at_block` is the tip it was read against, which under a
-  moving chain can be a later block than the one whose arrival triggered the
-  read — and can therefore be a block with no `BlockConnected` of its own yet.
-- PostgreSQL wraps every unary snapshot in a `snapshot_group` containing
-  `tip_before`, `tip_after`, the read interval, attempt count and either
-  `stable` or `changed`. Three bounded attempts are made; a moving chain is
-  persisted explicitly as `changed`, never mislabeled stable.
-- A live BMM auction has a stricter rule: the extractor reads the tip, asks
-  `GetSeenBmmRequests` for exactly that parent, and reads the tip again. It
-  discards and retries a response when the parent moved and persists only a
-  `stable` group whose two tips, event anchor, and payload parent are equal.
-  The BMM worker reads the current tip on its own five-second sampling cycle.
-  The independent 30-second tip poll can also wake it early after that poll
-  detects a move, but this notification is not immediate and correctness does
-  not depend on it.
-- Reorgs are recorded, not repaired. `BlockDisconnected` says a block left the
-  chain; the preceding `BlockConnected` fact remains because this is an
-  observation log, not a mutable current-chain view. The fact is idempotent,
-  while `event_observation` retains every repeated capture and
-  `tip_observation` retains transitions such as `A -> B -> A` in `capture_seq`
-  order. Reconstructing the surviving chain is the consumer's job.
-- `WithdrawalBundleProposalsSnapshot` carries the bundles still being voted on.
-  Its `vote_count` is read against
-  `Bip300Constants.withdrawal_bundle_inclusion_threshold` and its
-  `proposal_height` against `withdrawal_bundle_max_age`. The terminal outcome of
-  a bundle stays where it was, in `BlockConnected.events`.
-- Block events are scoped to the explicitly configured sidechain slot because
-  the upstream subscription is also per slot.
-- Block event order is preserved within a sidechain slot. A reorganization is
-  represented by the enforcer's ordered disconnect and connect events.
-- There is no global ordering guarantee across sidechain slots. The same
-  mainchain block is published once per configured slot with that slot's
-  filtered data.
-- An absent `CtipSnapshot.ctip` means that the sidechain has no current CTIP.
-- Startup can capture a block in both backfill and the buffered live stream.
-  Consumers that need unique facts use `event`; consumers that need delivery,
-  replay or reorg order join `event_observation` to `event` and order by
-  `(run_id, capture_seq)`.
+Immutable facts and capture occurrences have separate identities. Facts dedupe
+by payload; conflicting block content is retained and stops certification.
+Occurrences retain run, capture sequence, read window and capture method.
+Sequence is local capture order, not a global consensus order.
 
-Conversions reject missing required input fields, malformed hex, and hashes
-that are not exactly 32 bytes. This prevents incomplete upstream responses from
-being published as valid-looking zero values.
+## Observation guarantees
 
-`ConfirmedBmmRequest.fee_sats` is absent in the reviewed enforcer response and
-the monitor does not infer it. Confirmed M8 history therefore contains the
-request identity and effects exposed by the enforcer; live mempool samples are
-the source of `bid_sats`.
+`Event.timestamp` is monitor construction time. Block payloads identify the
+block they describe. State snapshots (active sidechains, proposals, CTIP,
+pending bundles) have no block anchor. Their snapshot group records tip before,
+tip after, read interval and attempts. `tip_matched` means equal tips were read;
+it does not prove atomicity or rule out A → B → A. Revisions stay null.
+Use `state_snapshot_tip_matched` for this limited guarantee. Legacy
+`state_snapshot_stable` does not certify official-source state.
 
-Core NATS transport is at-most-once and non-durable. A successful bounded client
-flush confirms that its transport write buffer was emptied; it does not confirm
-that the server processed the bytes or that any consumer received or persisted
-the event. The protobuf schema therefore defines observation data, not an
-exactly-once delivery protocol.
+Mutable state is captured on startup and refreshed on tip changes; changed
+windows are retried. Every reading is recorded, unchanged values included, so
+the latest occurrence shows how recently a value was confirmed. Identical
+payloads may have different occurrence quality.
+Consumers must select the latest occurrence before checking its quality.
+Several blocks can pass within one read; values between observations are unknown.
+An absent CTIP is observed absence, not a zero balance.
 
-The stored `event.envelope` is this normalized monitor protobuf, not the
-upstream wire response. Raw consensus-relevant fields are included explicitly;
-the envelope cannot recreate fields the input API never exposed.
+GetSeenBmmRequests samples a specific parent every five seconds. Parent-moving
+reads are retried. Every accepted occurrence is retained, including empty lists.
+Matching parent tips do not establish mempool readiness or exhaustive bid
+coverage. Samples in the readiness grace after start are `unknown`. No session,
+generation or ready flag is fabricated.
 
-When evolving the schema, add new fields with new numbers. Never change the
-meaning of an existing field number or reuse a removed number.
+Official SubscribeEvents(0) records global connects/disconnects even with no
+active slots. Slot 0 is a transport selector. There is no server sequence or
+atomic subscription baseline. Disconnect height may be absent. Every
+(re)subscription records a boundary (action 3) whose `gap_start` and header
+bound the interval with unknown transitions; the failure itself is also in
+observation_failure. Historical backfill cannot reproduce unseen live
+transitions.
+
+Per-slot GetBlockInfo supplies BMM commitments, deposits and bundle outcomes.
+Independent node history supplies raw blocks/headers and absolute work. Both
+are resumable and hash-linked; reorg repair preserves earlier coverage while
+walking to a certified ancestor. Node and enforcer tips are not interchangeable.
+The Observatory derives branch membership from parent links and enforcer tips;
+node disagreement blocks joint certification. Unsupported historical M1–M8
+resolved effects remain unknown; no private consensus rules are replayed.
+
+Optional confirmed BMM fees require an observed bid, matching official
+commitment and a transaction in the node block. Exact input-minus-output fee
+comes from node getblock verbosity 3. Coverage is `observed_bids_only`;
+only bids from tip-matched samples count. Unavailable prevouts produce an
+unknown reason, never zero, and bounded retries until every active slot's block
+fact exists.
+
+Add fields with new numbers. Never repurpose wire numbers or relabel old
+contract evidence as new guarantees.

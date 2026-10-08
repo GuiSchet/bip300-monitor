@@ -20,7 +20,7 @@ const CLIENT_NAME: &str = "bip300-monitor-event-logger";
 pub async fn run(args: Args, mut shutdown_rx: watch::Receiver<bool>) -> Result<()> {
     args.validate().context("validating logger configuration")?;
 
-    let connect = EventSubscriber::connect(&args.nats, Subject::Enforcer, CLIENT_NAME);
+    let connect = EventSubscriber::connect(&args.nats, Subject::All, CLIENT_NAME);
     tokio::pin!(connect);
     let mut subscriber = tokio::select! {
         biased;
@@ -32,7 +32,7 @@ pub async fn run(args: Args, mut shutdown_rx: watch::Receiver<bool>) -> Result<(
     };
 
     tracing::info!(
-        subject = %Subject::Enforcer,
+        subject = %Subject::All,
         full_events = args.full_events,
         "event logger subscription is ready"
     );
@@ -70,7 +70,7 @@ pub async fn run(args: Args, mut shutdown_rx: watch::Receiver<bool>) -> Result<(
             ReceivedEvent::Invalid { error, payload_len } => {
                 invalid_event_count = invalid_event_count.saturating_add(1);
                 tracing::warn!(
-                    subject = %Subject::Enforcer,
+                    subject = %Subject::All,
                     invalid_event_count,
                     payload_len,
                     error = %error,
@@ -84,7 +84,7 @@ pub async fn run(args: Args, mut shutdown_rx: watch::Receiver<bool>) -> Result<(
             continue;
         };
         tracing::info!(
-            subject = %Subject::Enforcer,
+            subject = %Subject::All,
             timestamp_ms = event.timestamp,
             event = rendered.kind,
             summary = %rendered.summary,
@@ -92,7 +92,7 @@ pub async fn run(args: Args, mut shutdown_rx: watch::Receiver<bool>) -> Result<(
         );
         if let Some(payload) = rendered.full_json.as_deref() {
             tracing::info!(
-                subject = %Subject::Enforcer,
+                subject = %Subject::All,
                 timestamp_ms = event.timestamp,
                 event = rendered.kind,
                 payload = %payload,
@@ -119,7 +119,7 @@ fn render_event(
         Err(error) => {
             *invalid_event_count = invalid_event_count.saturating_add(1);
             tracing::warn!(
-                subject = %Subject::Enforcer,
+                subject = %Subject::All,
                 invalid_event_count = *invalid_event_count,
                 error = %format!("{error:#}"),
                 "discarded an invalid enforcer event"

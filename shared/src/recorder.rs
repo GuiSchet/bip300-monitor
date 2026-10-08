@@ -77,9 +77,22 @@ impl Recorder {
         })
     }
 
+    /// Last tip this source recorded before the current run started.
+    pub fn previous_run_tip(&self) -> Option<&ObservedBlock> {
+        self.store.previous_run_tip()
+    }
+
     /// Record one event and fan it out.
     pub async fn record(&self, event: Event) -> Result<()> {
         self.record_batch(vec![event]).await
+    }
+
+    pub async fn record_fee_enrichment(&self, source_event_id: i64, event: Event) -> Result<()> {
+        self.store
+            .record_fee_enrichment(source_event_id, &event)
+            .await?;
+        self.fan_out(&[event]).await;
+        Ok(())
     }
 
     /// Record an event against the exact activation whose stream supplied it.

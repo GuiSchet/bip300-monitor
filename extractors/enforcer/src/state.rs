@@ -46,11 +46,15 @@ pub(crate) async fn collect(
     discover_new_slots: bool,
 ) -> Result<Reading> {
     let started_at = SystemTime::now();
-    let tip_before = tip_anchor(&convert::chain_tip(client.get_chain_tip().await?)?)?;
+    let before = client.get_chain_tip().await?;
+    let revision_before = None;
+    let tip_before = tip_anchor(&convert::chain_tip(before)?)?;
     let payloads = collect_payloads(client, sidechains, discover_new_slots).await?;
-    let tip_after = tip_anchor(&convert::chain_tip(client.get_chain_tip().await?)?)?;
-    let consistency = if tip_before.hash == tip_after.hash {
-        SnapshotConsistency::Stable
+    let after = client.get_chain_tip().await?;
+    let revision_after = None;
+    let tip_after = tip_anchor(&convert::chain_tip(after)?)?;
+    let consistency = if tip_before.hash == tip_after.hash && revision_before == revision_after {
+        SnapshotConsistency::TipMatched
     } else {
         SnapshotConsistency::Changed
     };
@@ -58,6 +62,8 @@ pub(crate) async fn collect(
         anchor: tip_before.clone(),
         payloads,
         metadata: SnapshotMetadata {
+            revision_before,
+            revision_after,
             started_at,
             finished_at: SystemTime::now(),
             tip_before,
@@ -99,15 +105,73 @@ pub(crate) async fn collect_payloads(
     Ok(payloads)
 }
 
+/// One state reading to publish.
+#[derive(Debug, PartialEq)]
+pub(crate) struct Publication {
+    /// Every payload read, unchanged ones included.
+    pub(crate) payloads: Vec<events::EnforcerEvent>,
+    /// The payloads whose value differs from the previous reading.
+    pub(crate) changed: Vec<events::EnforcerEvent>,
+}
+
+impl Publication {
+    /// Whether the set of active sidechains changed, which is what lifecycle
+    /// consumers react to.
+    pub(crate) fn active_sidechains_changed(&self) -> bool {
+        self.changed
+            .iter()
+            .any(|payload| active_instances(payload).is_some())
+    }
+}
+
 /// Remembers the last published value of each mutable-state payload.
 pub(crate) struct Tracker {
     last: Vec<events::EnforcerEvent>,
+    last_consistency: SnapshotConsistency,
 }
 
 impl Tracker {
     /// Seed the tracker with the payloads published in the initial snapshot.
     pub(crate) const fn new(published: Vec<events::EnforcerEvent>) -> Self {
-        Self { last: published }
+        Self {
+            last: published,
+            last_consistency: SnapshotConsistency::TipMatched,
+        }
+    }
+
+    pub(crate) const fn with_consistency(mut self, consistency: SnapshotConsistency) -> Self {
+        self.last_consistency = consistency;
+        self
+    }
+
+    pub(crate) fn needs_retry(&self) -> bool {
+        self.last_consistency == SnapshotConsistency::Changed
+    }
+
+    /// Every reading is published, unchanged payloads included: an unchanged
+    /// value re-read at a later tip is evidence that it still held there, and
+    /// identical facts deduplicate to one event with another occurrence.
+    pub(crate) fn take_observation(
+        &mut self,
+        current: Vec<events::EnforcerEvent>,
+        consistency: SnapshotConsistency,
+    ) -> Result<Publication> {
+        self.last_consistency = consistency;
+        // Changes are measured against the last tip-matched reading: a reading
+        // taken while the tip moved is published but is not a baseline, so the
+        // stable retry still reports what changed (e.g. a new activation).
+        let changed = if consistency == SnapshotConsistency::TipMatched {
+            self.take_changed(current.clone())?
+        } else {
+            let previous = self.last.clone();
+            let changed = self.take_changed(current.clone())?;
+            self.last = previous;
+            changed
+        };
+        Ok(Publication {
+            payloads: current,
+            changed,
+        })
     }
 
     /// Return the payloads that differ from the last published value, and
@@ -218,6 +282,7 @@ pub(crate) fn block_anchor(payload: &events::EnforcerEvent) -> Result<ObservedBl
 #[cfg(test)]
 mod tests {
     use shared::protobuf::enforcer_extractor as events;
+    use shared::store::SnapshotConsistency;
 
     use super::{Tracker, active_instances, block_anchor, tip_anchor};
 
@@ -256,7 +321,8 @@ mod tests {
             hash: vec![hash; 32],
             previous_hash: vec![hash.wrapping_sub(1); 32],
             height,
-            chain_work: vec![0x44; 32],
+            block_work: vec![1; 32],
+            cumulative_work: vec![0x44; 32],
             timestamp: 1_750_000_000,
         }
     }
@@ -272,6 +338,44 @@ mod tests {
                 },
             )),
         }
+    }
+
+    #[test]
+    fn every_reading_is_published_and_changes_are_reported() {
+        let payload = vec![ctip(9, 100)];
+        let mut tracker = Tracker::new(payload.clone());
+        let publication = tracker
+            .take_observation(payload.clone(), SnapshotConsistency::Changed)
+            .unwrap();
+        assert_eq!(publication.payloads, payload);
+        assert!(publication.changed.is_empty());
+        assert!(tracker.needs_retry());
+        // An unchanged re-read is still published as a new occurrence.
+        let publication = tracker
+            .take_observation(payload.clone(), SnapshotConsistency::TipMatched)
+            .unwrap();
+        assert_eq!(publication.payloads, payload);
+        assert!(publication.changed.is_empty());
+        assert!(!tracker.needs_retry());
+        let publication = tracker
+            .take_observation(vec![ctip(9, 150)], SnapshotConsistency::TipMatched)
+            .unwrap();
+        assert_eq!(publication.changed, vec![ctip(9, 150)]);
+        assert!(!publication.active_sidechains_changed());
+    }
+
+    #[test]
+    fn a_change_first_read_while_the_tip_moved_is_reported_when_stable() {
+        let mut tracker = Tracker::new(vec![ctip(9, 100)]);
+        let moving = tracker
+            .take_observation(vec![ctip(9, 150)], SnapshotConsistency::Changed)
+            .unwrap();
+        assert_eq!(moving.changed, vec![ctip(9, 150)]);
+        // The moving read is no baseline: the stable retry reports it again.
+        let stable = tracker
+            .take_observation(vec![ctip(9, 150)], SnapshotConsistency::TipMatched)
+            .unwrap();
+        assert_eq!(stable.changed, vec![ctip(9, 150)]);
     }
 
     #[test]
