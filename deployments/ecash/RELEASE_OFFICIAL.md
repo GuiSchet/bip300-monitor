@@ -40,7 +40,7 @@ each pinned by a registry digest verified with an anonymous manifest fetch:
 
 - Official enforcer `1753fc0`: `docker.io/guischet/bip300-enforcer-official`,
   pushed byte-for-byte from the locally built OCI archive (same digest).
-- Extractor and event logger: built by CI from merge commit `13dfbf7`.
+- Extractor and event logger: built by CI from merge commit `5642b87`.
 
 `RELEASE_STATUS=ready` permits an operator-approved start. The Observatory image
 is still to be rebuilt from its merged commit before a production deployment.
