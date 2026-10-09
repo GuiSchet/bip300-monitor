@@ -45,21 +45,18 @@ each pinned by a registry digest verified with an anonymous manifest fetch:
 `RELEASE_STATUS=ready` permits an operator-approved start. The Observatory image
 is still to be rebuilt from its merged commit before a production deployment.
 
-## Cutover
+## Fresh start
 
-1. Freeze and export the old monitor record using the existing backup workflow.
-   Verify a separate restore and the paired Observatory backup before finalizing.
-2. Preserve the old enforcer directory. Use `enforcer-official-v8` for official
-   upstream; never open the fork database with an official binary.
-3. Start a fresh monitor database (contract 9) and fresh Observatory database
-   (projection 8). Do not reuse an old dataset or migrate its interpretation.
-   Run `just grant-reader` to provision the Observatory's read-only role.
-4. Verify the node and enforcer activation hash and tips, global node history,
+Every deployment starts from an empty record; no earlier dataset is migrated.
+
+1. Use a fresh `enforcer-official-v8` data directory (the path the Compose file
+   mounts) for the official upstream enforcer.
+2. Start a fresh monitor database (contract 9) and a fresh Observatory database
+   (projection 8). Run `just grant-reader` to provision the Observatory's
+   read-only role.
+3. Verify the node and enforcer activation hash and tips, global node history,
    per-slot hash-linked history, conflicts, snapshot quality and worker health.
-5. Record the actual official source SHA and image digest. Compatibility is
+4. Record the actual official source SHA and image digest. Compatibility is
    checked by schema/contract/capabilities, not a hardcoded consumer SHA.
-6. Roll back by stopping both new consumers and restoring the paired old record,
-   projection, locks and enforcer directory. Keep both archives. Never run an
-   old binary against the new database.
 
-No HOSTKEY changes have been applied by this implementation.
+Backups and any later record reset follow [BACKUP.md](BACKUP.md).
