@@ -3,6 +3,9 @@ Description=Copy and restore HOSTKEY backups on the operator computer
 
 [Service]
 Type=oneshot
-ExecStart=/usr/bin/python3 %h/.local/lib/bip300-monitor/offhost-backup.py --host root@162.141.78.240 --identity %h/.ssh/bip300-alpha --local-root %h/.local/share/bip300-monitor/backups/betanet
+# The VPS address and SSH key path stay on the operator computer, outside the
+# repository. Copy offhost.env.example to ~/.config/bip300-monitor/offhost.env.
+EnvironmentFile=%h/.config/bip300-monitor/offhost.env
+ExecStart=/usr/bin/python3 %h/.local/lib/bip300-monitor/offhost-backup.py --host ${BIP300_BACKUP_HOST} --identity ${BIP300_BACKUP_IDENTITY} --local-root %h/.local/share/bip300-monitor/backups/betanet
 UMask=0077
 Nice=10

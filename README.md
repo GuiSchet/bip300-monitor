@@ -66,8 +66,8 @@ PostgreSQL is authoritative. NATS subjects are `bip300.enforcer` and
 transaction wait/duration metrics and growth should be monitored. No retention
 of observations is silently introduced.
 
-See [event semantics](proto/README.md), [candidate cutover](deployments/ecash/RELEASE_OFFICIAL.md),
-[backup/rollback](deployments/ecash/BACKUP_V7.md), and
+See [event semantics](proto/README.md), [the official release](deployments/ecash/RELEASE_OFFICIAL.md),
+[backup/rollback](deployments/ecash/BACKUP.md), and
 [quality SQL](deployments/ecash/scripts/quality-report.sql).
 
 ## Run locally
@@ -117,12 +117,10 @@ NATS_SERVER_BINARY=/path/to/nats-server \
 CI publishes separate `linux/amd64` extractor and logger images. See
 [container images](docs/container-images.md) for tags and reproducible pins.
 
-The locked eCash Alphanet stack includes the node, enforcer, Postgres, Core
+The locked eCash Betanet stack includes the node, enforcer, Postgres, Core
 NATS, extractor and logger. See the
 [eCash deployment runbook](deployments/ecash/README.md) for provisioning,
 verification, history status, resource limits and recovery.
-The gated HOSTKEY transition to Betanet is documented in the
-[Betanet migration runbook](docs/betanet-migration.md).
 
 ## Scope
 

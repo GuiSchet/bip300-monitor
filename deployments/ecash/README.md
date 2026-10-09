@@ -8,10 +8,10 @@ the node configuration is generated from those values plus
 `config/ecash.conf.template`. The scripts and Compose topology are shared so a
 future Beta or Mainnet transition does not require another deployment copy.
 
-The reviewed, fail-closed HOSTKEY transition procedure and its Alphanet
-preservation gates are in
-[`docs/betanet-migration.md`](../../docs/betanet-migration.md). The active lock
-contains the reproduced snapshot hash and immutable image digests.
+The active lock contains the reproduced snapshot hash and immutable image
+digests; `VERSIONS.betanet.lock.example` keeps the reviewed Betanet values as an
+audit reference. Backups and record resets are described in
+[`BACKUP.md`](BACKUP.md).
 
 Betanet is experimental. Use a dedicated data directory and no real funds.
 
