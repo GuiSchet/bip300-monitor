@@ -575,7 +575,7 @@ jq -e '.services["enforcer-extractor"].environment.BIP300_MONITOR_BACKFILL_PAGE_
     and (.services["enforcer-extractor"].environment
          | has("BIP300_MONITOR_BACKFILL_MAX_BLOCKS") | not)' \
     <<<"${config_json}" >/dev/null
-jq -e '.services["enforcer-extractor"].mem_limit == "536870912"
+jq -e '.services["enforcer-extractor"].mem_limit == "1610612736"
     and .services.postgres.mem_limit == "1073741824"' <<<"${config_json}" >/dev/null
 
 # Neither monitor service exposes a port, so each one proves it is alive by

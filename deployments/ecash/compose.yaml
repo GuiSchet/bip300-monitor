@@ -246,8 +246,10 @@ services:
     restart: on-failure
     stop_grace_period: 20s
     # A bad upstream response is contained to this process instead of causing a
-    # host-wide OOM. The durable page cursor makes a restart safe.
-    mem_limit: 512m
+    # host-wide OOM. The durable page cursor makes a restart safe. Confirmed
+    # fee enrichment holds whole `getblock` verbosity-3 responses: at 512m it
+    # reached the limit and paged to swap, so the limit leaves it headroom.
+    mem_limit: 1536m
     # Its own UID, but PGID as the group so it can read the group-readable
     # Postgres password without sharing an identity with any other service.
     user: 10001:${PGID:-1000}
