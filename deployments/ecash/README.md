@@ -255,8 +255,11 @@ Two different gaps follow from that, and only one of them is about transport:
   has it.
 
 `just status` reports start, cursor, target, page size and percentage per slot.
-The Compose limits are 512 MiB for the extractor and 1 GiB for Postgres so a bad
-response cannot turn into host-wide memory pressure.
+The Compose limits are 1.5 GiB for the extractor and 1 GiB for Postgres so a bad
+response cannot turn into host-wide memory pressure. The extractor's limit
+leaves room for confirmed fee enrichment (`BIP300_MONITOR_CONFIRMED_BMM_FEES`),
+which reads each block with `getblock` verbosity 3: at 512 MiB it ran at the
+limit and paged to swap.
 
 For an intentional Betanet record rebuild, `just reset-record betanet` first
 creates a checksummed `pg_dump`, stops only the extractor and Postgres, moves
