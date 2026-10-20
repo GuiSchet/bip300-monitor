@@ -314,10 +314,17 @@ jobs:
         with:
           persist-credentials: false
 
+      # One vendored API serves every network, so each pinned reference must
+      # name the same official commit. A candidate may not pin one yet.
       - name: Verify the vendored enforcer API
-        env:
-          BIP300_MONITOR_PROTO_VERSIONS_FILE: deployments/ecash/VERSIONS.betanet.lock.example
-        run: ./.github/scripts/check-proto-vendor.sh --online
+        run: |
+          for lock in deployments/ecash/VERSIONS.*.lock.example; do
+            if grep -q '^ENFORCER_COMMIT=REPLACE_WITH_' "${lock}"; then
+              echo "${lock}: enforcer not pinned yet"
+              continue
+            fi
+            BIP300_MONITOR_PROTO_VERSIONS_FILE="${lock}" ./.github/scripts/check-proto-vendor.sh --online
+          done
 
   # Deployment checks live under deployments/ecash. Keeping the
   # job separate means infrastructure PRs remain fast and cannot publish code.

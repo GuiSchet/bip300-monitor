@@ -73,7 +73,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--host")
     parser.add_argument("--identity", type=Path)
-    parser.add_argument("--remote-root", default="/srv/bip300-monitor/betanet/backups")
+    parser.add_argument("--network", help="monitor network; its VPS backups are under /srv/bip300-monitor/NETWORK/backups")
+    parser.add_argument("--remote-root", help="VPS backup directory, instead of the one --network names")
     parser.add_argument("--local-root", type=Path, required=True)
     parser.add_argument("--archive", help="copy only this permanent cutover archive")
     parser.add_argument("--restore-only", action="store_true", help="validate one already copied archive; no SSH")
@@ -84,6 +85,10 @@ def main():
         return
     if not args.host or not args.identity or not re.fullmatch(r"(?:[A-Za-z0-9._-]+@)?[A-Za-z0-9][A-Za-z0-9.-]*", args.host):
         parser.error("--host and --identity are required")
+    if args.remote_root is None:
+        if not args.network or not re.fullmatch(r"[a-z0-9][a-z0-9-]*", args.network):
+            parser.error("--network or --remote-root is required")
+        args.remote_root = f"/srv/bip300-monitor/{args.network}/backups"
     ssh = ["ssh", "-o", "BatchMode=yes", "-o", "IdentitiesOnly=yes", "-o", "StrictHostKeyChecking=yes",
            "-o", "HostKeyAlgorithms=ssh-ed25519", "-i", str(args.identity), args.host]
     root = shlex.quote(args.remote_root)

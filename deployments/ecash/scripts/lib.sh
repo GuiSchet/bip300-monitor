@@ -47,7 +47,12 @@ load_versions() {
     # This file is tracked in the repository and contains assignments only.
     # shellcheck disable=SC1090
     source "${VERSIONS_FILE}"
+    validate_versions
+}
 
+# Checks the values of whichever lock was sourced: the active VERSIONS.lock, or
+# a lock reference that check-lock.sh reviews without deploying it.
+validate_versions() {
     : "${LOCK_FORMAT:?LOCK_FORMAT must be locked}"
     : "${NETWORK_ID:?NETWORK_ID must be locked}"
     : "${ECASH_NODE_CHAIN:?ECASH_NODE_CHAIN must be locked}"
@@ -71,7 +76,7 @@ load_versions() {
     : "${ECASH_SNAPSHOT_URL:?ECASH_SNAPSHOT_URL must be locked}"
     : "${ECASH_SNAPSHOT_SIZE:?ECASH_SNAPSHOT_SIZE must be locked}"
     : "${ECASH_SNAPSHOT_SHA256:?ECASH_SNAPSHOT_SHA256 must be locked}"
-    : "${ENFORCER_NETWORK_PRESET:?ENFORCER_NETWORK_PRESET must be locked}"
+    : "${ENFORCER_NETWORK_ARG:?ENFORCER_NETWORK_ARG must be locked}"
     : "${ENFORCER_API_NETWORK:?ENFORCER_API_NETWORK must be locked}"
     : "${ENFORCER_UPSTREAM_REVIEWED_COMMIT:?ENFORCER_UPSTREAM_REVIEWED_COMMIT must be locked}"
     : "${MONITOR_EVENT_CONTRACT_VERSION:?MONITOR_EVENT_CONTRACT_VERSION must be locked}"
@@ -97,6 +102,10 @@ load_versions() {
         die "ECASH_SNAPSHOT_SHA256 must contain 64 hexadecimal characters"
     [[ "${ENFORCER_UPSTREAM_REVIEWED_COMMIT}" =~ ^[[:xdigit:]]{40}$ ]] ||
         die "ENFORCER_UPSTREAM_REVIEWED_COMMIT must contain 40 hexadecimal characters"
+    # The enforcer names its network with --network-preset up to 1753fc0 and
+    # with --fork from LayerTwo-Labs/bip300301_enforcer#666 on.
+    [[ "${ENFORCER_NETWORK_ARG}" =~ ^--(network-preset|fork)=[a-z][a-z-]*$ ]] ||
+        die "ENFORCER_NETWORK_ARG must be --network-preset=<preset> or --fork=<fork>"
     case "${ECASH_SNAPSHOT_TRANSFORM}" in
     none)
         : "${ECASH_SNAPSHOT_CHECKSUMS_URL:?ECASH_SNAPSHOT_CHECKSUMS_URL must be locked for a direct snapshot}"
@@ -137,6 +146,46 @@ load_versions() {
     ((ECASH_SNAPSHOT_HEIGHT <= ECASH_ACTIVATION_HEIGHT)) ||
         die "ECASH_SNAPSHOT_HEIGHT must not be after ECASH_ACTIVATION_HEIGHT; otherwise activation-era block bodies can be skipped"
     network_peers >/dev/null
+}
+
+# The reviewed lock of a network; the active VERSIONS.lock must equal it.
+network_lock_reference() {
+    printf '%s/VERSIONS.%s.lock.example\n' "${DEPLOYMENT_ROOT}" "$1"
+}
+
+# Pins static-check.sh and check-lock.sh require of a promotable lock.
+validate_release_pins() {
+    [[ -f "$(network_lock_reference "${NETWORK_ID}")" ]] ||
+        die "network ${NETWORK_ID} has no reviewed lock reference"
+    [[ "${ECASH_SNAPSHOT_TRANSFORM}" == network_magic_v2 ]] ||
+        die "only the network_magic_v2 snapshot transform is reviewed"
+    [[ "${ECASH_SNAPSHOT_SOURCE_NETWORK_MAGIC}" == f9beb4d9 ]] ||
+        die "the snapshot source must be a Bitcoin snapshot"
+    [[ "${ECASH_NETWORK_MAGIC}" =~ ^[[:xdigit:]]{8}$ ]] ||
+        die "ECASH_NETWORK_MAGIC must contain 8 hexadecimal characters"
+    [[ "${ECASH_NODE_COMMIT}" =~ ^[[:xdigit:]]{40}$ ]] ||
+        die "ECASH_NODE_COMMIT must contain 40 hexadecimal characters"
+    [[ "${ENFORCER_COMMIT}" =~ ^[[:xdigit:]]{40}$ ]] ||
+        die "ENFORCER_COMMIT must contain 40 hexadecimal characters"
+    [[ "${ENFORCER_COMMIT}" == "${ENFORCER_UPSTREAM_REVIEWED_COMMIT}" ]] ||
+        die "ENFORCER_COMMIT is not the reviewed upstream commit"
+    [[ "${MONITOR_EVENT_CONTRACT_VERSION}" =~ ^[0-9]+$ ]] ||
+        die "MONITOR_EVENT_CONTRACT_VERSION must be numeric"
+    [[ "${MONITOR_IMAGE_COMMIT}" =~ ^[[:xdigit:]]{40}$ ]] ||
+        die "MONITOR_IMAGE_COMMIT must contain 40 hexadecimal characters"
+    # Network branches have a moving tag (betanet); mainnet is the default
+    # branch, published as latest and as an immutable sha- tag.
+    [[ "${ECASH_NODE_IMAGE}" == *":${ECASH_NODE_BRANCH}@sha256:"* ||
+        "${ECASH_NODE_IMAGE}" == *":sha-${ECASH_NODE_COMMIT:0:7}@sha256:"* ]] ||
+        die "ECASH_NODE_IMAGE must be pinned by digest under its branch or commit tag"
+    [[ "${ENFORCER_IMAGE}" == *":sha-${ENFORCER_COMMIT:0:12}@sha256:"* ]] ||
+        die "ENFORCER_IMAGE is not the build of ENFORCER_COMMIT"
+    [[ "${ENFORCER_EXTRACTOR_IMAGE}" == *":sha-${MONITOR_IMAGE_COMMIT:0:12}@sha256:"* ]] ||
+        die "ENFORCER_EXTRACTOR_IMAGE is not the build of MONITOR_IMAGE_COMMIT"
+    [[ "${EVENT_LOGGER_IMAGE}" == *":sha-${MONITOR_IMAGE_COMMIT:0:12}@sha256:"* ]] ||
+        die "EVENT_LOGGER_IMAGE is not the build of MONITOR_IMAGE_COMMIT"
+    [[ "${POSTGRES_IMAGE}" == *"@sha256:"* ]] ||
+        die "POSTGRES_IMAGE must be pinned by digest"
 }
 
 network_peers() {
@@ -329,6 +378,43 @@ load_deployment_env() {
 data_root() {
     : "${ECASH_DATA_ROOT:?load deployment environment before resolving its data root}"
     printf '%s\n' "${ECASH_DATA_ROOT}"
+}
+
+# The enforcer's data directory on the host, mounted at /data (compose.yaml).
+enforcer_data_dir() {
+    printf '%s/enforcer-official-v8\n' "$(data_root)"
+}
+
+# Moves the enforcer state from the layout up to bip300301_enforcer 1753fc0,
+# DIR/{validator,wallet}/LEGACY, to the one #666 introduced,
+# DIR/TARGET/{validator,wallet}; --rollback moves it back. Renames on one
+# filesystem only: nothing is copied. A part already moved is skipped, so an
+# interrupted run can be repeated.
+move_enforcer_state() {
+    local dir="$1" legacy="$2" target="$3" mode="${4:-}"
+    local part from to
+    local -a moves=()
+    for part in validator wallet; do
+        from="${dir}/${part}/${legacy}"
+        to="${dir}/${target}/${part}"
+        [[ "${mode}" != --rollback ]] || {
+            from="${dir}/${target}/${part}"
+            to="${dir}/${part}/${legacy}"
+        }
+        if [[ -e "${from}" && -e "${to}" ]]; then
+            die "both ${from} and ${to} exist; resolve them by hand"
+        elif [[ -e "${from}" ]]; then
+            moves+=("${from}" "${to}")
+        elif [[ ! -e "${to}" ]]; then
+            die "neither ${from} nor ${to} exists"
+        fi
+    done
+    while ((${#moves[@]})); do
+        mkdir -p -- "$(dirname -- "${moves[1]}")"
+        mv -T -- "${moves[0]}" "${moves[1]}"
+        info "moved ${moves[0]} to ${moves[1]}"
+        moves=("${moves[@]:2}")
+    done
 }
 
 # Remove reproducible transform inputs only after the caller has verified that

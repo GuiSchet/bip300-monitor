@@ -64,7 +64,7 @@ services:
       RUST_LOG: ${ENFORCER_RUST_LOG:-info}
     command:
       - --data-dir=/data
-      - --network-preset=${ENFORCER_NETWORK_PRESET:?ENFORCER_NETWORK_PRESET must be set by VERSIONS.lock}
+      - ${ENFORCER_NETWORK_ARG:?ENFORCER_NETWORK_ARG must be set by VERSIONS.lock}
       - --node-rpc-addr=ecash-node:${ECASH_NODE_RPC_PORT}
       - --node-rpc-cookie-path=/rpc-cookie/.cookie
       - --node-zmq-addr-sequence=tcp://ecash-node:${ECASH_NODE_ZMQ_PORT}

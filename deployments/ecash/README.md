@@ -211,6 +211,46 @@ Moving to another network requires an intentional change to the network lock.
 The project name, generated node configuration, and fresh data root then follow
 from `NETWORK_ID`. Never point a new network at an existing chainstate.
 
+### Mainnet on its own host
+
+Each network runs on its own host: two full nodes do not fit on one disk, and
+the enforcer refuses a pruned node. `VERSIONS.<network>.lock.example` is each
+network's reviewed reference, and the active `VERSIONS.lock` of a host must
+equal its own. `static-check.sh` checks the active lock in full and every other
+reference with `scripts/check-lock.sh`.
+
+`VERSIONS.mainnet.lock.example` is a **candidate** (`RELEASE_STATUS=candidate`):
+it locks the node (`master` at `6e58233`, image pinned by its `sha-` tag), the
+fork height `973728`, magic `eca5dcb7`, the mainnet peers and the
+height-`935000` snapshot, and leaves as `REPLACE_WITH_` what does not exist yet.
+`check-lock.sh` lists them:
+
+- `ENFORCER_*`: the merged commit of LayerTwo-Labs/bip300301_enforcer#666, the
+  first enforcer that supports mainnet (`ENFORCER_NETWORK_ARG=--fork=ecash`), and
+  its image;
+- `MONITOR_IMAGE_COMMIT` and the monitor images: the first build whose extractor
+  knows the mainnet preset;
+- `ECASH_SNAPSHOT_SHA256`: the hash of the snapshot rewritten to the mainnet
+  magic;
+- `ECASH_ACTIVATION_BLOCK_HASH`: the hash of block `973728`, known once it is
+  mined.
+
+A candidate cannot be started (`require_ready_release`). On the mainnet host:
+copy the reference to `VERSIONS.lock`, start only the node so it downloads and
+validates history before the fork, then pin the remaining values, set
+`RELEASE_STATUS=ready`, run `just preflight` and `static-check.sh`, and start the
+stack. The Observatory reads it through its own backend on that host.
+
+### Enforcer data directory after #666
+
+From #666 the enforcer keeps its state under `<data-dir>/<fork>/<chain>` instead
+of `validator/<chain>-<preset>` and `wallet/<chain>-<preset>`, and does not move
+it. When a host moves to the #666 enforcer, stop the enforcer and the extractor
+and run `bash scripts/migrate-enforcer-datadir.sh ecash-betanet` before starting
+the new image; it archives the data directory under `backups/` and renames the
+two directories, so the enforcer resumes from its height. `--rollback` restores
+the old layout for the old image.
+
 ## Network exposure
 
 Compose publishes no host ports. Node RPC, REST, ZMQ, enforcer gRPC, Postgres,

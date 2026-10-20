@@ -132,8 +132,8 @@ grep -Fq 'SNAPSHOT_RPC_WAIT_SECONDS' "${DEPLOYMENT_ROOT}/scripts/snapshot.sh" ||
 grep -Fq 'SNAPSHOT_ACTIVATION_WAIT_SECONDS' "${DEPLOYMENT_ROOT}/scripts/lib.sh" ||
     die "snapshot activation block recovery is not bounded by the configured wait"
 
-# The only permitted Betanet snapshot conversion rewrites the four-byte
-# network magic in a version-2 snapshot header and preserves every other byte.
+# The only permitted snapshot conversion rewrites the four-byte network magic
+# in a version-2 snapshot header and preserves every other byte.
 snapshot_source_fixture="${snapshot_fixture_root}/source.dat"
 snapshot_target_fixture="${snapshot_fixture_root}/target.dat"
 printf '\x75\x74\x78\x6f\xff\x02\x00\xf9\xbe\xb4\xd9fixture-body' \
@@ -143,11 +143,11 @@ rewrite_snapshot_network_magic_v2 \
     "${snapshot_source_fixture}" \
     "${snapshot_target_fixture}" \
     f9beb4d9 \
-    eca5b104
+    "${ECASH_NETWORK_MAGIC}"
 [[ "$(snapshot_v2_header_hex "${snapshot_source_fixture}")" == 7574786fff0200f9beb4d9 ]] ||
     die "snapshot conversion modified its source"
-[[ "$(snapshot_v2_header_hex "${snapshot_target_fixture}")" == 7574786fff0200eca5b104 ]] ||
-    die "snapshot conversion did not write the locked Betanet magic"
+[[ "$(snapshot_v2_header_hex "${snapshot_target_fixture}")" == "7574786fff0200${ECASH_NETWORK_MAGIC}" ]] ||
+    die "snapshot conversion did not write the locked network magic"
 [[ "$(stat --format='%s' "${snapshot_source_fixture}")" == "$(stat --format='%s' "${snapshot_target_fixture}")" ]] ||
     die "snapshot conversion changed the artifact size"
 [[ "$(sha256sum "${snapshot_source_fixture}" | awk '{print $1}')" == "${source_fixture_sha}" ]] ||
@@ -160,7 +160,7 @@ if (
         "${snapshot_source_fixture}" \
         "${snapshot_fixture_root}/wrong-source.dat" \
         deadbeef \
-        eca5b104
+        "${ECASH_NETWORK_MAGIC}"
 ) >/dev/null 2>&1; then
     die "snapshot conversion accepted the wrong source network magic"
 fi
@@ -297,6 +297,7 @@ if grep -nE 'rm .*(node|enforcer|postgres)' \
 fi
 
 python3 "${DEPLOYMENT_ROOT}/scripts/test-backup-cutover.py"
+"${DEPLOYMENT_ROOT}/scripts/test-enforcer-datadir.sh"
 
 sidechain_fixture='{"sidechains":[]}'
 enforcer_rpc() {
@@ -599,7 +600,7 @@ for monitor_service in enforcer-extractor event-logger; do
 done
 
 for expected_arg in \
-    "--network-preset=${ENFORCER_NETWORK_PRESET}" \
+    "${ENFORCER_NETWORK_ARG}" \
     "--node-rpc-addr=ecash-node:${ECASH_NODE_RPC_PORT}" \
     '--node-rpc-cookie-path=/rpc-cookie/.cookie' \
     "--node-zmq-addr-sequence=tcp://ecash-node:${ECASH_NODE_ZMQ_PORT}" \
@@ -651,25 +652,8 @@ actual_peer_count="$(grep -c '^addnode=' "${rendered_node_config}")"
 [[ "${actual_peer_count}" == "${expected_peer_count}" ]] ||
     die "rendered node configuration contains an unexpected peer"
 
-[[ "${LOCK_FORMAT}" == 5 ]]
-[[ "${NETWORK_ID}" == betanet ]]
-[[ "${ECASH_SNAPSHOT_TRANSFORM}" == network_magic_v2 ]]
-[[ "${ECASH_SNAPSHOT_SOURCE_SHA256}" =~ ^[[:xdigit:]]{64}$ ]]
-[[ "${ECASH_SNAPSHOT_SOURCE_NETWORK_MAGIC}" == f9beb4d9 ]]
-[[ "${ECASH_NETWORK_MAGIC}" =~ ^[[:xdigit:]]{8}$ ]]
-[[ "${ECASH_ACTIVATION_BLOCK_HASH}" =~ ^[[:xdigit:]]{64}$ ]]
-[[ "${ECASH_SNAPSHOT_SHA256}" =~ ^[[:xdigit:]]{64}$ ]]
-[[ "${ECASH_NODE_COMMIT}" =~ ^[[:xdigit:]]{40}$ ]]
-[[ "${ENFORCER_COMMIT}" =~ ^[[:xdigit:]]{40}$ ]]
-[[ "${ENFORCER_UPSTREAM_REVIEWED_COMMIT}" =~ ^[[:xdigit:]]{40}$ ]]
-[[ "${ENFORCER_COMMIT}" == "${ENFORCER_UPSTREAM_REVIEWED_COMMIT}" ]]
-[[ "${MONITOR_EVENT_CONTRACT_VERSION}" =~ ^[0-9]+$ ]]
-[[ "${MONITOR_IMAGE_COMMIT}" =~ ^[[:xdigit:]]{40}$ ]]
-[[ "${ECASH_NODE_IMAGE}" == *":${ECASH_NODE_BRANCH}@sha256:"* ]]
-[[ "${ENFORCER_IMAGE}" == *":sha-${ENFORCER_COMMIT:0:12}@sha256:"* ]]
-[[ "${ENFORCER_EXTRACTOR_IMAGE}" == *":sha-${MONITOR_IMAGE_COMMIT:0:12}@sha256:"* ]]
-[[ "${EVENT_LOGGER_IMAGE}" == *":sha-${MONITOR_IMAGE_COMMIT:0:12}@sha256:"* ]]
-[[ "${POSTGRES_IMAGE}" == *"@sha256:"* ]]
+validate_release_pins
+lock_reference="$(network_lock_reference "${NETWORK_ID}")"
 
 legacy_prefix=DRYNET
 if grep -R -n --exclude-dir=data "${legacy_prefix}_" "${DEPLOYMENT_ROOT}"; then
@@ -677,13 +661,18 @@ if grep -R -n --exclude-dir=data "${legacy_prefix}_" "${DEPLOYMENT_ROOT}"; then
 fi
 if grep -qE 'REPLACE_WITH_' \
     "${DEPLOYMENT_ROOT}/VERSIONS.lock" \
-    "${DEPLOYMENT_ROOT}/VERSIONS.betanet.lock.example"; then
-    die "the promoted Betanet locks contain unresolved placeholders"
+    "${lock_reference}"; then
+    die "the promoted ${NETWORK_ID} locks contain unresolved placeholders"
 fi
 diff \
     <(grep -E '^[A-Z][A-Z0-9_]*=' "${DEPLOYMENT_ROOT}/VERSIONS.lock") \
-    <(grep -E '^[A-Z][A-Z0-9_]*=' "${DEPLOYMENT_ROOT}/VERSIONS.betanet.lock.example") ||
-    die "active Betanet lock differs from its reviewed audit reference"
+    <(grep -E '^[A-Z][A-Z0-9_]*=' "${lock_reference}") ||
+    die "active ${NETWORK_ID} lock differs from its reviewed audit reference"
+# Every other network's reference is checked without deploying it.
+for reference in "${DEPLOYMENT_ROOT}"/VERSIONS.*.lock.example; do
+    [[ "${reference}" == "${lock_reference}" ]] ||
+        "${DEPLOYMENT_ROOT}/scripts/check-lock.sh" "${reference}"
+done
 
 repository_root="$(git -C "${DEPLOYMENT_ROOT}" rev-parse --show-toplevel)"
 if grep -Fq "hashFiles('deployments/ecash" \
@@ -694,7 +683,7 @@ fi
 # Promoting ENFORCER_IMAGE without re-vendoring proto/upstream would pair a new
 # enforcer with stale client stubs. This is the offline half of that gate; CI
 # also re-downloads the upstream files.
-BIP300_MONITOR_PROTO_VERSIONS_FILE="${DEPLOYMENT_ROOT}/VERSIONS.betanet.lock.example" \
+BIP300_MONITOR_PROTO_VERSIONS_FILE="${lock_reference}" \
     "${repository_root}/.github/scripts/check-proto-vendor.sh" --offline
 
 info "${NETWORK_ID} eCash deployment checks passed"

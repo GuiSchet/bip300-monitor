@@ -6,16 +6,26 @@ images. Node/enforcer state and every five-second BMM occurrence are retained.
 
 ## Daily backups
 
-On the VPS, install the `bip300-record-backup` and `bip300-offhost-health`
-service/timer pairs from `systemd/`. The first dumps daily at 03:00 UTC. The second
-fails visibly in systemd/journal when no verified daily off-host copy is newer
-than 48 hours. No external notification destination is configured.
+Each monitor host runs one network, and the off-host units are templates whose
+instance is that network (`betanet`, `mainnet`).
+
+On the VPS, install the `bip300-record-backup` service/timer pair and the
+`bip300-offhost-health@` template from `systemd/`, and enable
+`bip300-offhost-health@<network>.timer`. The first dumps daily at 03:00 UTC. The
+second fails visibly in systemd/journal when no verified daily off-host copy is
+newer than 48 hours. No external notification destination is configured.
 
 On the operator computer, copy `scripts/offhost-backup.py` to
-`~/.local/lib/bip300-monitor/`, and install the `bip300-offhost-pull` service/timer
-as user units. Copy `systemd/offhost.env.example` to
-`~/.config/bip300-monitor/offhost.env` (mode 600) and set the VPS SSH destination
-and key path there; they are never committed. Prefer a dedicated, unprivileged
+`~/.local/lib/bip300-monitor/`, install the `bip300-offhost-pull@` service/timer
+templates as user units and enable `bip300-offhost-pull@<network>.timer` for each
+monitor host. Copy `systemd/offhost.env.example` to
+`~/.config/bip300-monitor/offhost-<network>.env` (mode 600) and set that VPS's SSH
+destination and key path there; they are never committed.
+
+Moving an existing install from the non-template units: disable
+`bip300-offhost-pull.timer` (user) and `bip300-offhost-health.timer` (VPS), rename
+`offhost.env` to `offhost-betanet.env`, then enable the `@betanet` instances. The
+paths do not change, so the copies already pulled are kept. Prefer a dedicated, unprivileged
 backup account over root. Strict known-host verification is required and no key
 contents are copied. The computer needs Docker and must be online. Pull runs
 hourly, and each new archive is checksum-verified and restored into an isolated
@@ -31,14 +41,14 @@ service. A restored database contains every occurrence, not only unique facts.
 
 Use this only to replace the record with a fresh dataset, after release approval.
 `BIP300_BACKUP_HOST` and `BIP300_BACKUP_IDENTITY` are the values from
-`offhost.env`.
+`offhost-betanet.env`; use the other network's name and file on its host.
 
 1. On the VPS, run `bash scripts/reset-record.sh betanet --prepare`. This stops
    the extractor **before** the final dump and leaves it stopped. The archive
    contains the current `VERSIONS.lock`, dataset manifest, dump, checksums and
    completion timestamp.
 2. On the operator computer, run `offhost-backup.py --host "$BIP300_BACKUP_HOST"
-   --identity "$BIP300_BACKUP_IDENTITY" --local-root
+   --identity "$BIP300_BACKUP_IDENTITY" --network betanet --local-root
    ~/.local/share/bip300-monitor/backups/betanet --archive cutover-TIMESTAMP`.
    Inspect the off-host restore receipt.
 3. On the VPS, run `bash scripts/reset-record.sh betanet --finalize
