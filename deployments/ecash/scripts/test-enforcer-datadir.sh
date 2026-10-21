@@ -5,9 +5,14 @@ set -euo pipefail
 
 # shellcheck source=lib.sh
 source "$(dirname -- "${BASH_SOURCE[0]}")/lib.sh"
+# shellcheck source=test-harness.sh
+source "$(dirname -- "${BASH_SOURCE[0]}")/test-harness.sh"
 
 root="$(mktemp -d)"
 trap 'rm -rf -- "${root}"' EXIT
+load_versions
+PUID="$(id -u)"
+PGID="$(id -g)"
 
 fresh() {
     rm -rf -- "${root}/data"
@@ -54,5 +59,38 @@ fails move_enforcer_state "${root}/data" bitcoin-betanet ecash-betanet/mainnet
 rm -rf -- "${root}/data"
 mkdir -p "${root}/data"
 fails move_enforcer_state "${root}/data" bitcoin-betanet ecash-betanet/mainnet
+
+# The script itself, on a copy of the deployment.
+copy="$(make_deployment_copy "${root}/e2e" "${VERSIONS_FILE}")"
+data="${copy}/data/${NETWORK_ID}/enforcer-official-v8"
+migrate() {
+    PATH="${root}/e2e/bin:${PATH}" "${copy}/scripts/migrate-enforcer-datadir.sh" ecash-betanet "$@"
+}
+mkdir -p "${data}/validator/bitcoin-betanet/bitcoin.mdb" "${data}/wallet/bitcoin-betanet"
+printf 'lmdb\n' >"${data}/validator/bitcoin-betanet/bitcoin.mdb/data.mdb"
+chmod 0750 "${data}"
+
+# A Docker error is not "stopped": nothing is archived or moved.
+STUB_PS=fail fails migrate
+STUB_PS=running fails migrate
+[[ -e "${data}/validator/bitcoin-betanet" && ! -e "${data}/ecash-betanet" ]] ||
+    die "the migration moved state without knowing the enforcer was stopped"
+[[ ! -e "${copy}/data/${NETWORK_ID}/backups" ]] ||
+    die "the migration archived state without knowing the enforcer was stopped"
+
+# The script's umask 077 must not reach the directories the enforcer enters.
+STUB_PS=empty migrate >/dev/null
+for created in "${data}/ecash-betanet" "${data}/ecash-betanet/mainnet"; do
+    [[ "$(stat --format='%u:%g %a' "${created}")" == "${PUID}:${PGID} 750" ]] ||
+        die "${created} is $(stat --format='%u:%g %a' "${created}"), not ${PUID}:${PGID} 750"
+done
+[[ "$(cat "${data}/ecash-betanet/mainnet/validator/bitcoin.mdb/data.mdb")" == lmdb ]] ||
+    die "the script did not move the state"
+compgen -G "${copy}/data/${NETWORK_ID}/backups/enforcer-layout-*.tar" >/dev/null ||
+    die "the script did not archive the data directory"
+STUB_PS=empty migrate --rollback >/dev/null
+[[ -e "${data}/validator/bitcoin-betanet/bitcoin.mdb/data.mdb" ]] ||
+    die "the script did not roll back"
+STUB_PS=empty migrate >/dev/null
 
 info "enforcer data directory migration checks passed"

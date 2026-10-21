@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+# A new network's node syncs from its candidate lock before the fork, while
+# the enforcer and the monitor keep refusing that lock.
+
+set -euo pipefail
+
+# shellcheck source=lib.sh
+source "$(dirname -- "${BASH_SOURCE[0]}")/lib.sh"
+# shellcheck source=test-harness.sh
+source "$(dirname -- "${BASH_SOURCE[0]}")/test-harness.sh"
+
+root="$(mktemp -d)"
+trap 'rm -rf -- "${root}"' EXIT
+
+candidate="${DEPLOYMENT_ROOT}/VERSIONS.mainnet.lock.example"
+grep -qx 'RELEASE_STATUS=candidate' "${candidate}" ||
+    die "the mainnet lock is no longer a candidate; retire this test"
+fails() {
+    if ("$@") >"${root}/out" 2>&1; then
+        die "expected failure: $*"
+    fi
+}
+run() {
+    PATH="${root}/bin:${PATH}" "${copy}/scripts/$1"
+}
+
+# The node's own pins, the snapshot hash among them, must be complete.
+sed 's/^ECASH_SNAPSHOT_SHA256=REPLACE_WITH_.*/ECASH_SNAPSHOT_SHA256='"$(printf 'a%.0s' {1..64})"'/' \
+    "${candidate}" >"${root}/node-pinned.lock"
+copy="$(make_deployment_copy "${root}" "${root}/node-pinned.lock")"
+
+run init.sh >/dev/null
+run up.sh >/dev/null
+for started in 'pull ecash-node' 'up --detach ecash-node'; do
+    grep -qx "compose .* ${started}" "${root}/docker.log" ||
+        die "up.sh did not run '${started}' from the candidate lock"
+done
+! grep -E 'compose .* (pull|up)( |$)' "${root}/docker.log" | grep -qvE ' ecash-node$' ||
+    die "up.sh started more than the node from the candidate lock"
+if [[ -n "${REAL_DOCKER}" ]]; then
+    bash -c 'source "$1/scripts/lib.sh"; allow_node_bootstrap; load_versions; load_deployment_env; compose config --format json' \
+        _ "${copy}" | jq -e '.services.enforcer.image | startswith("candidate.invalid/")' >/dev/null ||
+        die "compose did not render the stand-ins of the pending images"
+fi
+
+for script in enforcer-up.sh monitor-up.sh verify.sh accept.sh; do
+    fails run "${script}"
+    grep -q 'unresolved promotion placeholders' "${root}/out" ||
+        die "${script} did not refuse the candidate lock: $(cat "${root}/out")"
+done
+
+cp -- "${candidate}" "${copy}/VERSIONS.lock"
+fails run up.sh
+grep -q 'ECASH_SNAPSHOT_SHA256 is still a placeholder' "${root}/out" ||
+    die "up.sh accepted a pending snapshot hash: $(cat "${root}/out")"
+
+info "candidate node bootstrap checks passed"

@@ -298,6 +298,7 @@ fi
 
 python3 "${DEPLOYMENT_ROOT}/scripts/test-backup-cutover.py"
 "${DEPLOYMENT_ROOT}/scripts/test-enforcer-datadir.sh"
+"${DEPLOYMENT_ROOT}/scripts/test-candidate-bootstrap.sh"
 
 sidechain_fixture='{"sidechains":[]}'
 enforcer_rpc() {

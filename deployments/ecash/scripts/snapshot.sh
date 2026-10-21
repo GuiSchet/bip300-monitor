@@ -5,6 +5,7 @@ set -euo pipefail
 # shellcheck source=lib.sh
 source "$(dirname -- "${BASH_SOURCE[0]}")/lib.sh"
 
+allow_node_bootstrap
 load_versions
 load_deployment_env
 for command_name in cmp cp curl dd jq mv od rm sha256sum stat tr; do
@@ -162,6 +163,20 @@ if [[ "${ECASH_SNAPSHOT_TRANSFORM}" == network_magic_v2 ]]; then
         die "refusing to clean transformed snapshot sources before promotion"
 fi
 
+# Before a new network's fork its activation block does not exist, and a
+# candidate lock leaves its hash pending: the node syncs without the check, and
+# running this again once the hash is pinned performs it.
+check_activation_block() {
+    local check
+    if lock_is_pending ECASH_ACTIVATION_BLOCK_HASH; then
+        info "the activation block is not pinned yet; run 'just snapshot' again once it is"
+        return 0
+    fi
+    for check in "$@"; do
+        "${check}"
+    done
+}
+
 service_is_running ecash-node || die "ecash-node is not running; run 'just up' first"
 
 wait_seconds="${SNAPSHOT_RPC_WAIT_SECONDS:-43200}"
@@ -183,13 +198,12 @@ if jq -e '.chainstates | any(has("snapshot_blockhash"))' \
     )"
     [[ "${active_snapshot_hash}" == "${ECASH_SNAPSHOT_BLOCK_HASH}" ]] ||
         die "active AssumeUTXO snapshot uses ${active_snapshot_hash}, expected ${ECASH_SNAPSHOT_BLOCK_HASH}"
-    require_activation_header
-    ensure_activation_block_data
+    check_activation_block require_activation_header ensure_activation_block_data
     info "an AssumeUTXO snapshot chainstate is already active"
     exit 0
 fi
 if node_history_is_fully_validated "${chainstates}"; then
-    require_activation_block
+    check_activation_block require_activation_block
     info "the complete ${NETWORK_ID} chainstate is already validated; no snapshot is needed"
     exit 0
 fi
@@ -207,5 +221,5 @@ done
 
 info "loading the verified AssumeUTXO snapshot"
 node_cli -rpcclienttimeout=0 loadtxoutset "/snapshots/${ECASH_SNAPSHOT_FILE}"
-ensure_activation_block_data
+check_activation_block ensure_activation_block_data
 node_cli getchainstates | jq '{headers, chainstates}'

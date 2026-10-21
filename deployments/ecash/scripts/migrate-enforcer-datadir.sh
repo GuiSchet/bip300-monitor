@@ -2,8 +2,9 @@
 # Moves the enforcer state into the layout of bip300301_enforcer#666
 # (<fork>/<chain>), so an enforcer started with --fork resumes from its height
 # instead of syncing again. Run it with the enforcer and the extractor stopped,
-# before starting the #666 image. It archives the data directory first.
-# --rollback restores the old layout for the previous image.
+# before starting the #666 image. It archives the data directory first, and
+# stops if Docker cannot say whether they are running. New directories belong
+# to PUID:PGID. --rollback restores the old layout for the previous image.
 
 set -euo pipefail
 umask 077
@@ -37,4 +38,13 @@ if [[ -z "${mode}" ]]; then
     info "archived ${dir} to ${archive}"
 fi
 move_enforcer_state "${dir}" "${legacy}" "${target}" "${mode}"
+if [[ -z "${mode}" ]]; then
+    moved=("${dir}/${target}/validator" "${dir}/${target}/wallet")
+    undo="run it again with --rollback"
+else
+    moved=("${dir}/validator/${legacy}" "${dir}/wallet/${legacy}")
+    undo="migrate it again"
+fi
+(require_container_access "${moved[@]}") ||
+    die "the state moved, but the enforcer cannot use it; fix the ownership or ${undo}"
 info "enforcer state is in the $([[ -z "${mode}" ]] && printf '%s' "${target}" || printf 'old') layout"

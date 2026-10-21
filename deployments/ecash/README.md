@@ -235,11 +235,22 @@ height-`935000` snapshot, and leaves as `REPLACE_WITH_` what does not exist yet.
 - `ECASH_ACTIVATION_BLOCK_HASH`: the hash of block `973728`, known once it is
   mined.
 
-A candidate cannot be started (`require_ready_release`). On the mainnet host:
-copy the reference to `VERSIONS.lock`, start only the node so it downloads and
-validates history before the fork, then pin the remaining values, set
-`RELEASE_STATUS=ready`, run `just preflight` and `static-check.sh`, and start the
-stack. The Observatory reads it through its own backend on that host.
+Only the node runs from a candidate. `init`, `preflight`, `up`, `snapshot`,
+`status`, `logs` and `down` accept it while every pending value is one the node
+does not use; the snapshot hash is a node pin and has to be pinned first. The
+enforcer, the monitor and verification refuse it (`require_ready_release`). On
+the mainnet host:
+
+1. Copy the reference to `VERSIONS.lock` and run `just init`, `just preflight`,
+   `just up` and `just snapshot`, so the node downloads and validates history
+   before the fork. Preflight then checks the node only, and the snapshot skips
+   the activation block, which does not exist yet.
+2. Pin the remaining values, set `RELEASE_STATUS=ready`, and run
+   `just preflight` and `static-check.sh`.
+3. Run `just snapshot` again: it now checks the activation block.
+4. Run `just enforcer-up` and `just monitor-up`.
+
+The Observatory reads it through its own backend on that host.
 
 ### Enforcer data directory after #666
 
@@ -248,8 +259,10 @@ of `validator/<chain>-<preset>` and `wallet/<chain>-<preset>`, and does not move
 it. When a host moves to the #666 enforcer, stop the enforcer and the extractor
 and run `bash scripts/migrate-enforcer-datadir.sh ecash-betanet` before starting
 the new image; it archives the data directory under `backups/` and renames the
-two directories, so the enforcer resumes from its height. `--rollback` restores
-the old layout for the old image.
+two directories, so the enforcer resumes from its height. It stops if Docker
+cannot say whether those services are running, creates the new directories as
+`PUID:PGID` and checks that this identity can use them; run it as root or as
+`PUID`. `--rollback` restores the old layout for the old image.
 
 ## Network exposure
 

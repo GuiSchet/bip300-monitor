@@ -39,14 +39,96 @@ require_ready_release() {
     [[ "${ENFORCER_COMMIT}" == "${ENFORCER_UPSTREAM_REVIEWED_COMMIT}" ]] || die "official enforcer commit mismatch"
 }
 
+# Values a candidate lock (RELEASE_STATUS=candidate) cannot pin before launch:
+# the activation block, the transformed snapshot, the enforcer release that
+# supports the network, and the monitor images built after it.
+# shellcheck disable=SC2034 # check-lock.sh reviews candidates against it.
+readonly CANDIDATE_FIELDS=(
+    ECASH_ACTIVATION_BLOCK_HASH
+    ECASH_SNAPSHOT_SHA256
+    ENFORCER_UPSTREAM_REVIEWED_COMMIT
+    ENFORCER_COMMIT
+    ENFORCER_IMAGE
+    MONITOR_IMAGE_COMMIT
+    ENFORCER_EXTRACTOR_IMAGE
+    EVENT_LOGGER_IMAGE
+)
+# The ones the node does not use. The snapshot hash is a node pin.
+readonly NODE_BOOTSTRAP_FIELDS=(
+    ECASH_ACTIVATION_BLOCK_HASH
+    ENFORCER_UPSTREAM_REVIEWED_COMMIT
+    ENFORCER_COMMIT
+    ENFORCER_IMAGE
+    MONITOR_IMAGE_COMMIT
+    ENFORCER_EXTRACTOR_IMAGE
+    EVENT_LOGGER_IMAGE
+)
+NODE_BOOTSTRAP=false
+LOCK_PENDING=()
+
+# Scripts that operate only the node call this before load_versions. A
+# candidate lock is then accepted with the NODE_BOOTSTRAP_FIELDS still pending,
+# so a new network's node syncs before its enforcer release and activation
+# block exist. Everything else keeps refusing the candidate.
+allow_node_bootstrap() {
+    NODE_BOOTSTRAP=true
+}
+
+lock_placeholders() {
+    grep -oE '^[A-Z][A-Z0-9_]*=REPLACE_WITH_' "$1" | cut -d= -f1 || true
+}
+
+lock_is_pending() {
+    [[ " ${LOCK_PENDING[*]} " == *" $1 "* ]]
+}
+
+# Replaces the placeholders of a sourced candidate lock with stand-ins of the
+# right shape, so the remaining checks run; dies on a placeholder outside the
+# allowed fields. Records them in LOCK_PENDING.
+use_candidate_stand_ins() {
+    local placeholders="$1"
+    shift
+    local field
+    local zero_hash
+    zero_hash="$(printf '0%.0s' {1..64})"
+    LOCK_PENDING=()
+    while IFS= read -r field; do
+        [[ -n "${field}" ]] || continue
+        [[ " $* " == *" ${field} "* ]] ||
+            die "${field} is still a placeholder and must be pinned for this step"
+        case "${field}" in
+        *_COMMIT) printf -v "${field}" '%s' "${zero_hash:0:40}" ;;
+        *_HASH | *_SHA256) printf -v "${field}" '%s' "${zero_hash}" ;;
+        *) : ;;
+        esac
+        LOCK_PENDING+=("${field}")
+    done <<<"${placeholders}"
+    ! lock_is_pending ENFORCER_IMAGE ||
+        ENFORCER_IMAGE="candidate.invalid/enforcer:sha-${ENFORCER_COMMIT:0:12}@sha256:${zero_hash}"
+    ! lock_is_pending ENFORCER_EXTRACTOR_IMAGE ||
+        ENFORCER_EXTRACTOR_IMAGE="candidate.invalid/extractor:sha-${MONITOR_IMAGE_COMMIT:0:12}@sha256:${zero_hash}"
+    ! lock_is_pending EVENT_LOGGER_IMAGE ||
+        EVENT_LOGGER_IMAGE="candidate.invalid/logger:sha-${MONITOR_IMAGE_COMMIT:0:12}@sha256:${zero_hash}"
+}
+
 load_versions() {
+    local field
+    local placeholders
     [[ -f "${VERSIONS_FILE}" ]] || die "missing ${VERSIONS_FILE}"
-    if grep -qE '^[A-Z][A-Z0-9_]*=REPLACE_WITH_' "${VERSIONS_FILE}"; then
-        die "${VERSIONS_FILE} contains unresolved promotion placeholders"
-    fi
+    placeholders="$(lock_placeholders "${VERSIONS_FILE}")"
     # This file is tracked in the repository and contains assignments only.
     # shellcheck disable=SC1090
     source "${VERSIONS_FILE}"
+    if [[ -n "${placeholders}" ]]; then
+        [[ "${NODE_BOOTSTRAP}" == true && "${RELEASE_STATUS:-}" == candidate ]] ||
+            die "${VERSIONS_FILE} contains unresolved promotion placeholders"
+        use_candidate_stand_ins "${placeholders}" "${NODE_BOOTSTRAP_FIELDS[@]}"
+        # Compose reads VERSIONS.lock as an env file; the shell environment
+        # takes precedence, so the services it renders see the stand-ins.
+        for field in "${LOCK_PENDING[@]}"; do
+            export "${field?}"
+        done
+    fi
     validate_versions
 }
 
@@ -385,11 +467,45 @@ enforcer_data_dir() {
     printf '%s/enforcer-official-v8\n' "$(data_root)"
 }
 
+# Creates the missing directories of PATH below DIR as the enforcer container
+# (PUID:PGID) with DIR's mode, whatever the umask and user running this.
+make_enforcer_dirs() {
+    local dir="$1" path="$2"
+    local mode current="$1" part
+    local -a parts
+    : "${PUID:?PUID must be set}" "${PGID:?PGID must be set}"
+    mode="$(stat --format=%a -- "${dir}")"
+    IFS=/ read -r -a parts <<<"${path#"${dir}/"}"
+    for part in "${parts[@]}"; do
+        current="${current}/${part}"
+        [[ -d "${current}" ]] ||
+            install -d -o "${PUID}" -g "${PGID}" -m "${mode}" -- "${current}"
+    done
+}
+
+# Checks that the enforcer container, which runs as PUID:PGID with no
+# supplementary groups (compose.yaml), can read, write and enter each PATH.
+require_container_access() {
+    local path
+    : "${PUID:?PUID must be set}" "${PGID:?PGID must be set}"
+    for path in "$@"; do
+        if ((EUID == 0)); then
+            require_command setpriv
+            setpriv --reuid="${PUID}" --regid="${PGID}" --clear-groups -- \
+                test -r "${path}" -a -w "${path}" -a -x "${path}"
+        elif [[ "$(id -u)" == "${PUID}" ]]; then
+            test -r "${path}" -a -w "${path}" -a -x "${path}"
+        else
+            die "run this as root or as UID ${PUID} to check what the enforcer can reach"
+        fi || die "the enforcer (${PUID}:${PGID}) cannot use ${path}"
+    done
+}
+
 # Moves the enforcer state from the layout up to bip300301_enforcer 1753fc0,
 # DIR/{validator,wallet}/LEGACY, to the one #666 introduced,
 # DIR/TARGET/{validator,wallet}; --rollback moves it back. Renames on one
 # filesystem only: nothing is copied. A part already moved is skipped, so an
-# interrupted run can be repeated.
+# interrupted run can be repeated. New parents belong to PUID:PGID.
 move_enforcer_state() {
     local dir="$1" legacy="$2" target="$3" mode="${4:-}"
     local part from to
@@ -410,7 +526,8 @@ move_enforcer_state() {
         fi
     done
     while ((${#moves[@]})); do
-        mkdir -p -- "$(dirname -- "${moves[1]}")"
+        make_enforcer_dirs "${dir}" "$(dirname -- "${moves[1]}")"
+        require_container_access "$(dirname -- "${moves[1]}")"
         mv -T -- "${moves[0]}" "${moves[1]}"
         info "moved ${moves[0]} to ${moves[1]}"
         moves=("${moves[@]:2}")
@@ -447,8 +564,13 @@ node_cli() {
         "$@"
 }
 
+# An error from Docker is never read as "stopped": callers stop or migrate
+# state on the strength of this answer.
 service_is_running() {
-    [[ -n "$(compose ps --status running --quiet "$1")" ]]
+    local container_ids
+    container_ids="$(compose ps --status running --quiet "$1")" ||
+        die "could not read the state of $1 from Docker"
+    [[ -n "${container_ids}" ]]
 }
 
 require_service_running() {
