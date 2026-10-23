@@ -34,7 +34,7 @@ require_boolean() {
 }
 
 require_ready_release() {
-    [[ "${RELEASE_STATUS:-}" == ready ]] || die "release is not marked ready; this candidate cannot be started"
+    [[ "${RELEASE_STATUS:-}" == ready ]] || die "release is not marked ready; the enforcer and the monitor cannot start from a candidate lock"
     [[ "${ENFORCER_REPO}" == https://github.com/LayerTwo-Labs/bip300301_enforcer.git ]] || die "enforcer must use official upstream"
     [[ "${ENFORCER_COMMIT}" == "${ENFORCER_UPSTREAM_REVIEWED_COMMIT}" ]] || die "official enforcer commit mismatch"
 }
@@ -145,6 +145,9 @@ validate_versions() {
     : "${ECASH_NODE_ZMQ_PORT:?ECASH_NODE_ZMQ_PORT must be locked}"
     : "${ECASH_NODE_EXPECTED_VERSION:?ECASH_NODE_EXPECTED_VERSION must be locked}"
     : "${ECASH_TIP_HEIGHT_URL:?ECASH_TIP_HEIGHT_URL must be locked}"
+    # none: the network has no public explorer to compare the tip with.
+    [[ "${ECASH_TIP_HEIGHT_URL}" == none || "${ECASH_TIP_HEIGHT_URL}" =~ ^https://[^[:space:]]+$ ]] ||
+        die "ECASH_TIP_HEIGHT_URL must be an https URL or none"
     : "${ECASH_EXPECTED_DATA_BYTES:?ECASH_EXPECTED_DATA_BYTES must be locked}"
     : "${ECASH_MIN_FREE_PERCENT:?ECASH_MIN_FREE_PERCENT must be locked}"
     : "${ECASH_ACTIVATION_HEIGHT:?ECASH_ACTIVATION_HEIGHT must be locked}"
@@ -507,9 +510,24 @@ require_container_access() {
 # filesystem only: nothing is copied. A part already moved is skipped, so an
 # interrupted run can be repeated. New parents belong to PUID:PGID.
 move_enforcer_state() {
+    plan_enforcer_moves "$@"
+    local -a moves=("${ENFORCER_MOVES[@]}")
+    while ((${#moves[@]})); do
+        make_enforcer_dirs "$1" "$(dirname -- "${moves[1]}")"
+        require_container_access "$(dirname -- "${moves[1]}")"
+        mv -T -- "${moves[0]}" "${moves[1]}"
+        info "moved ${moves[0]} to ${moves[1]}"
+        moves=("${moves[@]:2}")
+    done
+}
+
+# Sets ENFORCER_MOVES to the from/to pairs move_enforcer_state would rename,
+# without touching anything; empty when the state already moved. Dies on state
+# in both layouts or in neither.
+plan_enforcer_moves() {
     local dir="$1" legacy="$2" target="$3" mode="${4:-}"
     local part from to
-    local -a moves=()
+    ENFORCER_MOVES=()
     for part in validator wallet; do
         from="${dir}/${part}/${legacy}"
         to="${dir}/${target}/${part}"
@@ -520,17 +538,10 @@ move_enforcer_state() {
         if [[ -e "${from}" && -e "${to}" ]]; then
             die "both ${from} and ${to} exist; resolve them by hand"
         elif [[ -e "${from}" ]]; then
-            moves+=("${from}" "${to}")
+            ENFORCER_MOVES+=("${from}" "${to}")
         elif [[ ! -e "${to}" ]]; then
             die "neither ${from} nor ${to} exists"
         fi
-    done
-    while ((${#moves[@]})); do
-        make_enforcer_dirs "${dir}" "$(dirname -- "${moves[1]}")"
-        require_container_access "$(dirname -- "${moves[1]}")"
-        mv -T -- "${moves[0]}" "${moves[1]}"
-        info "moved ${moves[0]} to ${moves[1]}"
-        moves=("${moves[@]:2}")
     done
 }
 

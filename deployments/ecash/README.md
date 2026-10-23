@@ -227,7 +227,8 @@ height-`935000` snapshot, and leaves as `REPLACE_WITH_` what does not exist yet.
 
 - `ENFORCER_*`: the merged commit of LayerTwo-Labs/bip300301_enforcer#666, the
   first enforcer that supports mainnet (`ENFORCER_NETWORK_ARG=--fork=ecash`), and
-  its image;
+  its image; the commit is also listed in `proto/upstream/README.md` once
+  `check-proto-vendor.sh --online` confirms its `proto/` is unchanged;
 - `MONITOR_IMAGE_COMMIT` and the monitor images: the first build whose extractor
   knows the mainnet preset;
 - `ECASH_SNAPSHOT_SHA256`: the hash of the snapshot rewritten to the mainnet
@@ -258,8 +259,10 @@ From #666 the enforcer keeps its state under `<data-dir>/<fork>/<chain>` instead
 of `validator/<chain>-<preset>` and `wallet/<chain>-<preset>`, and does not move
 it. When a host moves to the #666 enforcer, stop the enforcer and the extractor
 and run `bash scripts/migrate-enforcer-datadir.sh ecash-betanet` before starting
-the new image; it archives the data directory under `backups/` and renames the
-two directories, so the enforcer resumes from its height. It stops if Docker
+the new image; it archives the data directory under `migration-backups/`, apart
+from the record backups, and renames the two directories, so the enforcer
+resumes from its height. It checks the layout before archiving, and a repeated
+run that has nothing left to move archives nothing. It stops if Docker
 cannot say whether those services are running, creates the new directories as
 `PUID:PGID` and checks that this identity can use them; run it as root or as
 `PUID`. `--rollback` restores the old layout for the old image.

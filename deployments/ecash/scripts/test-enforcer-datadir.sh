@@ -75,7 +75,7 @@ STUB_PS=fail fails migrate
 STUB_PS=running fails migrate
 [[ -e "${data}/validator/bitcoin-betanet" && ! -e "${data}/ecash-betanet" ]] ||
     die "the migration moved state without knowing the enforcer was stopped"
-[[ ! -e "${copy}/data/${NETWORK_ID}/backups" ]] ||
+[[ ! -e "${copy}/data/${NETWORK_ID}/migration-backups" ]] ||
     die "the migration archived state without knowing the enforcer was stopped"
 
 # The script's umask 077 must not reach the directories the enforcer enters.
@@ -86,11 +86,23 @@ for created in "${data}/ecash-betanet" "${data}/ecash-betanet/mainnet"; do
 done
 [[ "$(cat "${data}/ecash-betanet/mainnet/validator/bitcoin.mdb/data.mdb")" == lmdb ]] ||
     die "the script did not move the state"
-compgen -G "${copy}/data/${NETWORK_ID}/backups/enforcer-layout-*.tar" >/dev/null ||
+compgen -G "${copy}/data/${NETWORK_ID}/migration-backups/enforcer-layout-*.tar" >/dev/null ||
     die "the script did not archive the data directory"
 STUB_PS=empty migrate --rollback >/dev/null
 [[ -e "${data}/validator/bitcoin-betanet/bitcoin.mdb/data.mdb" ]] ||
     die "the script did not roll back"
 STUB_PS=empty migrate >/dev/null
+
+# A repeated or refused run adds no archive of the whole directory.
+archives() {
+    find "${copy}/data/${NETWORK_ID}/migration-backups" -name 'enforcer-layout-*.tar' | wc -l
+}
+archived="$(archives)"
+STUB_PS=empty migrate >/dev/null
+[[ "$(archives)" == "${archived}" ]] || die "a finished migration archived the data directory again"
+mkdir -p "${data}/validator/bitcoin-betanet"
+STUB_PS=empty fails migrate
+[[ "$(archives)" == "${archived}" ]] || die "a refused migration archived the data directory"
+[[ ! -e "${copy}/data/${NETWORK_ID}/backups" ]] || die "the migration wrote into the record backups"
 
 info "enforcer data directory migration checks passed"

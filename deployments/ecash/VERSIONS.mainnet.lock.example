@@ -1,6 +1,8 @@
 # Candidate for the eCash mainnet launch (fork at block 973728). The REPLACE_WITH_
-# values do not exist yet; scripts/check-lock.sh lists them. A candidate cannot
-# be started: copy it to VERSIONS.lock only once it is ready.
+# values do not exist yet; scripts/check-lock.sh lists them. Only the node runs
+# from a candidate: copy it to VERSIONS.lock to sync the node before the fork
+# (README, "Mainnet on its own host"). The enforcer and the monitor refuse it
+# until RELEASE_STATUS=ready.
 RELEASE_STATUS=candidate
 # shellcheck shell=bash
 # Reviewed mainnet lock reference. On the mainnet host the active VERSIONS.lock
@@ -15,9 +17,9 @@ ECASH_NODE_P2P_PORT=8533
 ECASH_NODE_RPC_PORT=8532
 ECASH_NODE_ZMQ_PORT=29000
 ECASH_PUBLIC_PEERS=seed.ecash.ninja:8533,seed.bip300.xyz:8533,seed.ecash.drivecha.in:8533,seed.ecash.zuexeuz.net:8533,seed.ecash.eu.com:8533
-# Advisory only (preflight warns when it is down). Not live on 2026-10-20;
-# named after the Betanet explorer.
-ECASH_TIP_HEIGHT_URL=https://esplora.ecash.ninja/blocks/tip/height
+# Advisory only (preflight warns when it is down). No public mainnet explorer
+# confirmed on 2026-10-20; pin its /blocks/tip/height once one exists.
+ECASH_TIP_HEIGHT_URL=none
 ECASH_EXPECTED_DATA_BYTES=1200000000000
 ECASH_MIN_FREE_PERCENT=20
 

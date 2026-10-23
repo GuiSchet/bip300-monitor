@@ -69,7 +69,9 @@ else
     info "existing-data disk preflight passed (available=${filesystem_available}, free=${free_percent}%)"
 fi
 
-if tip_height="$(
+if [[ "${ECASH_TIP_HEIGHT_URL}" == none ]]; then
+    info "no public ${NETWORK_ID} tip endpoint is locked; skipping the advisory check"
+elif tip_height="$(
     curl --fail --silent --show-error --max-time 15 "${ECASH_TIP_HEIGHT_URL}" 2>/dev/null
 )" && [[ "${tip_height}" =~ ^[0-9]+$ ]]; then
     info "public ${NETWORK_ID} tip is ${tip_height} (advisory only)"

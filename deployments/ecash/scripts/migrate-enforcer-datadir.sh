@@ -2,8 +2,8 @@
 # Moves the enforcer state into the layout of bip300301_enforcer#666
 # (<fork>/<chain>), so an enforcer started with --fork resumes from its height
 # instead of syncing again. Run it with the enforcer and the extractor stopped,
-# before starting the #666 image. It archives the data directory first, and
-# stops if Docker cannot say whether they are running. New directories belong
+# before starting the #666 image. It archives the data directory first, under
+# migration-backups/, and stops if Docker cannot say whether they are running. New directories belong
 # to PUID:PGID. --rollback restores the old layout for the previous image.
 
 set -euo pipefail
@@ -31,8 +31,12 @@ dir="$(enforcer_data_dir)"
 legacy="bitcoin-${fork#ecash-}"
 target="${fork}/mainnet"
 
-if [[ -z "${mode}" ]]; then
-    archive="$(data_root)/backups/enforcer-layout-$(date -u +%Y%m%dT%H%M%SZ).tar"
+# Refuse a broken layout before archiving, and archive only when something
+# moves: a repeated run must not add another copy of the whole directory. The
+# archive stays out of backups/, which holds the record copies pulled off-host.
+plan_enforcer_moves "${dir}" "${legacy}" "${target}" "${mode}"
+if [[ -z "${mode}" ]] && ((${#ENFORCER_MOVES[@]})); then
+    archive="$(data_root)/migration-backups/enforcer-layout-$(date -u +%Y%m%dT%H%M%SZ).tar"
     mkdir -p -- "$(dirname -- "${archive}")"
     tar --create --file "${archive}" --directory "$(dirname -- "${dir}")" "$(basename -- "${dir}")"
     info "archived ${dir} to ${archive}"

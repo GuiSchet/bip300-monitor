@@ -12,9 +12,14 @@ source "$(dirname -- "${BASH_SOURCE[0]}")/test-harness.sh"
 root="$(mktemp -d)"
 trap 'rm -rf -- "${root}"' EXIT
 
-candidate="${DEPLOYMENT_ROOT}/VERSIONS.mainnet.lock.example"
-grep -qx 'RELEASE_STATUS=candidate' "${candidate}" ||
-    die "the mainnet lock is no longer a candidate; retire this test"
+# A candidate whatever the mainnet reference's own state: once it is ready, the
+# values pinned at launch go back to placeholders here.
+candidate="${root}/candidate.lock"
+sed 's/^RELEASE_STATUS=.*/RELEASE_STATUS=candidate/' \
+    "${DEPLOYMENT_ROOT}/VERSIONS.mainnet.lock.example" >"${candidate}"
+for field in "${NODE_BOOTSTRAP_FIELDS[@]}" ECASH_SNAPSHOT_SHA256; do
+    sed -i "s/^${field}=.*/${field}=REPLACE_WITH_TEST/" "${candidate}"
+done
 fails() {
     if ("$@") >"${root}/out" 2>&1; then
         die "expected failure: $*"
