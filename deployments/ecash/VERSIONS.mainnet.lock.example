@@ -59,27 +59,31 @@ JUST_VERSION=1.57.0
 JUST_TARGET=x86_64-unknown-linux-musl
 JUST_SHA256=45b548094283cb9739af8f13273b8cddeee869f5b4ef2bb631b1f311cb566155
 
-# The official node commits to the Bitcoin height-935000 UTXO set. The UTXO
-# contents are shared history, but snapshot format v2 embeds Bitcoin's network
-# magic. snapshot.sh verifies the source and rewrites only those four metadata
-# bytes before loadtxoutset validates the compiled UTXO commitment.
+# The official node (ecash-v1.0.0-core31.1) commits to the Bitcoin
+# height-965000 UTXO set, the newest it knows, which leaves the fewest blocks
+# to fetch before the fork. eCash publishes the file at releases.ecash.com
+# (SHA256SUMS, utxo-965000.json) and Bitcoin Core's #36196 snapshot is the same
+# file. The UTXO contents are shared history, but snapshot format v2 embeds
+# Bitcoin's network magic. snapshot.sh verifies the source and rewrites only
+# those four metadata bytes before loadtxoutset validates the compiled UTXO
+# commitment.
 ECASH_ACTIVATION_HEIGHT=973728
 # Known once block 973728 is mined.
 ECASH_ACTIVATION_BLOCK_HASH=REPLACE_WITH_BLOCK_973728_HASH
-ECASH_SNAPSHOT_HEIGHT=935000
-ECASH_SNAPSHOT_BLOCK_HASH=0000000000000000000147034958af1652b2b91bba607beacc5e72a56f0fb5ee
+ECASH_SNAPSHOT_HEIGHT=965000
+ECASH_SNAPSHOT_BLOCK_HASH=00000000000000000001595977e6000ce56129f5c9b4073e31ccc30b90b97da9
 ECASH_SNAPSHOT_TRANSFORM=network_magic_v2
-ECASH_SNAPSHOT_URL=https://achow101.com/files/utxo-snapshots/mainnet-935000-utxos.dat
-ECASH_SNAPSHOT_MIRROR_URL=https://files-vps02.jaonoctus.dev/utxo-935000.dat
-ECASH_SNAPSHOT_SOURCE_FILE=mainnet-935000-utxos.dat
-ECASH_SNAPSHOT_SOURCE_SIZE=9387990306
-ECASH_SNAPSHOT_SOURCE_SHA256=e572ddbe456d254f05fb004cebe225bdb3656074b66f0e9b1c7fa83e1301d486
+ECASH_SNAPSHOT_URL=https://releases.ecash.com/assumeutxo/mainnet/utxo-965000.dat
+ECASH_SNAPSHOT_MIRROR_URL=https://achow101.com/files/utxo-snapshots/mainnet-965000-utxos.dat
+ECASH_SNAPSHOT_SOURCE_FILE=mainnet-965000-utxos.dat
+ECASH_SNAPSHOT_SOURCE_SIZE=9468312119
+ECASH_SNAPSHOT_SOURCE_SHA256=89351f7106051c0685880f9c64026e993335308de63ae6980e94ba3fafdc7dda
 ECASH_SNAPSHOT_SOURCE_NETWORK_MAGIC=f9beb4d9
-ECASH_SNAPSHOT_FILE=utxo-935000-mainnet.dat
-ECASH_SNAPSHOT_UTXO_HASH=e4b90ef9eae834f56c4b64d2d50143cee10ad87994c614d7d04125e2a6025050
-ECASH_SNAPSHOT_CHAIN_TX_COUNT=1305397408
-ECASH_SNAPSHOT_SIZE=9387990306
+ECASH_SNAPSHOT_FILE=utxo-965000-mainnet.dat
+ECASH_SNAPSHOT_UTXO_HASH=4a8d794337118c0c615b574f817c7306c687584a537184b8d233df42bf477ec2
+ECASH_SNAPSHOT_CHAIN_TX_COUNT=1429611231
+ECASH_SNAPSHOT_SIZE=9468312119
 # The same source with the mainnet magic, hashed from the transformed file on
 # the mainnet host (2026-10-23): snapshot.sh's rewrite and an independent
 # stream over the verified source agreed.
-ECASH_SNAPSHOT_SHA256=77c0d7a8143e402b349f56c0f9473c0f0b0030fc47fb2ebcf3bff156180685ee
+ECASH_SNAPSHOT_SHA256=19a386265ad551fdcdb8dbcfef8526200e3bb8960a6eb6d211a9a40cfdd20930
