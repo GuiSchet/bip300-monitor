@@ -79,5 +79,7 @@ ECASH_SNAPSHOT_FILE=utxo-935000-mainnet.dat
 ECASH_SNAPSHOT_UTXO_HASH=e4b90ef9eae834f56c4b64d2d50143cee10ad87994c614d7d04125e2a6025050
 ECASH_SNAPSHOT_CHAIN_TX_COUNT=1305397408
 ECASH_SNAPSHOT_SIZE=9387990306
-# The same source with the mainnet magic; to be hashed from the transformed file.
-ECASH_SNAPSHOT_SHA256=REPLACE_WITH_MAINNET_SNAPSHOT_SHA256
+# The same source with the mainnet magic, hashed from the transformed file on
+# the mainnet host (2026-10-23): snapshot.sh's rewrite and an independent
+# stream over the verified source agreed.
+ECASH_SNAPSHOT_SHA256=77c0d7a8143e402b349f56c0f9473c0f0b0030fc47fb2ebcf3bff156180685ee
