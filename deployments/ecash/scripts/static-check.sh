@@ -71,7 +71,9 @@ for invalid_assignment in \
     'SNAPSHOT_ACTIVATION_WAIT_SECONDS=0' \
     'SNAPSHOT_ACTIVATION_WAIT_SECONDS=invalid' \
     'TRUST_ASSUMEUTXO_SNAPSHOT=1' \
-    'TRUST_ASSUMEUTXO_SNAPSHOT=yes'; do
+    'TRUST_ASSUMEUTXO_SNAPSHOT=yes' \
+    'SNAPSHOT_HEADER_WAIT_SECONDS=0' \
+    'SNAPSHOT_ON_UP=1'; do
     cp "${DEPLOYMENT_ROOT}/.env.example" "${override_env}"
     printf '\n%s\n' "${invalid_assignment}" >>"${override_env}"
     if (

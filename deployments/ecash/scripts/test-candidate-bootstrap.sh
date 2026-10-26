@@ -28,6 +28,19 @@ fails() {
 run() {
     PATH="${root}/bin:${PATH}" "${copy}/scripts/$1"
 }
+# 'just up' hands the snapshot load to a transient unit; record it instead.
+mkdir -p -- "${root}/bin"
+cat >"${root}/bin/systemd-run" <<STUB
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >>"${root}/systemd-run.log"
+STUB
+cat >"${root}/bin/systemctl" <<'STUB'
+#!/usr/bin/env bash
+[[ "$1" == is-active ]] || exit 0
+printf '%s\n' "${STUB_LOADER:-inactive}"
+[[ "${STUB_LOADER:-inactive}" == active ]]
+STUB
+chmod +x -- "${root}/bin/systemd-run" "${root}/bin/systemctl"
 
 # The node's own pins, the snapshot hash among them, must be complete.
 sed 's/^ECASH_SNAPSHOT_SHA256=REPLACE_WITH_.*/ECASH_SNAPSHOT_SHA256='"$(printf 'a%.0s' {1..64})"'/' \
@@ -42,6 +55,23 @@ for started in 'pull ecash-node' 'up --detach ecash-node'; do
 done
 ! grep -E 'compose .* (pull|up)( |$)' "${root}/docker.log" | grep -qvE ' ecash-node$' ||
     die "up.sh started more than the node from the candidate lock"
+grep -q -- "--unit=bip300-snapshot-mainnet .*/scripts/snapshot.sh$" "${root}/systemd-run.log" ||
+    die "up.sh did not start the snapshot loader"
+
+# A second 'just up' sees the running load instead of starting another.
+STUB_LOADER=active run up.sh >"${root}/out" 2>&1
+[[ "$(wc -l <"${root}/systemd-run.log")" -eq 1 ]] ||
+    die "up.sh started a second snapshot loader"
+grep -q 'snapshot loader bip300-snapshot-mainnet is already running' "${root}/out" ||
+    die "up.sh did not report the running snapshot loader: $(cat "${root}/out")"
+
+# The operator can keep the load manual. static-check exports its own env
+# file, so write the opt-out to a copy of whichever one is in use.
+cp -- "${COMPOSE_ENV_FILE:-${copy}/.env}" "${root}/manual.env"
+printf '\nSNAPSHOT_ON_UP=false\n' >>"${root}/manual.env"
+COMPOSE_ENV_FILE="${root}/manual.env" run up.sh >/dev/null
+[[ "$(wc -l <"${root}/systemd-run.log")" -eq 1 ]] ||
+    die "up.sh started the snapshot loader with SNAPSHOT_ON_UP=false"
 if [[ -n "${REAL_DOCKER}" ]]; then
     bash -c 'source "$1/scripts/lib.sh"; allow_node_bootstrap; load_versions; load_deployment_env; compose config --format json' \
         _ "${copy}" | jq -e '.services.enforcer.image | startswith("candidate.invalid/")' >/dev/null ||

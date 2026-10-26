@@ -8,7 +8,7 @@ source "$(dirname -- "${BASH_SOURCE[0]}")/lib.sh"
 allow_node_bootstrap
 load_versions
 load_deployment_env
-for command_name in cmp cp curl dd jq mv od rm sha256sum stat tr; do
+for command_name in cmp cp curl dd flock jq mv od rm sha256sum stat tr; do
     require_command "${command_name}"
 done
 
@@ -17,6 +17,11 @@ snapshot_dir="${resolved_data_root}/snapshots"
 snapshot_path="${snapshot_dir}/${ECASH_SNAPSHOT_FILE}"
 partial_path="${snapshot_path}.part"
 mkdir -p -- "${snapshot_dir}"
+# 'just up' runs this in the background; a manual 'just snapshot' meanwhile
+# must not hash, rewrite or load the same files a second time.
+exec 9>"${snapshot_dir}/.snapshot.lock"
+flock --nonblock 9 ||
+    die "another snapshot load is running; follow it with 'journalctl -u $(snapshot_loader_unit) -f'"
 source_path=''
 source_partial_path=''
 if [[ "${ECASH_SNAPSHOT_TRANSFORM}" == network_magic_v2 ]]; then
@@ -110,58 +115,62 @@ download_verified_file() {
     mv -- "${partial}" "${destination}"
 }
 
-if [[ -f "${snapshot_path}" ]]; then
-    info "verifying existing snapshot"
-    verify_snapshot "${snapshot_path}" || die "existing snapshot failed verification"
-elif [[ "${ECASH_SNAPSHOT_TRANSFORM}" == network_magic_v2 ]]; then
-    # A transformation is deterministic but not resumable. Keep a verified
-    # source instead, and always rebuild an incomplete/invalid destination.
-    if [[ -f "${partial_path}" ]]; then
-        if verify_snapshot "${partial_path}"; then
-            mv -- "${partial_path}" "${snapshot_path}"
-        else
-            info "discarding incomplete or invalid transformed snapshot"
-            rm -f -- "${partial_path}"
-        fi
-    fi
-    if [[ ! -f "${snapshot_path}" ]]; then
-        download_verified_file \
-            "${source_path}" \
-            "${source_partial_path}" \
-            "${ECASH_SNAPSHOT_SOURCE_SIZE}" \
-            "${ECASH_SNAPSHOT_SOURCE_SHA256}" \
-            "${NETWORK_ID} snapshot source" \
-            "${ECASH_SNAPSHOT_URL}" \
-            "${ECASH_SNAPSHOT_MIRROR_URL}"
-        info "rewriting the version-2 snapshot network magic for ${NETWORK_ID}"
-        rewrite_snapshot_network_magic_v2 \
-            "${source_path}" \
-            "${partial_path}" \
-            "${ECASH_SNAPSHOT_SOURCE_NETWORK_MAGIC}" \
-            "${ECASH_NETWORK_MAGIC}"
-        verify_snapshot "${partial_path}" || {
-            rm -f -- "${partial_path}"
-            die "transformed snapshot failed verification"
-        }
-        mv -- "${partial_path}" "${snapshot_path}"
-    fi
-else
-    download_verified_file \
-        "${snapshot_path}" \
-        "${partial_path}" \
-        "${ECASH_SNAPSHOT_SIZE}" \
-        "${ECASH_SNAPSHOT_SHA256}" \
-        "${NETWORK_ID} snapshot" \
-        "${ECASH_SNAPSHOT_URL}"
-fi
-
-if [[ "${ECASH_SNAPSHOT_TRANSFORM}" == network_magic_v2 ]]; then
-    # This also covers recovery after an interruption between promoting the
-    # transformed artifact and deleting its reproducible source copy.
+# This also covers recovery after an interruption between promoting the
+# transformed artifact and deleting its reproducible source copy.
+clean_snapshot_source() {
+    [[ "${ECASH_SNAPSHOT_TRANSFORM}" == network_magic_v2 ]] || return 0
     cleanup_transformed_snapshot_source \
         "${snapshot_path}" "${source_path}" "${source_partial_path}" ||
         die "refusing to clean transformed snapshot sources before promotion"
-fi
+}
+
+prepare_snapshot() {
+    if [[ -f "${snapshot_path}" ]]; then
+        info "verifying existing snapshot"
+        verify_snapshot "${snapshot_path}" || die "existing snapshot failed verification"
+    elif [[ "${ECASH_SNAPSHOT_TRANSFORM}" == network_magic_v2 ]]; then
+        # A transformation is deterministic but not resumable. Keep a verified
+        # source instead, and always rebuild an incomplete/invalid destination.
+        if [[ -f "${partial_path}" ]]; then
+            if verify_snapshot "${partial_path}"; then
+                mv -- "${partial_path}" "${snapshot_path}"
+            else
+                info "discarding incomplete or invalid transformed snapshot"
+                rm -f -- "${partial_path}"
+            fi
+        fi
+        if [[ ! -f "${snapshot_path}" ]]; then
+            download_verified_file \
+                "${source_path}" \
+                "${source_partial_path}" \
+                "${ECASH_SNAPSHOT_SOURCE_SIZE}" \
+                "${ECASH_SNAPSHOT_SOURCE_SHA256}" \
+                "${NETWORK_ID} snapshot source" \
+                "${ECASH_SNAPSHOT_URL}" \
+                "${ECASH_SNAPSHOT_MIRROR_URL}"
+            info "rewriting the version-2 snapshot network magic for ${NETWORK_ID}"
+            rewrite_snapshot_network_magic_v2 \
+                "${source_path}" \
+                "${partial_path}" \
+                "${ECASH_SNAPSHOT_SOURCE_NETWORK_MAGIC}" \
+                "${ECASH_NETWORK_MAGIC}"
+            verify_snapshot "${partial_path}" || {
+                rm -f -- "${partial_path}"
+                die "transformed snapshot failed verification"
+            }
+            mv -- "${partial_path}" "${snapshot_path}"
+        fi
+    else
+        download_verified_file \
+            "${snapshot_path}" \
+            "${partial_path}" \
+            "${ECASH_SNAPSHOT_SIZE}" \
+            "${ECASH_SNAPSHOT_SHA256}" \
+            "${NETWORK_ID} snapshot" \
+            "${ECASH_SNAPSHOT_URL}"
+    fi
+    clean_snapshot_source
+}
 
 # Before a new network's fork its activation block does not exist, and a
 # candidate lock leaves its hash pending: the node syncs without the check, and
@@ -198,6 +207,7 @@ if jq -e '.chainstates | any(has("snapshot_blockhash"))' \
     )"
     [[ "${active_snapshot_hash}" == "${ECASH_SNAPSHOT_BLOCK_HASH}" ]] ||
         die "active AssumeUTXO snapshot uses ${active_snapshot_hash}, expected ${ECASH_SNAPSHOT_BLOCK_HASH}"
+    [[ ! -f "${snapshot_path}" ]] || clean_snapshot_source
     check_activation_block require_activation_header ensure_activation_block_data
     info "an AssumeUTXO snapshot chainstate is already active"
     exit 0
@@ -207,15 +217,31 @@ if node_history_is_fully_validated "${chainstates}"; then
     info "the complete ${NETWORK_ID} chainstate is already validated; no snapshot is needed"
     exit 0
 fi
+# loadtxoutset refuses a base its own chainstate has already passed.
+if jq -e --argjson height "${ECASH_SNAPSHOT_HEIGHT}" \
+    '.chainstates[0].blocks >= $height' <<<"${chainstates}" >/dev/null; then
+    info "the node validated past the snapshot height ${ECASH_SNAPSHOT_HEIGHT} on its own; no snapshot is needed"
+    exit 0
+fi
 
-wait_seconds="${SNAPSHOT_HEADER_WAIT_SECONDS:-1800}"
+# The checks above come before the 9.5 GB hash, so 'just up' on a node that
+# already has its snapshot returns at once.
+prepare_snapshot
+
+wait_seconds="${SNAPSHOT_HEADER_WAIT_SECONDS:-604800}"
 deadline="$((SECONDS + wait_seconds))"
 info "waiting for the exact ${NETWORK_ID} snapshot header ${ECASH_SNAPSHOT_BLOCK_HASH}"
+next_report="${SECONDS}"
 until header_json="$(node_cli getblockheader "${ECASH_SNAPSHOT_BLOCK_HASH}" 2>/dev/null)" &&
     jq -e --argjson height "${ECASH_SNAPSHOT_HEIGHT}" \
         '.height == $height' <<<"${header_json}" >/dev/null; do
     ((SECONDS < deadline)) ||
         die "snapshot header ${ECASH_SNAPSHOT_BLOCK_HASH} was not available after ${wait_seconds}s"
+    # A new network can sit for days without peers; say so in the journal.
+    if ((SECONDS >= next_report)); then
+        info "still waiting: $(node_cli getblockchaininfo 2>/dev/null | jq -r '.headers' || printf '?') headers from $(node_cli getconnectioncount 2>/dev/null || printf '?') peers"
+        next_report="$((SECONDS + 600))"
+    fi
     sleep 10
 done
 

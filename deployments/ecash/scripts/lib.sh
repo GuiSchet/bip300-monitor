@@ -396,7 +396,7 @@ load_deployment_env() {
     require_positive_integer \
         SNAPSHOT_RPC_WAIT_SECONDS "${SNAPSHOT_RPC_WAIT_SECONDS:-43200}"
     require_positive_integer \
-        SNAPSHOT_HEADER_WAIT_SECONDS "${SNAPSHOT_HEADER_WAIT_SECONDS:-1800}"
+        SNAPSHOT_HEADER_WAIT_SECONDS "${SNAPSHOT_HEADER_WAIT_SECONDS:-604800}"
     require_positive_integer \
         SNAPSHOT_ACTIVATION_WAIT_SECONDS "${SNAPSHOT_ACTIVATION_WAIT_SECONDS:-86400}"
     require_positive_integer \
@@ -445,6 +445,8 @@ load_deployment_env() {
     TRUST_ASSUMEUTXO_SNAPSHOT="${TRUST_ASSUMEUTXO_SNAPSHOT:-false}"
     require_boolean TRUST_ASSUMEUTXO_SNAPSHOT "${TRUST_ASSUMEUTXO_SNAPSHOT}"
     export TRUST_ASSUMEUTXO_SNAPSHOT
+    SNAPSHOT_ON_UP="${SNAPSHOT_ON_UP:-true}"
+    require_boolean SNAPSHOT_ON_UP "${SNAPSHOT_ON_UP}"
 
     # Restore every repository pin after loading operator-owned configuration.
     load_versions
@@ -554,6 +556,44 @@ cleanup_transformed_snapshot_source() {
 
     [[ -f "${snapshot_path}" ]] || return 1
     rm -f -- "${source_path}" "${source_partial_path}"
+}
+
+# The background snapshot load that 'just up' starts. A transient systemd unit
+# outlives the SSH session, keeps its output in the journal, and its name lets
+# a second 'just up' see the first load instead of starting another.
+snapshot_loader_unit() {
+    printf 'bip300-snapshot-%s\n' "${NETWORK_ID}"
+}
+
+snapshot_loader_state() {
+    command -v systemctl >/dev/null 2>&1 || {
+        printf 'unavailable\n'
+        return 0
+    }
+    systemctl is-active "$(snapshot_loader_unit)" 2>/dev/null || true
+}
+
+start_snapshot_loader() {
+    local unit
+    unit="$(snapshot_loader_unit)"
+    if ! command -v systemd-run >/dev/null 2>&1; then
+        info "systemd-run is not available; run 'just snapshot' inside tmux to load the pinned snapshot"
+        return 0
+    fi
+    if [[ "$(snapshot_loader_state)" =~ ^(active|activating)$ ]]; then
+        info "the snapshot loader ${unit} is already running"
+        return 0
+    fi
+    # A failed earlier run keeps its name loaded until it is reset.
+    systemctl reset-failed "${unit}" >/dev/null 2>&1 || true
+    systemd-run --quiet --unit="${unit}" \
+        --description="Load the pinned ${NETWORK_ID} AssumeUTXO snapshot" \
+        --property=WorkingDirectory="${DEPLOYMENT_ROOT}" \
+        --setenv=COMPOSE_ENV_FILE="$(deployment_env_file)" \
+        --setenv=HOME="${HOME:-/root}" \
+        "${DEPLOYMENT_ROOT}/scripts/snapshot.sh" ||
+        die "could not start the snapshot loader ${unit}; run 'just snapshot' inside tmux"
+    info "loading the pinned snapshot in the background; follow it with 'journalctl -u ${unit} -f'"
 }
 
 compose() {

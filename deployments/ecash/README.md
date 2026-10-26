@@ -52,14 +52,22 @@ just up
 just status
 ```
 
-The AssumeUTXO bootstrap is explicit because it downloads about 9.5 GB,
-verifies its pinned size and SHA-256, and waits for the exact snapshot-base
-header before loading it:
+`just up` also starts the AssumeUTXO bootstrap in the background, as the
+transient systemd unit `bip300-snapshot-<network>`. It downloads about 9.5 GB,
+verifies its pinned size and SHA-256, waits for the exact snapshot-base header
+and loads it. On a new network the header only arrives once the node finds
+peers, which can take days, so the load waits for it (`SNAPSHOT_HEADER_WAIT_SECONDS`,
+seven days by default) instead of relying on someone coming back. Until the
+snapshot is loaded the node validates from genesis, and `just status` says so.
 
 ```bash
-just snapshot
+journalctl -u bip300-snapshot-<network> -f
 just status
 ```
+
+Set `SNAPSHOT_ON_UP=false` to keep the load manual, or on a host without
+systemd, and run `just snapshot` inside `tmux` instead. It is idempotent, and
+one lock file keeps a manual run and the background unit from loading twice.
 
 Once the snapshot-backed node reaches the active network tip, start the pinned
 validator-only enforcer. Wallet and mining services remain disabled:
@@ -240,9 +248,10 @@ does not use; the snapshot hash is a node pin and has to be pinned first. The
 enforcer, the monitor and verification refuse it (`require_ready_release`). On
 the mainnet host:
 
-1. Copy the reference to `VERSIONS.lock` and run `just init`, `just preflight`,
-   `just up` and `just snapshot`, so the node downloads and validates history
-   before the fork. Preflight then checks the node only, and the snapshot skips
+1. Copy the reference to `VERSIONS.lock` and run `just init`, `just preflight`
+   and `just up`, so the node syncs before the fork. `just up` starts the
+   snapshot load, which waits for the snapshot header even while the seeds
+   are still down. Preflight then checks the node only, and the snapshot skips
    the activation block, which does not exist yet.
 2. Pin the remaining values, set `RELEASE_STATUS=ready`, and run
    `just preflight` and `static-check.sh`.
