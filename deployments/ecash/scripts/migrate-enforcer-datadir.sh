@@ -5,6 +5,7 @@
 # before starting the #666 image. It archives the data directory first, under
 # migration-backups/, and stops if Docker cannot say whether they are running. New directories belong
 # to PUID:PGID. --rollback restores the old layout for the previous image.
+# Log files are left in logs/: #666 writes its own under <fork>/<chain>/logs.
 
 set -euo pipefail
 umask 077
