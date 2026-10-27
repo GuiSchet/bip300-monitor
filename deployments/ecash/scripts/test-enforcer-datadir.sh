@@ -62,6 +62,9 @@ fails move_enforcer_state "${root}/data" bitcoin-betanet ecash-betanet/mainnet
 
 # The script itself, on a copy of the deployment.
 copy="$(make_deployment_copy "${root}/e2e" "${VERSIONS_FILE}")"
+# The copy's .env carries the caller's uid; static-check exports .env.example,
+# whose PUID only matches a host where the caller is uid 1000.
+export COMPOSE_ENV_FILE="${copy}/.env"
 data="${copy}/data/${NETWORK_ID}/enforcer-official-v8"
 migrate() {
     PATH="${root}/e2e/bin:${PATH}" "${copy}/scripts/migrate-enforcer-datadir.sh" ecash-betanet "$@"

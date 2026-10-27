@@ -46,6 +46,9 @@ chmod +x -- "${root}/bin/systemd-run" "${root}/bin/systemctl"
 sed 's/^ECASH_SNAPSHOT_SHA256=REPLACE_WITH_.*/ECASH_SNAPSHOT_SHA256='"$(printf 'a%.0s' {1..64})"'/' \
     "${candidate}" >"${root}/node-pinned.lock"
 copy="$(make_deployment_copy "${root}" "${root}/node-pinned.lock")"
+# The copy's .env carries the caller's uid; static-check exports .env.example,
+# whose PUID only matches a host where the caller is uid 1000.
+export COMPOSE_ENV_FILE="${copy}/.env"
 
 run init.sh >/dev/null
 run up.sh >/dev/null
@@ -65,9 +68,8 @@ STUB_LOADER=active run up.sh >"${root}/out" 2>&1
 grep -q 'snapshot loader bip300-snapshot-mainnet is already running' "${root}/out" ||
     die "up.sh did not report the running snapshot loader: $(cat "${root}/out")"
 
-# The operator can keep the load manual. static-check exports its own env
-# file, so write the opt-out to a copy of whichever one is in use.
-cp -- "${COMPOSE_ENV_FILE:-${copy}/.env}" "${root}/manual.env"
+# The operator can keep the load manual.
+cp -- "${copy}/.env" "${root}/manual.env"
 printf '\nSNAPSHOT_ON_UP=false\n' >>"${root}/manual.env"
 COMPOSE_ENV_FILE="${root}/manual.env" run up.sh >/dev/null
 [[ "$(wc -l <"${root}/systemd-run.log")" -eq 1 ]] ||
