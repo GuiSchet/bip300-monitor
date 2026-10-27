@@ -228,7 +228,7 @@ equal its own. `static-check.sh` checks the active lock in full and every other
 reference with `scripts/check-lock.sh`.
 
 `VERSIONS.mainnet.lock.example` is a **candidate** (`RELEASE_STATUS=candidate`):
-it locks the node (`master` at `6e58233`, image pinned by its `sha-` tag), the
+it locks the node (`master` at `5bd8690`, the 288-block retarget from the fork; image pinned by its `sha-` tag), the
 fork height `973728`, magic `eca5dcb7`, the mainnet peers and the
 height-`965000` snapshot with both of its hashes, and leaves as `REPLACE_WITH_`
 what does not exist yet. `check-lock.sh` lists them:

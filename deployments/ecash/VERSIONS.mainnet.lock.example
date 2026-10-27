@@ -23,13 +23,14 @@ ECASH_TIP_HEIGHT_URL=none
 ECASH_EXPECTED_DATA_BYTES=1200000000000
 ECASH_MIN_FREE_PERCENT=20
 
-# Official eCash mainnet source and image reviewed on 2026-10-20: master is
-# Bitcoin Core v31.1 plus the eCash commits, built by the node's CI as latest
-# and as the immutable sha- tag pinned here (same digest).
+# Official eCash mainnet source and image reviewed on 2026-10-27: master is
+# Bitcoin Core v31.1 plus the eCash commits, up to the 288-block dampened
+# retarget from the fork height (5bd8690), built by the node's CI as latest and
+# as the immutable sha- tag pinned here (same digest).
 ECASH_NODE_REPO=https://github.com/ecash-com/bitcoin.git
 ECASH_NODE_BRANCH=master
-ECASH_NODE_COMMIT=6e582335d1210af7963f20ceff371edd37c79af5
-ECASH_NODE_IMAGE=ghcr.io/ecash-com/bitcoin:sha-6e58233@sha256:675e12ac8dc2f13940c9c3fa0fa508d745b11e4bfae5128069292a4efb860c9b
+ECASH_NODE_COMMIT=5bd8690fab60c0d3490a8abab1f1a601524be073
+ECASH_NODE_IMAGE=ghcr.io/ecash-com/bitcoin:sha-5bd8690@sha256:a1025984e40bbaeb83ce2adb373115b87ac4a3a42af1d0a29fc8e2c2057f15d8
 ECASH_NODE_EXPECTED_VERSION=31
 
 ENFORCER_REPO=https://github.com/LayerTwo-Labs/bip300301_enforcer.git
