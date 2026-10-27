@@ -635,6 +635,39 @@ service_started_at() {
     docker inspect --format '{{.State.StartedAt}}' "${container_id}"
 }
 
+# Compose keeps the image reference exactly as VERSIONS.lock spells it.
+service_image() {
+    local container_id
+    container_id="$(compose ps --status running --quiet "$1")"
+    [[ -n "${container_id}" ]] || die "$1 is not running"
+    docker inspect --format '{{.Config.Image}}' "${container_id}"
+}
+
+# Each pinned service, the lock field of its image and the command that
+# recreates it.
+PINNED_SERVICE_IMAGES=(
+    ecash-node:ECASH_NODE_IMAGE:up
+    enforcer:ENFORCER_IMAGE:enforcer-up
+    nats:NATS_IMAGE:monitor-up
+    postgres:POSTGRES_IMAGE:monitor-up
+    event-logger:EVENT_LOGGER_IMAGE:monitor-up
+    enforcer-extractor:ENFORCER_EXTRACTOR_IMAGE:monitor-up
+)
+
+# A lock updated without recreating the containers leaves them on the old
+# images, and nothing else says so: the node of a consensus change keeps
+# answering RPC until the chains part.
+report_stale_service_images() {
+    local entry field recipe running service
+    for entry in "${PINNED_SERVICE_IMAGES[@]}"; do
+        IFS=: read -r service field recipe <<<"${entry}"
+        service_is_running "${service}" || continue
+        running="$(service_image "${service}")"
+        [[ "${running}" != "${!field}" ]] || continue
+        info "warning: ${service} runs ${running}, but the lock pins ${!field}; run 'just ${recipe}'"
+    done
+}
+
 enforcer_mempool_tracking_is_enabled() {
     local command_json
     local container_id

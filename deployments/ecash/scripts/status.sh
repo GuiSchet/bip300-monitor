@@ -34,6 +34,7 @@ jq -n \
 
 compose ps
 require_service_running ecash-node
+report_stale_service_images
 
 info "blockchain"
 node_cli getblockchaininfo |

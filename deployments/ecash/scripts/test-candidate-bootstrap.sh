@@ -72,6 +72,22 @@ printf '\nSNAPSHOT_ON_UP=false\n' >>"${root}/manual.env"
 COMPOSE_ENV_FILE="${root}/manual.env" run up.sh >/dev/null
 [[ "$(wc -l <"${root}/systemd-run.log")" -eq 1 ]] ||
     die "up.sh started the snapshot loader with SNAPSHOT_ON_UP=false"
+
+# 'just status' names a container left on another image than the lock pins.
+stale_report() {
+    STUB_PS=running STUB_IMAGE="$1" PATH="${root}/bin:${PATH}" bash -c \
+        'source "$1/scripts/lib.sh"; allow_node_bootstrap; load_versions; load_deployment_env; report_stale_service_images' \
+        _ "${copy}" 2>&1
+}
+pinned_node_image="$(sed -n 's/^ECASH_NODE_IMAGE=//p' "${copy}/VERSIONS.lock")"
+report="$(stale_report "${pinned_node_image}")"
+! grep -q 'warning: ecash-node ' <<<"${report}" ||
+    die "status reported the pinned node image as stale: ${report}"
+old_image='ghcr.io/ecash-com/bitcoin:sha-6e58233@sha256:old'
+report="$(stale_report "${old_image}")"
+grep -Fq "warning: ecash-node runs ${old_image}, but the lock pins ${pinned_node_image}; run 'just up'" <<<"${report}" ||
+    die "status did not report a node left on another image: ${report}"
+
 if [[ -n "${REAL_DOCKER}" ]]; then
     bash -c 'source "$1/scripts/lib.sh"; allow_node_bootstrap; load_versions; load_deployment_env; compose config --format json' \
         _ "${copy}" | jq -e '.services.enforcer.image | startswith("candidate.invalid/")' >/dev/null ||

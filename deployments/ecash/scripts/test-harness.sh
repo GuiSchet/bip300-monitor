@@ -15,7 +15,8 @@ make_deployment_copy() {
     sed -e "s/^PUID=.*/PUID=$(id -u)/" -e "s/^PGID=.*/PGID=$(id -g)/" \
         "${DEPLOYMENT_ROOT}/.env.example" >"${copy}/.env"
 
-    # STUB_PS sets what `compose ps` answers: empty, running or fail. Rendering
+    # STUB_PS sets what `compose ps` answers: empty, running or fail, and
+    # STUB_IMAGE the image `docker inspect` reports for a container. Rendering
     # goes to the real Docker CLI when there is one; it needs no daemon.
     cat >"${root}/bin/docker" <<EOF
 #!/usr/bin/env bash
@@ -28,6 +29,8 @@ case " \$* " in
     fail) printf 'Cannot connect to the Docker daemon\n' >&2; exit 1 ;;
     running) printf 'c0ffee\n' ;;
     esac ;;
+*" inspect "*)
+    printf '%s\n' "\${STUB_IMAGE:-}" ;;
 esac
 exit 0
 EOF
