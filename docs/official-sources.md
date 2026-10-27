@@ -30,6 +30,13 @@ it does and does not prove. Record schema: 10.
 | `mainchain_block` | node `getblockheader`/`getblock` | Verified raw block and header with absolute chain work. |
 | `confirmed_bmm_fees` | node `getblock(hash, 3)` | Fees of observed bids that were committed in the block. |
 
+A withdrawal bundle's `Failed` event carries no reason. Today a bundle fails
+only when it outlives `withdrawal_bundle_max_age`, but enforcer proposals
+LayerTwo-Labs/bip300301_enforcer#670 and #671 add activation-gated reasons: a
+payout of another bundle in the slot, too long without an upvote or at zero
+votes, and eviction from a full slot. Once a network activates them, a
+proposal's age is only an upper bound on how long it can still be voted on.
+
 ## Snapshot consistency
 
 Each state or BMM reading is bracketed by two tip reads:

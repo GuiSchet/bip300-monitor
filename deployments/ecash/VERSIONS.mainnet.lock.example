@@ -1,0 +1,90 @@
+# Candidate for the eCash mainnet launch (fork at block 973728). The REPLACE_WITH_
+# values do not exist yet; scripts/check-lock.sh lists them. Only the node runs
+# from a candidate: copy it to VERSIONS.lock to sync the node before the fork
+# (README, "Mainnet on its own host"). The enforcer and the monitor refuse it
+# until RELEASE_STATUS=ready.
+RELEASE_STATUS=candidate
+# shellcheck shell=bash
+# Reviewed mainnet lock reference. On the mainnet host the active VERSIONS.lock
+# must match these immutable network and artifact values.
+LOCK_FORMAT=5
+LOCKED_AT=2026-10-20
+
+NETWORK_ID=mainnet
+ECASH_NODE_CHAIN=main
+ECASH_NETWORK_MAGIC=eca5dcb7
+ECASH_NODE_P2P_PORT=8533
+ECASH_NODE_RPC_PORT=8532
+ECASH_NODE_ZMQ_PORT=29000
+ECASH_PUBLIC_PEERS=seed.ecash.ninja:8533,seed.bip300.xyz:8533,seed.ecash.drivecha.in:8533,seed.ecash.zuexeuz.net:8533,seed.ecash.eu.com:8533
+# Advisory only (preflight warns when it is down). No public mainnet explorer
+# confirmed on 2026-10-20; pin its /blocks/tip/height once one exists.
+ECASH_TIP_HEIGHT_URL=none
+ECASH_EXPECTED_DATA_BYTES=1200000000000
+ECASH_MIN_FREE_PERCENT=20
+
+# Official eCash mainnet source and image reviewed on 2026-10-27: master is
+# Bitcoin Core v31.1 plus the eCash commits, up to the 288-block dampened
+# retarget from the fork height (5bd8690), built by the node's CI as latest and
+# as the immutable sha- tag pinned here (same digest).
+ECASH_NODE_REPO=https://github.com/ecash-com/bitcoin.git
+ECASH_NODE_BRANCH=master
+ECASH_NODE_COMMIT=5bd8690fab60c0d3490a8abab1f1a601524be073
+ECASH_NODE_IMAGE=ghcr.io/ecash-com/bitcoin:sha-5bd8690@sha256:a1025984e40bbaeb83ce2adb373115b87ac4a3a42af1d0a29fc8e2c2057f15d8
+ECASH_NODE_EXPECTED_VERSION=31
+
+ENFORCER_REPO=https://github.com/LayerTwo-Labs/bip300301_enforcer.git
+ENFORCER_BRANCH=master
+# Mainnet support arrives with LayerTwo-Labs/bip300301_enforcer#666 (--fork).
+ENFORCER_UPSTREAM_REVIEWED_COMMIT=REPLACE_WITH_MERGED_ENFORCER_666_COMMIT
+ENFORCER_COMMIT=REPLACE_WITH_MERGED_ENFORCER_666_COMMIT
+ENFORCER_IMAGE=REPLACE_WITH_ENFORCER_666_IMAGE
+ENFORCER_NETWORK_ARG=--fork=ecash
+ENFORCER_API_NETWORK=NETWORK_MAINNET
+
+NATS_IMAGE=docker.io/library/nats:2.14.3-alpine@sha256:c11af972c99ae542de8925e6a7d9c533aa1eb039660420d2074beed6089b3bf0
+POSTGRES_IMAGE=docker.io/library/postgres:18.2-alpine@sha256:035b9ab53cfa147d7202b61f5f7782b939ae815b7d6bc81c96b7b42ff1fca950
+POSTGRES_DB=bip300_monitor
+POSTGRES_USER=bip300_monitor
+
+# Images built and published by CI from the merged release commit.
+# Keep contract, source commit, and both immutable image
+# digests together.
+MONITOR_EVENT_CONTRACT_VERSION=9
+# The first images whose extractor knows the mainnet preset.
+MONITOR_IMAGE_COMMIT=REPLACE_WITH_MONITOR_IMAGE_COMMIT
+ENFORCER_EXTRACTOR_IMAGE=REPLACE_WITH_ENFORCER_EXTRACTOR_IMAGE
+EVENT_LOGGER_IMAGE=REPLACE_WITH_EVENT_LOGGER_IMAGE
+
+JUST_VERSION=1.57.0
+JUST_TARGET=x86_64-unknown-linux-musl
+JUST_SHA256=45b548094283cb9739af8f13273b8cddeee869f5b4ef2bb631b1f311cb566155
+
+# The official node (ecash-v1.0.0-core31.1) commits to the Bitcoin
+# height-965000 UTXO set, the newest it knows, which leaves the fewest blocks
+# to fetch before the fork. eCash publishes the file at releases.ecash.com
+# (SHA256SUMS, utxo-965000.json) and Bitcoin Core's #36196 snapshot is the same
+# file. The UTXO contents are shared history, but snapshot format v2 embeds
+# Bitcoin's network magic. snapshot.sh verifies the source and rewrites only
+# those four metadata bytes before loadtxoutset validates the compiled UTXO
+# commitment.
+ECASH_ACTIVATION_HEIGHT=973728
+# Known once block 973728 is mined.
+ECASH_ACTIVATION_BLOCK_HASH=REPLACE_WITH_BLOCK_973728_HASH
+ECASH_SNAPSHOT_HEIGHT=965000
+ECASH_SNAPSHOT_BLOCK_HASH=00000000000000000001595977e6000ce56129f5c9b4073e31ccc30b90b97da9
+ECASH_SNAPSHOT_TRANSFORM=network_magic_v2
+ECASH_SNAPSHOT_URL=https://releases.ecash.com/assumeutxo/mainnet/utxo-965000.dat
+ECASH_SNAPSHOT_MIRROR_URL=https://achow101.com/files/utxo-snapshots/mainnet-965000-utxos.dat
+ECASH_SNAPSHOT_SOURCE_FILE=mainnet-965000-utxos.dat
+ECASH_SNAPSHOT_SOURCE_SIZE=9468312119
+ECASH_SNAPSHOT_SOURCE_SHA256=89351f7106051c0685880f9c64026e993335308de63ae6980e94ba3fafdc7dda
+ECASH_SNAPSHOT_SOURCE_NETWORK_MAGIC=f9beb4d9
+ECASH_SNAPSHOT_FILE=utxo-965000-mainnet.dat
+ECASH_SNAPSHOT_UTXO_HASH=4a8d794337118c0c615b574f817c7306c687584a537184b8d233df42bf477ec2
+ECASH_SNAPSHOT_CHAIN_TX_COUNT=1429611231
+ECASH_SNAPSHOT_SIZE=9468312119
+# The same source with the mainnet magic, hashed from the transformed file on
+# the mainnet host (2026-10-23): snapshot.sh's rewrite and an independent
+# stream over the verified source agreed.
+ECASH_SNAPSHOT_SHA256=19a386265ad551fdcdb8dbcfef8526200e3bb8960a6eb6d211a9a40cfdd20930

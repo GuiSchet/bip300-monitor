@@ -42,7 +42,7 @@ if ! record_current_workers_are_healthy || ! record_node_worker_is_healthy; then
 fi
 event_contract_version="$(record_current_event_contract_version)"
 [[ "${event_contract_version}" == "${MONITOR_EVENT_CONTRACT_VERSION}" ]] ||
-    die "the current extractor uses event contract v${event_contract_version:-unknown}; Betanet requires v${MONITOR_EVENT_CONTRACT_VERSION}"
+    die "the current extractor uses event contract v${event_contract_version:-unknown}; ${NETWORK_ID} requires v${MONITOR_EVENT_CONTRACT_VERSION}"
 run_capabilities="$(record_current_run_capabilities)"
 jq -e 'index("live_bmm_bid_snapshots") != null' <<<"${run_capabilities}" >/dev/null ||
     die "the active extractor run does not declare live_bmm_bid_snapshots"

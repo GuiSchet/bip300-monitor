@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 # Compare verbatim official protobuf against its immutable source, never a patch.
+# The lock's ENFORCER_COMMIT must be one of the official commits listed in
+# proto/upstream/README.md; --online proves its proto/ matches SHA256SUMS.
 set -euo pipefail
 REPOSITORY_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 readonly REPOSITORY_ROOT
@@ -7,7 +9,8 @@ PROTO_ROOT="${REPOSITORY_ROOT}/proto/upstream"
 VERSIONS_FILE="${BIP300_MONITOR_PROTO_VERSIONS_FILE:-${REPOSITORY_ROOT}/deployments/ecash/VERSIONS.lock}"
 commit="$(sed -n 's/^ENFORCER_COMMIT=//p' "${VERSIONS_FILE}")"
 [[ "${commit}" =~ ^[[:xdigit:]]{40}$ ]] || { echo 'invalid official commit' >&2; exit 1; }
-grep -Fxq -- "- Official commit: \`${commit}\`" "${PROTO_ROOT}/README.md"
+grep -Fxq -- "- Official commit: \`${commit}\`" "${PROTO_ROOT}/README.md" ||
+    { echo "official commit ${commit} is not listed in proto/upstream/README.md" >&2; exit 1; }
 [[ ! -e "${PROTO_ROOT}/validator-observer.patch" ]] || { echo 'observer patches are forbidden' >&2; exit 1; }
 (cd "${PROTO_ROOT}" && sha256sum --check --quiet SHA256SUMS)
 case "${1:---offline}" in

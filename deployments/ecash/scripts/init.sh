@@ -5,6 +5,7 @@ set -euo pipefail
 # shellcheck source=lib.sh
 source "$(dirname -- "${BASH_SOURCE[0]}")/lib.sh"
 
+allow_node_bootstrap
 load_versions
 case "$(uname -m)" in
 x86_64 | amd64) ;;

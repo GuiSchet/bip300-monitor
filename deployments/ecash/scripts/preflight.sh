@@ -5,6 +5,7 @@ set -euo pipefail
 # shellcheck source=lib.sh
 source "$(dirname -- "${BASH_SOURCE[0]}")/lib.sh"
 
+allow_node_bootstrap
 load_versions
 load_deployment_env
 for command_name in awk bash cmp curl df docker grep jq mktemp realpath timeout; do
@@ -68,7 +69,9 @@ else
     info "existing-data disk preflight passed (available=${filesystem_available}, free=${free_percent}%)"
 fi
 
-if tip_height="$(
+if [[ "${ECASH_TIP_HEIGHT_URL}" == none ]]; then
+    info "no public ${NETWORK_ID} tip endpoint is locked; skipping the advisory check"
+elif tip_height="$(
     curl --fail --silent --show-error --max-time 15 "${ECASH_TIP_HEIGHT_URL}" 2>/dev/null
 )" && [[ "${tip_height}" =~ ^[0-9]+$ ]]; then
     info "public ${NETWORK_ID} tip is ${tip_height} (advisory only)"
@@ -145,13 +148,11 @@ else
     info "transformed snapshot source and output are pinned by SHA-256 in VERSIONS.lock"
 fi
 
-for image in \
-    "${ECASH_NODE_IMAGE}" \
-    "${ENFORCER_IMAGE}" \
-    "${NATS_IMAGE}" \
-    "${POSTGRES_IMAGE}" \
-    "${ENFORCER_EXTRACTOR_IMAGE}" \
-    "${EVENT_LOGGER_IMAGE}"; do
+images=("${ECASH_NODE_IMAGE}" "${NATS_IMAGE}" "${POSTGRES_IMAGE}")
+for field in ENFORCER_IMAGE ENFORCER_EXTRACTOR_IMAGE EVENT_LOGGER_IMAGE; do
+    lock_is_pending "${field}" || images+=("${!field}")
+done
+for image in "${images[@]}"; do
     # Registry pins may resolve either to a multi-architecture index or to one
     # manifest. Reject a missing/wrong amd64 child before it can surface later
     # as a runtime exec-format error.
@@ -177,6 +178,10 @@ done
 # secret and a stale image pin each surface downstream as a container that dies
 # or never goes healthy, with nothing in the error naming the real cause.
 require_postgres_secret_readable
-require_pinned_images_current
+lock_is_pending MONITOR_IMAGE_COMMIT || require_pinned_images_current
 
-info "${NETWORK_ID} deployment preflight passed"
+if ((${#LOCK_PENDING[@]})); then
+    info "${NETWORK_ID} node preflight passed; the candidate lock still has to pin: ${LOCK_PENDING[*]}"
+else
+    info "${NETWORK_ID} deployment preflight passed"
+fi

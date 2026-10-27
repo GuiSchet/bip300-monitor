@@ -5,6 +5,7 @@ set -euo pipefail
 # shellcheck source=lib.sh
 source "$(dirname -- "${BASH_SOURCE[0]}")/lib.sh"
 
+allow_node_bootstrap
 load_versions
 load_deployment_env
 require_command docker
@@ -33,6 +34,7 @@ jq -n \
 
 compose ps
 require_service_running ecash-node
+report_stale_service_images
 
 info "blockchain"
 node_cli getblockchaininfo |
@@ -76,6 +78,15 @@ jq \
         end
     )
 }' <<<"${chainstates}"
+
+# Without its snapshot the node validates from genesis, which is easy to
+# mistake for a node that is merely catching up.
+if jq -e --argjson height "${ECASH_SNAPSHOT_HEIGHT}" '
+    (.chainstates | any(has("snapshot_blockhash")) | not)
+    and (.chainstates[0].blocks < $height)
+' <<<"${chainstates}" >/dev/null; then
+    info "the pinned snapshot is not loaded: the node is validating from genesis (snapshot loader $(snapshot_loader_unit): $(snapshot_loader_state)); 'just up' starts it, or run 'just snapshot' inside tmux"
+fi
 
 info "peers"
 node_cli getpeerinfo |

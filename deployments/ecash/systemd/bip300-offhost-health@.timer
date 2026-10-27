@@ -1,5 +1,5 @@
 [Unit]
-Description=Check off-host backup freshness hourly
+Description=Check off-host %i backup freshness hourly
 
 [Timer]
 OnCalendar=hourly

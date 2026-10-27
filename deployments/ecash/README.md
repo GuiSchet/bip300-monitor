@@ -52,14 +52,22 @@ just up
 just status
 ```
 
-The AssumeUTXO bootstrap is explicit because it downloads about 9.5 GB,
-verifies its pinned size and SHA-256, and waits for the exact snapshot-base
-header before loading it:
+`just up` also starts the AssumeUTXO bootstrap in the background, as the
+transient systemd unit `bip300-snapshot-<network>`. It downloads about 9.5 GB,
+verifies its pinned size and SHA-256, waits for the exact snapshot-base header
+and loads it. On a new network the header only arrives once the node finds
+peers, which can take days, so the load waits for it (`SNAPSHOT_HEADER_WAIT_SECONDS`,
+seven days by default) instead of relying on someone coming back. Until the
+snapshot is loaded the node validates from genesis, and `just status` says so.
 
 ```bash
-just snapshot
+journalctl -u bip300-snapshot-<network> -f
 just status
 ```
+
+Set `SNAPSHOT_ON_UP=false` to keep the load manual, or on a host without
+systemd, and run `just snapshot` inside `tmux` instead. It is idempotent, and
+one lock file keeps a manual run and the background unit from loading twice.
 
 Once the snapshot-backed node reaches the active network tip, start the pinned
 validator-only enforcer. Wallet and mining services remain disabled:
@@ -210,6 +218,65 @@ transformed hashes are both pinned in the lock.
 Moving to another network requires an intentional change to the network lock.
 The project name, generated node configuration, and fresh data root then follow
 from `NETWORK_ID`. Never point a new network at an existing chainstate.
+
+### Mainnet on its own host
+
+Each network runs on its own host: two full nodes do not fit on one disk, and
+the enforcer refuses a pruned node. `VERSIONS.<network>.lock.example` is each
+network's reviewed reference, and the active `VERSIONS.lock` of a host must
+equal its own. `static-check.sh` checks the active lock in full and every other
+reference with `scripts/check-lock.sh`.
+
+`VERSIONS.mainnet.lock.example` is a **candidate** (`RELEASE_STATUS=candidate`):
+it locks the node (`master` at `5bd8690`, the 288-block retarget from the fork; image pinned by its `sha-` tag), the
+fork height `973728`, magic `eca5dcb7`, the mainnet peers and the
+height-`965000` snapshot with both of its hashes, and leaves as `REPLACE_WITH_`
+what does not exist yet. `check-lock.sh` lists them:
+
+- `ENFORCER_*`: the merged commit of LayerTwo-Labs/bip300301_enforcer#666, the
+  first enforcer that supports mainnet (`ENFORCER_NETWORK_ARG=--fork=ecash`), and
+  its image; the commit is also listed in `proto/upstream/README.md` once
+  `check-proto-vendor.sh --online` confirms its `proto/` is unchanged. If #666
+  is still open when the fork nears, its head `a8b3dcd` can be pinned the same
+  way (its `proto/` passed `--online` on 2026-10-23) and repinned to the merged
+  commit later;
+- `MONITOR_IMAGE_COMMIT` and the monitor images: the first build whose extractor
+  knows the mainnet preset;
+- `ECASH_ACTIVATION_BLOCK_HASH`: the hash of block `973728`, known once it is
+  mined.
+
+Only the node runs from a candidate. `init`, `preflight`, `up`, `snapshot`,
+`status`, `logs` and `down` accept it while every pending value is one the node
+does not use; the snapshot hash is a node pin and has to be pinned first. The
+enforcer, the monitor and verification refuse it (`require_ready_release`). On
+the mainnet host:
+
+1. Copy the reference to `VERSIONS.lock` and run `just init`, `just preflight`
+   and `just up`, so the node syncs before the fork. `just up` starts the
+   snapshot load, which waits for the snapshot header even while the seeds
+   are still down. Preflight then checks the node only, and the snapshot skips
+   the activation block, which does not exist yet.
+2. Pin the remaining values, set `RELEASE_STATUS=ready`, and run
+   `just preflight` and `static-check.sh`.
+3. Run `just snapshot` again: it now checks the activation block.
+4. Run `just enforcer-up` and `just monitor-up`.
+
+The Observatory reads it through its own backend on that host.
+
+### Enforcer data directory after #666
+
+From #666 the enforcer keeps its state under `<data-dir>/<fork>/<chain>` instead
+of `validator/<chain>-<preset>` and `wallet/<chain>-<preset>`, and does not move
+it. When a host moves to the #666 enforcer, stop the enforcer and the extractor
+and run `bash scripts/migrate-enforcer-datadir.sh ecash-betanet` before starting
+the new image; it archives the data directory under `migration-backups/`, apart
+from the record backups, and renames the two directories, so the enforcer
+resumes from its height. Log files are not state and stay in `logs/`; #666
+writes new ones under `<fork>/<chain>/logs`. It checks the layout before archiving, and a repeated
+run that has nothing left to move archives nothing. It stops if Docker
+cannot say whether those services are running, creates the new directories as
+`PUID:PGID` and checks that this identity can use them; run it as root or as
+`PUID`. `--rollback` restores the old layout for the old image.
 
 ## Network exposure
 

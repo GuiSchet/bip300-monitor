@@ -1,0 +1,11 @@
+[Unit]
+Description=Copy and restore %i monitor backups on the operator computer
+
+[Service]
+Type=oneshot
+# The VPS address and SSH key path stay on the operator computer, outside the
+# repository. Copy offhost.env.example to ~/.config/bip300-monitor/offhost-%i.env.
+EnvironmentFile=%h/.config/bip300-monitor/offhost-%i.env
+ExecStart=/usr/bin/python3 %h/.local/lib/bip300-monitor/offhost-backup.py --host ${BIP300_BACKUP_HOST} --identity ${BIP300_BACKUP_IDENTITY} --network %i --local-root %h/.local/share/bip300-monitor/backups/%i
+UMask=0077
+Nice=10

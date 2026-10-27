@@ -34,20 +34,107 @@ require_boolean() {
 }
 
 require_ready_release() {
-    [[ "${RELEASE_STATUS:-}" == ready ]] || die "release is not marked ready; this candidate cannot be started"
+    [[ "${RELEASE_STATUS:-}" == ready ]] || die "release is not marked ready; the enforcer and the monitor cannot start from a candidate lock"
     [[ "${ENFORCER_REPO}" == https://github.com/LayerTwo-Labs/bip300301_enforcer.git ]] || die "enforcer must use official upstream"
     [[ "${ENFORCER_COMMIT}" == "${ENFORCER_UPSTREAM_REVIEWED_COMMIT}" ]] || die "official enforcer commit mismatch"
 }
 
+# Values a candidate lock (RELEASE_STATUS=candidate) cannot pin before launch:
+# the activation block, the transformed snapshot, the enforcer release that
+# supports the network, and the monitor images built after it.
+# shellcheck disable=SC2034 # check-lock.sh reviews candidates against it.
+readonly CANDIDATE_FIELDS=(
+    ECASH_ACTIVATION_BLOCK_HASH
+    ECASH_SNAPSHOT_SHA256
+    ENFORCER_UPSTREAM_REVIEWED_COMMIT
+    ENFORCER_COMMIT
+    ENFORCER_IMAGE
+    MONITOR_IMAGE_COMMIT
+    ENFORCER_EXTRACTOR_IMAGE
+    EVENT_LOGGER_IMAGE
+)
+# The ones the node does not use. The snapshot hash is a node pin.
+readonly NODE_BOOTSTRAP_FIELDS=(
+    ECASH_ACTIVATION_BLOCK_HASH
+    ENFORCER_UPSTREAM_REVIEWED_COMMIT
+    ENFORCER_COMMIT
+    ENFORCER_IMAGE
+    MONITOR_IMAGE_COMMIT
+    ENFORCER_EXTRACTOR_IMAGE
+    EVENT_LOGGER_IMAGE
+)
+NODE_BOOTSTRAP=false
+LOCK_PENDING=()
+
+# Scripts that operate only the node call this before load_versions. A
+# candidate lock is then accepted with the NODE_BOOTSTRAP_FIELDS still pending,
+# so a new network's node syncs before its enforcer release and activation
+# block exist. Everything else keeps refusing the candidate.
+allow_node_bootstrap() {
+    NODE_BOOTSTRAP=true
+}
+
+lock_placeholders() {
+    grep -oE '^[A-Z][A-Z0-9_]*=REPLACE_WITH_' "$1" | cut -d= -f1 || true
+}
+
+lock_is_pending() {
+    [[ " ${LOCK_PENDING[*]} " == *" $1 "* ]]
+}
+
+# Replaces the placeholders of a sourced candidate lock with stand-ins of the
+# right shape, so the remaining checks run; dies on a placeholder outside the
+# allowed fields. Records them in LOCK_PENDING.
+use_candidate_stand_ins() {
+    local placeholders="$1"
+    shift
+    local field
+    local zero_hash
+    zero_hash="$(printf '0%.0s' {1..64})"
+    LOCK_PENDING=()
+    while IFS= read -r field; do
+        [[ -n "${field}" ]] || continue
+        [[ " $* " == *" ${field} "* ]] ||
+            die "${field} is still a placeholder and must be pinned for this step"
+        case "${field}" in
+        *_COMMIT) printf -v "${field}" '%s' "${zero_hash:0:40}" ;;
+        *_HASH | *_SHA256) printf -v "${field}" '%s' "${zero_hash}" ;;
+        *) : ;;
+        esac
+        LOCK_PENDING+=("${field}")
+    done <<<"${placeholders}"
+    ! lock_is_pending ENFORCER_IMAGE ||
+        ENFORCER_IMAGE="candidate.invalid/enforcer:sha-${ENFORCER_COMMIT:0:12}@sha256:${zero_hash}"
+    ! lock_is_pending ENFORCER_EXTRACTOR_IMAGE ||
+        ENFORCER_EXTRACTOR_IMAGE="candidate.invalid/extractor:sha-${MONITOR_IMAGE_COMMIT:0:12}@sha256:${zero_hash}"
+    ! lock_is_pending EVENT_LOGGER_IMAGE ||
+        EVENT_LOGGER_IMAGE="candidate.invalid/logger:sha-${MONITOR_IMAGE_COMMIT:0:12}@sha256:${zero_hash}"
+}
+
 load_versions() {
+    local field
+    local placeholders
     [[ -f "${VERSIONS_FILE}" ]] || die "missing ${VERSIONS_FILE}"
-    if grep -qE '^[A-Z][A-Z0-9_]*=REPLACE_WITH_' "${VERSIONS_FILE}"; then
-        die "${VERSIONS_FILE} contains unresolved promotion placeholders"
-    fi
+    placeholders="$(lock_placeholders "${VERSIONS_FILE}")"
     # This file is tracked in the repository and contains assignments only.
     # shellcheck disable=SC1090
     source "${VERSIONS_FILE}"
+    if [[ -n "${placeholders}" ]]; then
+        [[ "${NODE_BOOTSTRAP}" == true && "${RELEASE_STATUS:-}" == candidate ]] ||
+            die "${VERSIONS_FILE} contains unresolved promotion placeholders"
+        use_candidate_stand_ins "${placeholders}" "${NODE_BOOTSTRAP_FIELDS[@]}"
+        # Compose reads VERSIONS.lock as an env file; the shell environment
+        # takes precedence, so the services it renders see the stand-ins.
+        for field in "${LOCK_PENDING[@]}"; do
+            export "${field?}"
+        done
+    fi
+    validate_versions
+}
 
+# Checks the values of whichever lock was sourced: the active VERSIONS.lock, or
+# a lock reference that check-lock.sh reviews without deploying it.
+validate_versions() {
     : "${LOCK_FORMAT:?LOCK_FORMAT must be locked}"
     : "${NETWORK_ID:?NETWORK_ID must be locked}"
     : "${ECASH_NODE_CHAIN:?ECASH_NODE_CHAIN must be locked}"
@@ -58,6 +145,9 @@ load_versions() {
     : "${ECASH_NODE_ZMQ_PORT:?ECASH_NODE_ZMQ_PORT must be locked}"
     : "${ECASH_NODE_EXPECTED_VERSION:?ECASH_NODE_EXPECTED_VERSION must be locked}"
     : "${ECASH_TIP_HEIGHT_URL:?ECASH_TIP_HEIGHT_URL must be locked}"
+    # none: the network has no public explorer to compare the tip with.
+    [[ "${ECASH_TIP_HEIGHT_URL}" == none || "${ECASH_TIP_HEIGHT_URL}" =~ ^https://[^[:space:]]+$ ]] ||
+        die "ECASH_TIP_HEIGHT_URL must be an https URL or none"
     : "${ECASH_EXPECTED_DATA_BYTES:?ECASH_EXPECTED_DATA_BYTES must be locked}"
     : "${ECASH_MIN_FREE_PERCENT:?ECASH_MIN_FREE_PERCENT must be locked}"
     : "${ECASH_ACTIVATION_HEIGHT:?ECASH_ACTIVATION_HEIGHT must be locked}"
@@ -71,7 +161,7 @@ load_versions() {
     : "${ECASH_SNAPSHOT_URL:?ECASH_SNAPSHOT_URL must be locked}"
     : "${ECASH_SNAPSHOT_SIZE:?ECASH_SNAPSHOT_SIZE must be locked}"
     : "${ECASH_SNAPSHOT_SHA256:?ECASH_SNAPSHOT_SHA256 must be locked}"
-    : "${ENFORCER_NETWORK_PRESET:?ENFORCER_NETWORK_PRESET must be locked}"
+    : "${ENFORCER_NETWORK_ARG:?ENFORCER_NETWORK_ARG must be locked}"
     : "${ENFORCER_API_NETWORK:?ENFORCER_API_NETWORK must be locked}"
     : "${ENFORCER_UPSTREAM_REVIEWED_COMMIT:?ENFORCER_UPSTREAM_REVIEWED_COMMIT must be locked}"
     : "${MONITOR_EVENT_CONTRACT_VERSION:?MONITOR_EVENT_CONTRACT_VERSION must be locked}"
@@ -97,6 +187,10 @@ load_versions() {
         die "ECASH_SNAPSHOT_SHA256 must contain 64 hexadecimal characters"
     [[ "${ENFORCER_UPSTREAM_REVIEWED_COMMIT}" =~ ^[[:xdigit:]]{40}$ ]] ||
         die "ENFORCER_UPSTREAM_REVIEWED_COMMIT must contain 40 hexadecimal characters"
+    # The enforcer names its network with --network-preset up to 1753fc0 and
+    # with --fork from LayerTwo-Labs/bip300301_enforcer#666 on.
+    [[ "${ENFORCER_NETWORK_ARG}" =~ ^--(network-preset|fork)=[a-z][a-z-]*$ ]] ||
+        die "ENFORCER_NETWORK_ARG must be --network-preset=<preset> or --fork=<fork>"
     case "${ECASH_SNAPSHOT_TRANSFORM}" in
     none)
         : "${ECASH_SNAPSHOT_CHECKSUMS_URL:?ECASH_SNAPSHOT_CHECKSUMS_URL must be locked for a direct snapshot}"
@@ -137,6 +231,46 @@ load_versions() {
     ((ECASH_SNAPSHOT_HEIGHT <= ECASH_ACTIVATION_HEIGHT)) ||
         die "ECASH_SNAPSHOT_HEIGHT must not be after ECASH_ACTIVATION_HEIGHT; otherwise activation-era block bodies can be skipped"
     network_peers >/dev/null
+}
+
+# The reviewed lock of a network; the active VERSIONS.lock must equal it.
+network_lock_reference() {
+    printf '%s/VERSIONS.%s.lock.example\n' "${DEPLOYMENT_ROOT}" "$1"
+}
+
+# Pins static-check.sh and check-lock.sh require of a promotable lock.
+validate_release_pins() {
+    [[ -f "$(network_lock_reference "${NETWORK_ID}")" ]] ||
+        die "network ${NETWORK_ID} has no reviewed lock reference"
+    [[ "${ECASH_SNAPSHOT_TRANSFORM}" == network_magic_v2 ]] ||
+        die "only the network_magic_v2 snapshot transform is reviewed"
+    [[ "${ECASH_SNAPSHOT_SOURCE_NETWORK_MAGIC}" == f9beb4d9 ]] ||
+        die "the snapshot source must be a Bitcoin snapshot"
+    [[ "${ECASH_NETWORK_MAGIC}" =~ ^[[:xdigit:]]{8}$ ]] ||
+        die "ECASH_NETWORK_MAGIC must contain 8 hexadecimal characters"
+    [[ "${ECASH_NODE_COMMIT}" =~ ^[[:xdigit:]]{40}$ ]] ||
+        die "ECASH_NODE_COMMIT must contain 40 hexadecimal characters"
+    [[ "${ENFORCER_COMMIT}" =~ ^[[:xdigit:]]{40}$ ]] ||
+        die "ENFORCER_COMMIT must contain 40 hexadecimal characters"
+    [[ "${ENFORCER_COMMIT}" == "${ENFORCER_UPSTREAM_REVIEWED_COMMIT}" ]] ||
+        die "ENFORCER_COMMIT is not the reviewed upstream commit"
+    [[ "${MONITOR_EVENT_CONTRACT_VERSION}" =~ ^[0-9]+$ ]] ||
+        die "MONITOR_EVENT_CONTRACT_VERSION must be numeric"
+    [[ "${MONITOR_IMAGE_COMMIT}" =~ ^[[:xdigit:]]{40}$ ]] ||
+        die "MONITOR_IMAGE_COMMIT must contain 40 hexadecimal characters"
+    # Network branches have a moving tag (betanet); mainnet is the default
+    # branch, published as latest and as an immutable sha- tag.
+    [[ "${ECASH_NODE_IMAGE}" == *":${ECASH_NODE_BRANCH}@sha256:"* ||
+        "${ECASH_NODE_IMAGE}" == *":sha-${ECASH_NODE_COMMIT:0:7}@sha256:"* ]] ||
+        die "ECASH_NODE_IMAGE must be pinned by digest under its branch or commit tag"
+    [[ "${ENFORCER_IMAGE}" == *":sha-${ENFORCER_COMMIT:0:12}@sha256:"* ]] ||
+        die "ENFORCER_IMAGE is not the build of ENFORCER_COMMIT"
+    [[ "${ENFORCER_EXTRACTOR_IMAGE}" == *":sha-${MONITOR_IMAGE_COMMIT:0:12}@sha256:"* ]] ||
+        die "ENFORCER_EXTRACTOR_IMAGE is not the build of MONITOR_IMAGE_COMMIT"
+    [[ "${EVENT_LOGGER_IMAGE}" == *":sha-${MONITOR_IMAGE_COMMIT:0:12}@sha256:"* ]] ||
+        die "EVENT_LOGGER_IMAGE is not the build of MONITOR_IMAGE_COMMIT"
+    [[ "${POSTGRES_IMAGE}" == *"@sha256:"* ]] ||
+        die "POSTGRES_IMAGE must be pinned by digest"
 }
 
 network_peers() {
@@ -262,7 +396,7 @@ load_deployment_env() {
     require_positive_integer \
         SNAPSHOT_RPC_WAIT_SECONDS "${SNAPSHOT_RPC_WAIT_SECONDS:-43200}"
     require_positive_integer \
-        SNAPSHOT_HEADER_WAIT_SECONDS "${SNAPSHOT_HEADER_WAIT_SECONDS:-1800}"
+        SNAPSHOT_HEADER_WAIT_SECONDS "${SNAPSHOT_HEADER_WAIT_SECONDS:-604800}"
     require_positive_integer \
         SNAPSHOT_ACTIVATION_WAIT_SECONDS "${SNAPSHOT_ACTIVATION_WAIT_SECONDS:-86400}"
     require_positive_integer \
@@ -311,6 +445,8 @@ load_deployment_env() {
     TRUST_ASSUMEUTXO_SNAPSHOT="${TRUST_ASSUMEUTXO_SNAPSHOT:-false}"
     require_boolean TRUST_ASSUMEUTXO_SNAPSHOT "${TRUST_ASSUMEUTXO_SNAPSHOT}"
     export TRUST_ASSUMEUTXO_SNAPSHOT
+    SNAPSHOT_ON_UP="${SNAPSHOT_ON_UP:-true}"
+    require_boolean SNAPSHOT_ON_UP "${SNAPSHOT_ON_UP}"
 
     # Restore every repository pin after loading operator-owned configuration.
     load_versions
@@ -331,6 +467,86 @@ data_root() {
     printf '%s\n' "${ECASH_DATA_ROOT}"
 }
 
+# The enforcer's data directory on the host, mounted at /data (compose.yaml).
+enforcer_data_dir() {
+    printf '%s/enforcer-official-v8\n' "$(data_root)"
+}
+
+# Creates the missing directories of PATH below DIR as the enforcer container
+# (PUID:PGID) with DIR's mode, whatever the umask and user running this.
+make_enforcer_dirs() {
+    local dir="$1" path="$2"
+    local mode current="$1" part
+    local -a parts
+    : "${PUID:?PUID must be set}" "${PGID:?PGID must be set}"
+    mode="$(stat --format=%a -- "${dir}")"
+    IFS=/ read -r -a parts <<<"${path#"${dir}/"}"
+    for part in "${parts[@]}"; do
+        current="${current}/${part}"
+        [[ -d "${current}" ]] ||
+            install -d -o "${PUID}" -g "${PGID}" -m "${mode}" -- "${current}"
+    done
+}
+
+# Checks that the enforcer container, which runs as PUID:PGID with no
+# supplementary groups (compose.yaml), can read, write and enter each PATH.
+require_container_access() {
+    local path
+    : "${PUID:?PUID must be set}" "${PGID:?PGID must be set}"
+    for path in "$@"; do
+        if ((EUID == 0)); then
+            require_command setpriv
+            setpriv --reuid="${PUID}" --regid="${PGID}" --clear-groups -- \
+                test -r "${path}" -a -w "${path}" -a -x "${path}"
+        elif [[ "$(id -u)" == "${PUID}" ]]; then
+            test -r "${path}" -a -w "${path}" -a -x "${path}"
+        else
+            die "run this as root or as UID ${PUID} to check what the enforcer can reach"
+        fi || die "the enforcer (${PUID}:${PGID}) cannot use ${path}"
+    done
+}
+
+# Moves the enforcer state from the layout up to bip300301_enforcer 1753fc0,
+# DIR/{validator,wallet}/LEGACY, to the one #666 introduced,
+# DIR/TARGET/{validator,wallet}; --rollback moves it back. Renames on one
+# filesystem only: nothing is copied. A part already moved is skipped, so an
+# interrupted run can be repeated. New parents belong to PUID:PGID.
+move_enforcer_state() {
+    plan_enforcer_moves "$@"
+    local -a moves=("${ENFORCER_MOVES[@]}")
+    while ((${#moves[@]})); do
+        make_enforcer_dirs "$1" "$(dirname -- "${moves[1]}")"
+        require_container_access "$(dirname -- "${moves[1]}")"
+        mv -T -- "${moves[0]}" "${moves[1]}"
+        info "moved ${moves[0]} to ${moves[1]}"
+        moves=("${moves[@]:2}")
+    done
+}
+
+# Sets ENFORCER_MOVES to the from/to pairs move_enforcer_state would rename,
+# without touching anything; empty when the state already moved. Dies on state
+# in both layouts or in neither.
+plan_enforcer_moves() {
+    local dir="$1" legacy="$2" target="$3" mode="${4:-}"
+    local part from to
+    ENFORCER_MOVES=()
+    for part in validator wallet; do
+        from="${dir}/${part}/${legacy}"
+        to="${dir}/${target}/${part}"
+        [[ "${mode}" != --rollback ]] || {
+            from="${dir}/${target}/${part}"
+            to="${dir}/${part}/${legacy}"
+        }
+        if [[ -e "${from}" && -e "${to}" ]]; then
+            die "both ${from} and ${to} exist; resolve them by hand"
+        elif [[ -e "${from}" ]]; then
+            ENFORCER_MOVES+=("${from}" "${to}")
+        elif [[ ! -e "${to}" ]]; then
+            die "neither ${from} nor ${to} exists"
+        fi
+    done
+}
+
 # Remove reproducible transform inputs only after the caller has verified that
 # the promoted destination exists and is valid.
 cleanup_transformed_snapshot_source() {
@@ -340,6 +556,44 @@ cleanup_transformed_snapshot_source() {
 
     [[ -f "${snapshot_path}" ]] || return 1
     rm -f -- "${source_path}" "${source_partial_path}"
+}
+
+# The background snapshot load that 'just up' starts. A transient systemd unit
+# outlives the SSH session, keeps its output in the journal, and its name lets
+# a second 'just up' see the first load instead of starting another.
+snapshot_loader_unit() {
+    printf 'bip300-snapshot-%s\n' "${NETWORK_ID}"
+}
+
+snapshot_loader_state() {
+    command -v systemctl >/dev/null 2>&1 || {
+        printf 'unavailable\n'
+        return 0
+    }
+    systemctl is-active "$(snapshot_loader_unit)" 2>/dev/null || true
+}
+
+start_snapshot_loader() {
+    local unit
+    unit="$(snapshot_loader_unit)"
+    if ! command -v systemd-run >/dev/null 2>&1; then
+        info "systemd-run is not available; run 'just snapshot' inside tmux to load the pinned snapshot"
+        return 0
+    fi
+    if [[ "$(snapshot_loader_state)" =~ ^(active|activating)$ ]]; then
+        info "the snapshot loader ${unit} is already running"
+        return 0
+    fi
+    # A failed earlier run keeps its name loaded until it is reset.
+    systemctl reset-failed "${unit}" >/dev/null 2>&1 || true
+    systemd-run --quiet --unit="${unit}" \
+        --description="Load the pinned ${NETWORK_ID} AssumeUTXO snapshot" \
+        --property=WorkingDirectory="${DEPLOYMENT_ROOT}" \
+        --setenv=COMPOSE_ENV_FILE="$(deployment_env_file)" \
+        --setenv=HOME="${HOME:-/root}" \
+        "${DEPLOYMENT_ROOT}/scripts/snapshot.sh" ||
+        die "could not start the snapshot loader ${unit}; run 'just snapshot' inside tmux"
+    info "loading the pinned snapshot in the background; follow it with 'journalctl -u ${unit} -f'"
 }
 
 compose() {
@@ -361,8 +615,13 @@ node_cli() {
         "$@"
 }
 
+# An error from Docker is never read as "stopped": callers stop or migrate
+# state on the strength of this answer.
 service_is_running() {
-    [[ -n "$(compose ps --status running --quiet "$1")" ]]
+    local container_ids
+    container_ids="$(compose ps --status running --quiet "$1")" ||
+        die "could not read the state of $1 from Docker"
+    [[ -n "${container_ids}" ]]
 }
 
 require_service_running() {
@@ -374,6 +633,39 @@ service_started_at() {
     container_id="$(compose ps --status running --quiet "$1")"
     [[ -n "${container_id}" ]] || die "$1 is not running"
     docker inspect --format '{{.State.StartedAt}}' "${container_id}"
+}
+
+# Compose keeps the image reference exactly as VERSIONS.lock spells it.
+service_image() {
+    local container_id
+    container_id="$(compose ps --status running --quiet "$1")"
+    [[ -n "${container_id}" ]] || die "$1 is not running"
+    docker inspect --format '{{.Config.Image}}' "${container_id}"
+}
+
+# Each pinned service, the lock field of its image and the command that
+# recreates it.
+PINNED_SERVICE_IMAGES=(
+    ecash-node:ECASH_NODE_IMAGE:up
+    enforcer:ENFORCER_IMAGE:enforcer-up
+    nats:NATS_IMAGE:monitor-up
+    postgres:POSTGRES_IMAGE:monitor-up
+    event-logger:EVENT_LOGGER_IMAGE:monitor-up
+    enforcer-extractor:ENFORCER_EXTRACTOR_IMAGE:monitor-up
+)
+
+# A lock updated without recreating the containers leaves them on the old
+# images, and nothing else says so: the node of a consensus change keeps
+# answering RPC until the chains part.
+report_stale_service_images() {
+    local entry field recipe running service
+    for entry in "${PINNED_SERVICE_IMAGES[@]}"; do
+        IFS=: read -r service field recipe <<<"${entry}"
+        service_is_running "${service}" || continue
+        running="$(service_image "${service}")"
+        [[ "${running}" != "${!field}" ]] || continue
+        info "warning: ${service} runs ${running}, but the lock pins ${!field}; run 'just ${recipe}'"
+    done
 }
 
 enforcer_mempool_tracking_is_enabled() {
