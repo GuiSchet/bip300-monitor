@@ -773,6 +773,13 @@ struct NetworkPreset {
 }
 
 const NETWORK_PRESETS: &[NetworkPreset] = &[
+    // eCash mainnet (`--fork ecash`). Betanet's parameters except that an
+    // unused slot needs 1815 of 2016 blocks to activate, as in BIP300.
+    NetworkPreset {
+        network_id: "mainnet",
+        activation_height: 973_728,
+        thresholds: [26_300, 13_150, 26_300, 13_150, 2_016, 1_815],
+    },
     NetworkPreset {
         network_id: "betanet",
         activation_height: 967_680,
@@ -2112,6 +2119,36 @@ mod tests {
         )
         .expect_err("preset mismatch");
         assert!(wrong_preset.to_string().contains("betanet preset"));
+
+        // eCash mainnet differs from betanet only in the unused-slot
+        // activation threshold, so that alone must tell them apart.
+        const MAINNET_THRESHOLDS: [u32; 6] = [26_300, 13_150, 26_300, 13_150, 2_016, 1_815];
+        args.network_id = "mainnet".to_owned();
+        args.activation_height = 973_728;
+        validate_chain_identity(
+            &args,
+            &thresholds_snapshot(mainchain::Network::Mainnet, 973_728, MAINNET_THRESHOLDS),
+        )
+        .expect("matching mainnet identity");
+
+        let betanet_enforcer = validate_chain_identity(
+            &args,
+            &chain_identity_snapshot(mainchain::Network::Mainnet, 973_728),
+        )
+        .expect_err("a betanet-preset enforcer at the mainnet activation height");
+        assert!(betanet_enforcer.to_string().contains("mainnet preset"));
+
+        args.activation_height = 967_680;
+        let wrong_lock = validate_chain_identity(
+            &args,
+            &thresholds_snapshot(mainchain::Network::Mainnet, 967_680, MAINNET_THRESHOLDS),
+        )
+        .expect_err("mainnet locked to betanet's activation height");
+        assert!(
+            wrong_lock
+                .to_string()
+                .contains("network mainnet activates at 973728")
+        );
 
         args.network_id = "gammanet".to_owned();
         let unknown = validate_chain_identity(

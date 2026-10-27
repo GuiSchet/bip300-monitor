@@ -335,7 +335,10 @@ impl Args {
                 "tip_matched_snapshots",
                 "bmm_readiness_unknown",
             ]),
-            creation_reason: "Drivechain Observatory official-source contract 8 dataset".to_owned(),
+            creation_reason: format!(
+                "Drivechain Observatory official-source contract {} dataset",
+                shared::protobuf::enforcer_extractor::EVENT_CONTRACT_VERSION
+            ),
         };
         if self.node_rpc_endpoint.is_some() {
             manifest
