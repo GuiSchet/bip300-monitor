@@ -230,17 +230,13 @@ reference with `scripts/check-lock.sh`.
 `VERSIONS.mainnet.lock.example` is a **candidate** (`RELEASE_STATUS=candidate`):
 it locks the node (`master` at `5bd8690`, the 288-block retarget from the fork; image pinned by its `sha-` tag), the
 fork height `973728`, magic `eca5dcb7`, the mainnet peers, the
-height-`965000` snapshot with both of its hashes and the monitor images built
-from `fc98511`, the first whose extractor knows the mainnet preset, and leaves as `REPLACE_WITH_`
-what does not exist yet. `check-lock.sh` lists them:
+height-`965000` snapshot with both of its hashes, the monitor images built
+from `fc98511`, the first whose extractor knows the mainnet preset, and the
+enforcer `d9d9ba8` (LayerTwo-Labs/bip300301_enforcer#666, the first that
+supports mainnet with `ENFORCER_NETWORK_ARG=--fork=ecash`, plus #662), listed in
+`proto/upstream/README.md` after `check-proto-vendor.sh --online`. It leaves as
+`REPLACE_WITH_` only what does not exist yet, and `check-lock.sh` lists it:
 
-- `ENFORCER_*`: the merged commit of LayerTwo-Labs/bip300301_enforcer#666, the
-  first enforcer that supports mainnet (`ENFORCER_NETWORK_ARG=--fork=ecash`), and
-  its image; the commit is also listed in `proto/upstream/README.md` once
-  `check-proto-vendor.sh --online` confirms its `proto/` is unchanged. If #666
-  is still open when the fork nears, its head `a8b3dcd` can be pinned the same
-  way (its `proto/` passed `--online` on 2026-10-23) and repinned to the merged
-  commit later;
 - `ECASH_ACTIVATION_BLOCK_HASH`: the hash of block `973728`, known once it is
   mined.
 
