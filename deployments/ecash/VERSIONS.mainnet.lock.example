@@ -35,10 +35,13 @@ ECASH_NODE_EXPECTED_VERSION=31
 
 ENFORCER_REPO=https://github.com/LayerTwo-Labs/bip300301_enforcer.git
 ENFORCER_BRANCH=master
-# Mainnet support arrives with LayerTwo-Labs/bip300301_enforcer#666 (--fork).
-ENFORCER_UPSTREAM_REVIEWED_COMMIT=REPLACE_WITH_MERGED_ENFORCER_666_COMMIT
-ENFORCER_COMMIT=REPLACE_WITH_MERGED_ENFORCER_666_COMMIT
-ENFORCER_IMAGE=REPLACE_WITH_ENFORCER_666_IMAGE
+# Mainnet support arrived with LayerTwo-Labs/bip300301_enforcer#666 (--fork),
+# merged on 2026-10-27; d9d9ba8 adds #662, so a mempool sync timeout re-syncs
+# instead of stopping the enforcer. Later master commits change the block
+# producer, which this validator-only deployment does not run.
+ENFORCER_UPSTREAM_REVIEWED_COMMIT=d9d9ba89dbd22187c84de2f4347744ea6e07dd4c
+ENFORCER_COMMIT=d9d9ba89dbd22187c84de2f4347744ea6e07dd4c
+ENFORCER_IMAGE=docker.io/guischet/bip300-enforcer-official:sha-d9d9ba89dbd2@sha256:8d3191f1b8f9a206d8a7c0e37255fb792dfe50227112bad711a03735ffa78206
 ENFORCER_NETWORK_ARG=--fork=ecash
 ENFORCER_API_NETWORK=NETWORK_MAINNET
 
