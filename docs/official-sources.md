@@ -37,6 +37,15 @@ payout of another bundle in the slot, too long without an upvote or at zero
 votes, and eviction from a full slot. Once a network activates them, a
 proposal's age is only an upper bound on how long it can still be voted on.
 
+From enforcer v1.0.0 (`f13e4e2`), a deposit (M5) no longer spends the slot's
+CTIP: it adds an unconsolidated treasury output, and a later transaction
+consolidates them (LayerTwo-Labs/bip300301_enforcer#664). `GetCtip` returns
+only the consolidated CTIP, so between a deposit and its consolidation the
+`ctip` snapshot's value is lower than the treasury. Deposits keep arriving as
+`block_connected` events. The same release gives eCash mainnet its own
+withdrawal thresholds: 12096 blocks to pass 6048 ACKs, also used to replace a
+sidechain in a used slot.
+
 ## Snapshot consistency
 
 Each state or BMM reading is bracketed by two tip reads:

@@ -773,12 +773,13 @@ struct NetworkPreset {
 }
 
 const NETWORK_PRESETS: &[NetworkPreset] = &[
-    // eCash mainnet (`--fork ecash`). Betanet's parameters except that an
-    // unused slot needs 1815 of 2016 blocks to activate, as in BIP300.
+    // eCash mainnet (`--fork ecash`, enforcer v1.0.0). Withdrawals have
+    // 12096 blocks to pass 6048 ACKs, and replacing a used slot is held to
+    // the same bar; an unused slot needs 1815 of 2016 blocks, as in BIP300.
     NetworkPreset {
         network_id: "mainnet",
         activation_height: 973_728,
-        thresholds: [26_300, 13_150, 26_300, 13_150, 2_016, 1_815],
+        thresholds: [12_096, 6_048, 12_096, 6_048, 2_016, 1_815],
     },
     NetworkPreset {
         network_id: "betanet",
@@ -2120,9 +2121,7 @@ mod tests {
         .expect_err("preset mismatch");
         assert!(wrong_preset.to_string().contains("betanet preset"));
 
-        // eCash mainnet differs from betanet only in the unused-slot
-        // activation threshold, so that alone must tell them apart.
-        const MAINNET_THRESHOLDS: [u32; 6] = [26_300, 13_150, 26_300, 13_150, 2_016, 1_815];
+        const MAINNET_THRESHOLDS: [u32; 6] = [12_096, 6_048, 12_096, 6_048, 2_016, 1_815];
         args.network_id = "mainnet".to_owned();
         args.activation_height = 973_728;
         validate_chain_identity(
@@ -2137,6 +2136,19 @@ mod tests {
         )
         .expect_err("a betanet-preset enforcer at the mainnet activation height");
         assert!(betanet_enforcer.to_string().contains("mainnet preset"));
+
+        // Enforcers before v1.0.0 (d9d9ba8 included) gave eCash mainnet
+        // Bitcoin's withdrawal thresholds; only those tell them apart.
+        let pre_v1_enforcer = validate_chain_identity(
+            &args,
+            &thresholds_snapshot(
+                mainchain::Network::Mainnet,
+                973_728,
+                [26_300, 13_150, 26_300, 13_150, 2_016, 1_815],
+            ),
+        )
+        .expect_err("a pre-v1.0.0 enforcer at the mainnet activation height");
+        assert!(pre_v1_enforcer.to_string().contains("mainnet preset"));
 
         args.activation_height = 967_680;
         let wrong_lock = validate_chain_identity(
