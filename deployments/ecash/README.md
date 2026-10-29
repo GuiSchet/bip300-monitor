@@ -227,8 +227,9 @@ network's reviewed reference, and the active `VERSIONS.lock` of a host must
 equal its own. `static-check.sh` checks the active lock in full and every other
 reference with `scripts/check-lock.sh`.
 
-`VERSIONS.mainnet.lock.example` is a **candidate** (`RELEASE_STATUS=candidate`):
-it locks the node (`master` at `5bd8690`, the 288-block retarget from the fork; image pinned by its `sha-` tag), the
+`VERSIONS.mainnet.lock.example` was a **candidate** (`RELEASE_STATUS=candidate`)
+until block `973728` was mined on 2026-10-29; it is now `ready` with that
+block's hash. It locks the node (`master` at `5bd8690`, the 288-block retarget from the fork; image pinned by its `sha-` tag), the
 fork height `973728`, magic `eca5dcb7`, the mainnet peers, the
 height-`965000` snapshot with both of its hashes, the monitor images built
 from `5997c22`, the first whose extractor expects v1.0.0's mainnet thresholds, and the
@@ -236,10 +237,8 @@ enforcer v1.0.0 `f13e4e2` (`ENFORCER_NETWORK_ARG=--fork=ecash` from #666, the
 mempool re-sync from #662, and eCash's withdrawal thresholds 12096/6048 from
 #685; earlier commits such as `d9d9ba8` apply Bitcoin's on mainnet), listed in
 `proto/upstream/README.md` after `check-proto-vendor.sh --online`. It leaves as
-`REPLACE_WITH_` only what does not exist yet, and `check-lock.sh` lists it:
-
-- `ECASH_ACTIVATION_BLOCK_HASH`: the hash of block `973728`, known once it is
-  mined.
+`REPLACE_WITH_` only what did not exist yet, which `check-lock.sh` listed:
+`ECASH_ACTIVATION_BLOCK_HASH`, the hash of block `973728`.
 
 Only the node runs from a candidate. `init`, `preflight`, `up`, `snapshot`,
 `status`, `logs` and `down` accept it while every pending value is one the node
