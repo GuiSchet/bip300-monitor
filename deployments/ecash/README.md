@@ -231,9 +231,10 @@ reference with `scripts/check-lock.sh`.
 it locks the node (`master` at `5bd8690`, the 288-block retarget from the fork; image pinned by its `sha-` tag), the
 fork height `973728`, magic `eca5dcb7`, the mainnet peers, the
 height-`965000` snapshot with both of its hashes, the monitor images built
-from `fc98511`, the first whose extractor knows the mainnet preset, and the
-enforcer `d9d9ba8` (LayerTwo-Labs/bip300301_enforcer#666, the first that
-supports mainnet with `ENFORCER_NETWORK_ARG=--fork=ecash`, plus #662), listed in
+from `5997c22`, the first whose extractor expects v1.0.0's mainnet thresholds, and the
+enforcer v1.0.0 `f13e4e2` (`ENFORCER_NETWORK_ARG=--fork=ecash` from #666, the
+mempool re-sync from #662, and eCash's withdrawal thresholds 12096/6048 from
+#685; earlier commits such as `d9d9ba8` apply Bitcoin's on mainnet), listed in
 `proto/upstream/README.md` after `check-proto-vendor.sh --online`. It leaves as
 `REPLACE_WITH_` only what does not exist yet, and `check-lock.sh` lists it:
 
