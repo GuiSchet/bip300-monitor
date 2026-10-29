@@ -1,14 +1,11 @@
-# Candidate for the eCash mainnet launch (fork at block 973728). The REPLACE_WITH_
-# values do not exist yet; scripts/check-lock.sh lists them. Only the node runs
-# from a candidate: copy it to VERSIONS.lock to sync the node before the fork
-# (README, "Mainnet on its own host"). The enforcer and the monitor refuse it
-# until RELEASE_STATUS=ready.
-RELEASE_STATUS=candidate
+# Published release for eCash mainnet (fork at block 973728, mined on
+# 2026-10-29): every image is pinned by its verified registry digest.
+RELEASE_STATUS=ready
 # shellcheck shell=bash
 # Reviewed mainnet lock reference. On the mainnet host the active VERSIONS.lock
 # must match these immutable network and artifact values.
 LOCK_FORMAT=5
-LOCKED_AT=2026-10-20
+LOCKED_AT=2026-10-29
 
 NETWORK_ID=mainnet
 ECASH_NODE_CHAIN=main
@@ -71,8 +68,9 @@ JUST_SHA256=45b548094283cb9739af8f13273b8cddeee869f5b4ef2bb631b1f311cb566155
 # those four metadata bytes before loadtxoutset validates the compiled UTXO
 # commitment.
 ECASH_ACTIVATION_HEIGHT=973728
-# Known once block 973728 is mined.
-ECASH_ACTIVATION_BLOCK_HASH=REPLACE_WITH_BLOCK_973728_HASH
+# Block 973728, read from the mainnet node with 4 confirmations; all 14 peers
+# share the chain through 973731.
+ECASH_ACTIVATION_BLOCK_HASH=0000000000000001441a6a4ae49d679d4a30581db3e3eaeeb2fba5da6dc146ed
 ECASH_SNAPSHOT_HEIGHT=965000
 ECASH_SNAPSHOT_BLOCK_HASH=00000000000000000001595977e6000ce56129f5c9b4073e31ccc30b90b97da9
 ECASH_SNAPSHOT_TRANSFORM=network_magic_v2
