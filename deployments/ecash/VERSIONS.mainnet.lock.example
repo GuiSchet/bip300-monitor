@@ -35,13 +35,12 @@ ECASH_NODE_EXPECTED_VERSION=31
 
 ENFORCER_REPO=https://github.com/LayerTwo-Labs/bip300301_enforcer.git
 ENFORCER_BRANCH=master
-# Mainnet support arrived with LayerTwo-Labs/bip300301_enforcer#666 (--fork),
-# merged on 2026-10-27; d9d9ba8 adds #662, so a mempool sync timeout re-syncs
-# instead of stopping the enforcer. Later master commits change the block
-# producer, which this validator-only deployment does not run.
-ENFORCER_UPSTREAM_REVIEWED_COMMIT=d9d9ba89dbd22187c84de2f4347744ea6e07dd4c
-ENFORCER_COMMIT=d9d9ba89dbd22187c84de2f4347744ea6e07dd4c
-ENFORCER_IMAGE=docker.io/guischet/bip300-enforcer-official:sha-d9d9ba89dbd2@sha256:8d3191f1b8f9a206d8a7c0e37255fb792dfe50227112bad711a03735ffa78206
+# Enforcer v1.0.0 (2026-10-28): --fork from #666, the mempool re-sync from
+# #662, and eCash mainnet's own withdrawal thresholds, 12096/6048 (#685).
+# Earlier commits, d9d9ba8 included, apply Bitcoin's 26300/13150 on mainnet.
+ENFORCER_UPSTREAM_REVIEWED_COMMIT=f13e4e2ae045ebe4d80d35de7216dc1810fc2b9d
+ENFORCER_COMMIT=f13e4e2ae045ebe4d80d35de7216dc1810fc2b9d
+ENFORCER_IMAGE=docker.io/guischet/bip300-enforcer-official:sha-f13e4e2ae045@sha256:816059efe0fcf976999c95db2bba8b986b1847b5de715178bb25c5f1629bfd7a
 ENFORCER_NETWORK_ARG=--fork=ecash
 ENFORCER_API_NETWORK=NETWORK_MAINNET
 
@@ -54,10 +53,10 @@ POSTGRES_USER=bip300_monitor
 # Keep contract, source commit, and both immutable image
 # digests together.
 MONITOR_EVENT_CONTRACT_VERSION=9
-# The first images whose extractor knows the mainnet preset.
-MONITOR_IMAGE_COMMIT=fc985110fc1528851f24dde43cef0a688ff5d08d
-ENFORCER_EXTRACTOR_IMAGE=docker.io/guischet/bip300-enforcer-extractor:sha-fc985110fc15@sha256:f2a0c00dd540c449cbb07864719312c51823c23962935c16b26dbbaf6f246e96
-EVENT_LOGGER_IMAGE=docker.io/guischet/bip300-event-logger:sha-fc985110fc15@sha256:06ecc79a3c7a31db1fc881230af5daa298f1c5bd6fe1baa9be93d3c5e085ef33
+# The first images whose extractor expects enforcer v1.0.0's mainnet thresholds.
+MONITOR_IMAGE_COMMIT=5997c22029f87f57c0e08c143215a0e9920b0341
+ENFORCER_EXTRACTOR_IMAGE=docker.io/guischet/bip300-enforcer-extractor:sha-5997c22029f8@sha256:8c85ac478ceabb4547cfcb92fbe34a812c4de313b2352ef8a6941e6e22f302c3
+EVENT_LOGGER_IMAGE=docker.io/guischet/bip300-event-logger:sha-5997c22029f8@sha256:da5f2457826d86143cf4e5dd427d258339dfea4ad6b17091d4c037d916ace2f3
 
 JUST_VERSION=1.57.0
 JUST_TARGET=x86_64-unknown-linux-musl
