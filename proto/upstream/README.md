@@ -3,6 +3,7 @@
 - Repository: https://github.com/LayerTwo-Labs/bip300301_enforcer
 - Official commit: `1753fc0c23863bcb39c681e1cfaea2705613516f`
 - Official commit: `d9d9ba89dbd22187c84de2f4347744ea6e07dd4c`
+- Official commit: `f13e4e2ae045ebe4d80d35de7216dc1810fc2b9d`
 
 Files are copied verbatim from `proto/` at each official commit listed above;
 their bytes are identical at every one of them. `SHA256SUMS` records those
