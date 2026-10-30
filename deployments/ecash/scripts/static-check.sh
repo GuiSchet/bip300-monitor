@@ -638,6 +638,17 @@ grep -Fxq 'txindex=0' "${rendered_node_config}"
 if grep -Fxq 'txindex=1' "${rendered_node_config}"; then
     die "observer-only deployment unexpectedly enables txindex"
 fi
+# dbcache is host sizing: absent unless the host's .env sets it.
+if [[ -z "${ECASH_NODE_DBCACHE:-}" ]] && grep -q '^dbcache=' "${rendered_node_config}"; then
+    die "node configuration sets dbcache without ECASH_NODE_DBCACHE"
+fi
+BIP300_NODE_OBSERVER_AUTH_CONFIG_FILE="${rendered_node_config}.observer-auth"
+printf 'rpcauth=bip300_observer:test$%064d\n' 0 >"${BIP300_NODE_OBSERVER_AUTH_CONFIG_FILE}"
+ECASH_NODE_DBCACHE=3000 render_node_config "${rendered_node_config}.dbcache"
+rm -- "${BIP300_NODE_OBSERVER_AUTH_CONFIG_FILE}"
+grep -Fxq 'dbcache=3000' "${rendered_node_config}.dbcache" ||
+    die "ECASH_NODE_DBCACHE is not rendered into the node configuration"
+rm -- "${rendered_node_config}.dbcache"
 grep -Fxq "port=${ECASH_NODE_P2P_PORT}" "${rendered_node_config}"
 grep -Fxq "rpcport=${ECASH_NODE_RPC_PORT}" "${rendered_node_config}"
 grep -Fxq 'rpcallowip=172.30.0.0/24' "${rendered_node_config}"
