@@ -316,6 +316,11 @@ render_node_config() {
         # cursor. Make the non-pruned requirement explicit instead of relying
         # on the node default, which could change or be overridden unnoticed.
         printf 'prune=0\n'
+        # Host sizing, not a network value: only written when the host's .env
+        # sets it, so hosts without it keep the node default and their file.
+        if [[ -n "${ECASH_NODE_DBCACHE:-}" ]]; then
+            printf 'dbcache=%s\n' "${ECASH_NODE_DBCACHE}"
+        fi
         [[ -f "${auth_config}" ]] || die "missing dedicated observer rpcauth; run just init"
         cat -- "${auth_config}"
         printf 'zmqpubsequence=tcp://0.0.0.0:%s\n' "${ECASH_NODE_ZMQ_PORT}"
@@ -393,6 +398,8 @@ load_deployment_env() {
     [[ "${PGID}" =~ ^[0-9]+$ ]] || die "PGID must be numeric"
     require_positive_integer \
         ENFORCER_SYNC_WAIT_SECONDS "${ENFORCER_SYNC_WAIT_SECONDS:-300}"
+    [[ -z "${ECASH_NODE_DBCACHE:-}" ]] ||
+        require_positive_integer ECASH_NODE_DBCACHE "${ECASH_NODE_DBCACHE}"
     require_positive_integer \
         SNAPSHOT_RPC_WAIT_SECONDS "${SNAPSHOT_RPC_WAIT_SECONDS:-43200}"
     require_positive_integer \
