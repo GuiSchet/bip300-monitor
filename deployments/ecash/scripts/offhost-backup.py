@@ -17,7 +17,7 @@ import subprocess
 import time
 import uuid
 
-POSTGRES = "postgres:18.2-alpine@sha256:035b9ab53cfa147d7202b61f5f7782b939ae815b7d6bc81c96b7b42ff1fca950"
+POSTGRES = "postgres:18.7-alpine@sha256:b6972e1115a4ff8eba5d7f7d19184926d1e16d7d1136ae1e1a7ebf286da0f015"
 
 
 def run(args, **kwargs):
