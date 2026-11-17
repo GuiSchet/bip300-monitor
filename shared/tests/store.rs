@@ -5,7 +5,7 @@
 //!
 //! ```text
 //! docker run --rm -d -p 55432:5432 -e POSTGRES_PASSWORD=test \
-//!     --name bip300-test-postgres postgres:18.2-alpine
+//!     --name bip300-test-postgres postgres:18.7-alpine
 //! BIP300_MONITOR_TEST_POSTGRES_URL='host=127.0.0.1 port=55432 user=postgres password=test dbname=postgres' \
 //!     cargo test -p shared --features postgres_integration_tests
 //! ```
